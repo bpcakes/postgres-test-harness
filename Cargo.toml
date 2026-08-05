@@ -1,0 +1,25 @@
+[package]
+name = "postgres-test-harness"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Reusable PostgreSQL test servers, templates, isolated databases, and cleanup"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/bpcakes/postgres-test-harness"
+documentation = "https://docs.rs/postgres-test-harness"
+keywords = ["postgres", "testing", "testcontainers", "database"]
+categories = ["development-tools::testing", "database"]
+
+[dependencies]
+libc = "0.2"
+postgres = "0.19"
+sha2 = "0.10"
+testcontainers = { version = "0.27.3", default-features = false, features = ["blocking", "ring", "watchdog"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "sync"] }
+url = "2"
+uuid = { version = "1", features = ["v7"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

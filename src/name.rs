@@ -42,10 +42,9 @@ impl DatabaseName {
         let template_prefix = format!("pgh_{}_template_", project.as_str());
         let kind = if let Some(suffix) = value.strip_prefix(&test_prefix) {
             valid_hex_suffix(suffix, 32).then_some(DatabaseKind::Test)?
-        } else if let Some(suffix) = value.strip_prefix(&template_prefix) {
-            valid_hex_suffix(suffix, 24).then_some(DatabaseKind::Template)?
         } else {
-            return None;
+            let suffix = value.strip_prefix(&template_prefix)?;
+            valid_hex_suffix(suffix, 24).then_some(DatabaseKind::Template)?
         };
         Self::new(value, kind).ok()
     }

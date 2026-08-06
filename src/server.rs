@@ -18,8 +18,8 @@ use uuid::Uuid;
 use crate::{
     Error, HarnessConfig, ProjectName, Result,
     admin::{
-        AdminDatabaseUrl, PersistentClient, acquire_advisory_lock, advisory_key, connect_admin,
-        validate_postgres_18,
+        AdminClient, AdminDatabaseUrl, PersistentClient, acquire_advisory_lock, advisory_key,
+        connect_admin, validate_postgres_18,
     },
     config::ImageReference,
 };
@@ -67,7 +67,29 @@ impl ServerInner {
             (admin_url, Some(container))
         };
 
-        let mut owner_lock = connect_admin(
+        Self::finish_start(config, admin_url, container, owner_key)
+    }
+
+    fn finish_start(
+        config: HarnessConfig,
+        admin_url: AdminDatabaseUrl,
+        container: Option<Arc<ContainerOwner>>,
+        owner_key: i64,
+    ) -> Result<Arc<Self>> {
+        Self::finish_start_with(config, admin_url, container, owner_key, connect_admin)
+    }
+
+    fn finish_start_with<F>(
+        config: HarnessConfig,
+        admin_url: AdminDatabaseUrl,
+        container: Option<Arc<ContainerOwner>>,
+        owner_key: i64,
+        connector: F,
+    ) -> Result<Arc<Self>>
+    where
+        F: FnOnce(&AdminDatabaseUrl, Duration, &'static str) -> Result<AdminClient>,
+    {
+        let mut owner_lock = connector(
             &admin_url,
             config.operation_timeout,
             "connect to PostgreSQL test server",
@@ -280,9 +302,17 @@ fn resolve_started_container(
 ) -> std::result::Result<StartedContainer, testcontainers::TestcontainersError> {
     Ok(StartedContainer {
         id: container.id().to_owned(),
-        host: container.get_host()?.to_string(),
+        host: ipv4_mapped_container_host(container.get_host()?.to_string()),
         port: container.get_host_port_ipv4(POSTGRES_PORT.tcp())?,
     })
+}
+
+fn ipv4_mapped_container_host(host: String) -> String {
+    if host.eq_ignore_ascii_case("localhost") {
+        "127.0.0.1".to_owned()
+    } else {
+        host
+    }
 }
 
 fn register_container(container: &Arc<ContainerOwner>) -> Result<()> {
@@ -330,4 +360,79 @@ fn unix_now() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{Arc, Mutex, mpsc},
+        thread,
+        time::Duration,
+    };
+
+    use super::{ContainerCommand, ContainerOwner, ServerInner, ipv4_mapped_container_host};
+    use crate::{Error, HarnessConfig, admin::AdminDatabaseUrl};
+
+    #[test]
+    fn ipv4_port_mapping_uses_an_ipv4_loopback_literal() {
+        assert_eq!(
+            ipv4_mapped_container_host("localhost".to_owned()),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            ipv4_mapped_container_host("LOCALHOST".to_owned()),
+            "127.0.0.1"
+        );
+        assert_eq!(
+            ipv4_mapped_container_host("192.0.2.10".to_owned()),
+            "192.0.2.10"
+        );
+        assert_eq!(
+            ipv4_mapped_container_host("host.docker.internal".to_owned()),
+            "host.docker.internal"
+        );
+    }
+
+    #[test]
+    fn owned_container_is_shut_down_when_admin_connection_times_out() {
+        let (command_sender, command_receiver) = mpsc::channel();
+        let (shutdown_sender, shutdown_receiver) = mpsc::channel();
+        let worker = thread::spawn(move || match command_receiver.recv().unwrap() {
+            ContainerCommand::Shutdown(result_sender) => {
+                shutdown_sender.send(()).unwrap();
+                result_sender.send(Ok(())).unwrap();
+            }
+        });
+        let container = Arc::new(ContainerOwner {
+            id: "test-container".to_owned(),
+            commands: Mutex::new(Some(command_sender)),
+            worker: Mutex::new(Some(worker)),
+        });
+        let config = HarnessConfig::new("cleanup").unwrap();
+        let admin_url = AdminDatabaseUrl::parse(
+            "postgres://postgres:secret@127.0.0.1:5432/postgres?sslmode=disable",
+        )
+        .unwrap();
+
+        let error = match ServerInner::finish_start_with(
+            config,
+            admin_url,
+            Some(container),
+            1,
+            |_, _, operation| {
+                Err(Error::PostgresConnectTimeout {
+                    operation,
+                    timeout: Duration::from_millis(50),
+                })
+            },
+        ) {
+            Ok(_) => panic!("forced admin connection timeout must fail startup"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, Error::PostgresConnectTimeout { .. }));
+        shutdown_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("owned container shutdown should run before startup returns");
+    }
 }

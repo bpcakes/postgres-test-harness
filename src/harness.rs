@@ -7,17 +7,17 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use postgres::Client;
 use tokio::sync::OwnedSemaphorePermit;
 
 use crate::{
     BoxError, Error, HarnessConfig, ProjectName, Result, TemplateFingerprint, TemplateSpec,
     admin::{
-        AdminDatabaseUrl, DatabaseRecord, PersistentClient, acquire_shared_template_advisory_lock,
-        acquire_template_advisory_lock, advisory_key, connect_admin, create_database,
-        database_comment, database_exists, disable_database_connections, drop_database,
-        list_databases, release_advisory_lock, release_shared_advisory_lock, set_database_metadata,
-        terminate_database_connections, try_acquire_advisory_lock, validate_postgres_18,
+        AdminClient, AdminDatabaseUrl, DatabaseRecord, PersistentClient,
+        acquire_shared_template_advisory_lock, acquire_template_advisory_lock, advisory_key,
+        connect_admin, create_database, database_comment, database_exists,
+        disable_database_connections, drop_database, list_databases, release_advisory_lock,
+        release_shared_advisory_lock, set_database_metadata, terminate_database_connections,
+        try_acquire_advisory_lock, validate_postgres_18,
     },
     metadata::{ResourceMetadata, TemplateState},
     name::{DatabaseKind, DatabaseName},
@@ -424,7 +424,7 @@ fn acquire_ready_template_lock(
 }
 
 fn template_is_ready(
-    client: &mut Client,
+    client: &mut AdminClient,
     server: &ServerInner,
     name: &DatabaseName,
     fingerprint: TemplateFingerprint,

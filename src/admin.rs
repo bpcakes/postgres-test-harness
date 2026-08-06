@@ -8,8 +8,10 @@ use std::{
     time::Duration,
 };
 
-use postgres::{Client, NoTls};
+use postgres::{Row, types::ToSql};
 use sha2::{Digest, Sha256};
+use tokio::{runtime::Runtime, task::JoinHandle};
+use tokio_postgres::NoTls;
 use url::Url;
 
 use crate::{Error, Result, metadata::ResourceMetadata, name::DatabaseName};
@@ -17,7 +19,7 @@ use crate::{Error, Result, metadata::ResourceMetadata, name::DatabaseName};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
-static CLIENT_DROP_WORKER: OnceLock<Option<Sender<Client>>> = OnceLock::new();
+static CLIENT_DROP_WORKER: OnceLock<Option<Sender<AdminClient>>> = OnceLock::new();
 
 #[derive(Clone)]
 pub(crate) struct AdminDatabaseUrl(Url);
@@ -75,19 +77,88 @@ pub(crate) struct DatabaseRecord {
     pub(crate) comment: Option<String>,
 }
 
-/// Synchronous PostgreSQL client that may be owned by async code.
+/// Tokio-backed PostgreSQL client with a synchronous internal interface.
 ///
-/// `postgres::Client::drop` blocks on its private Tokio runtime and panics if
-/// that happens directly on another Tokio runtime. This wrapper transfers the
-/// client to a plain dedicated thread for destruction.
-pub(crate) struct PersistentClient(Option<Client>);
+/// Keeping the runtime here lets connection establishment place one deadline
+/// around socket connection, PostgreSQL startup, and authentication. All
+/// callers already execute admin work through `spawn_blocking`.
+pub(crate) struct AdminClient {
+    client: tokio_postgres::Client,
+    _connection: JoinHandle<std::result::Result<(), tokio_postgres::Error>>,
+    runtime: Runtime,
+}
+
+impl AdminClient {
+    fn connect(
+        admin_url: &AdminDatabaseUrl,
+        connect_timeout: Duration,
+        operation: &'static str,
+    ) -> Result<Self> {
+        let mut config = tokio_postgres::Config::from_str(admin_url.as_str())
+            .map_err(|source| Error::postgres(operation, source))?;
+        config.connect_timeout(connect_timeout);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|source| Error::PostgresRuntime { operation, source })?;
+        let connection = runtime
+            .block_on(async { tokio::time::timeout(connect_timeout, config.connect(NoTls)).await });
+        let (client, connection) = connection
+            .map_err(|_| Error::PostgresConnectTimeout {
+                operation,
+                timeout: connect_timeout,
+            })?
+            .map_err(|source| Error::postgres(operation, source))?;
+        let connection = runtime.spawn(connection);
+        Ok(Self {
+            client,
+            _connection: connection,
+            runtime,
+        })
+    }
+
+    fn batch_execute(&mut self, query: &str) -> std::result::Result<(), postgres::Error> {
+        self.runtime.block_on(self.client.batch_execute(query))
+    }
+
+    fn query(
+        &mut self,
+        query: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> std::result::Result<Vec<Row>, postgres::Error> {
+        self.runtime.block_on(self.client.query(query, params))
+    }
+
+    fn query_one(
+        &mut self,
+        query: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> std::result::Result<Row, postgres::Error> {
+        self.runtime.block_on(self.client.query_one(query, params))
+    }
+
+    fn query_opt(
+        &mut self,
+        query: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> std::result::Result<Option<Row>, postgres::Error> {
+        self.runtime.block_on(self.client.query_opt(query, params))
+    }
+}
+
+/// Admin client that may be retained by async code to hold an advisory lock.
+///
+/// Dropping a Tokio runtime directly from another Tokio runtime panics. This
+/// wrapper transfers the complete client to a plain dedicated thread for
+/// destruction.
+pub(crate) struct PersistentClient(Option<AdminClient>);
 
 impl PersistentClient {
-    pub(crate) fn new(client: Client) -> Self {
+    pub(crate) fn new(client: AdminClient) -> Self {
         Self(Some(client))
     }
 
-    pub(crate) fn client_mut(&mut self) -> &mut Client {
+    pub(crate) fn client_mut(&mut self) -> &mut AdminClient {
         self.0
             .as_mut()
             .expect("persistent PostgreSQL client exists until drop")
@@ -100,7 +171,7 @@ impl Drop for PersistentClient {
             return;
         };
         let worker = CLIENT_DROP_WORKER.get_or_init(|| {
-            let (sender, receiver) = mpsc::channel::<Client>();
+            let (sender, receiver) = mpsc::channel::<AdminClient>();
             match std::thread::Builder::new()
                 .name("postgres-test-harness-client-drop".to_owned())
                 .spawn(move || {
@@ -132,19 +203,22 @@ pub(crate) fn connect_admin(
     admin_url: &AdminDatabaseUrl,
     operation_timeout: Duration,
     operation: &'static str,
-) -> Result<Client> {
-    let mut config = postgres::Config::from_str(admin_url.as_str())
-        .map_err(|source| Error::postgres(operation, source))?;
-    config.connect_timeout(CONNECT_TIMEOUT);
-    let mut client = config
-        .connect(NoTls)
-        .map_err(|source| Error::postgres(operation, source))?;
+) -> Result<AdminClient> {
+    connect_admin_with_timeout(admin_url, operation_timeout, operation, CONNECT_TIMEOUT)
+}
 
+fn connect_admin_with_timeout(
+    admin_url: &AdminDatabaseUrl,
+    operation_timeout: Duration,
+    operation: &'static str,
+    connect_timeout: Duration,
+) -> Result<AdminClient> {
+    let mut client = AdminClient::connect(admin_url, connect_timeout, operation)?;
     configure_session_timeouts(&mut client, operation_timeout)?;
     Ok(client)
 }
 
-fn configure_session_timeouts(client: &mut Client, operation_timeout: Duration) -> Result<()> {
+fn configure_session_timeouts(client: &mut AdminClient, operation_timeout: Duration) -> Result<()> {
     let statement_timeout = duration_millis(operation_timeout)?;
     let lock_timeout = duration_millis(LOCK_TIMEOUT.min(operation_timeout))?;
     client
@@ -154,7 +228,7 @@ fn configure_session_timeouts(client: &mut Client, operation_timeout: Duration) 
         .map_err(|source| Error::postgres("configure admin session timeouts", source))
 }
 
-fn configure_coordination_timeouts(client: &mut Client, wait_timeout: Duration) -> Result<()> {
+fn configure_coordination_timeouts(client: &mut AdminClient, wait_timeout: Duration) -> Result<()> {
     let timeout = duration_millis(wait_timeout)?;
     client
         .batch_execute(&format!(
@@ -163,7 +237,7 @@ fn configure_coordination_timeouts(client: &mut Client, wait_timeout: Duration) 
         .map_err(|source| Error::postgres("configure template coordination timeouts", source))
 }
 
-pub(crate) fn validate_postgres_18(client: &mut Client) -> Result<()> {
+pub(crate) fn validate_postgres_18(client: &mut AdminClient) -> Result<()> {
     let server_version_num: i32 = client
         .query_one("SELECT current_setting('server_version_num')::integer", &[])
         .map_err(|source| Error::postgres("read PostgreSQL server version", source))?
@@ -177,7 +251,7 @@ pub(crate) fn validate_postgres_18(client: &mut Client) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn acquire_advisory_lock(client: &mut Client, key: i64) -> Result<()> {
+pub(crate) fn acquire_advisory_lock(client: &mut AdminClient, key: i64) -> Result<()> {
     client
         .query_one("SELECT pg_advisory_lock($1)", &[&key])
         .map_err(|source| Error::postgres("acquire PostgreSQL advisory lock", source))?;
@@ -185,7 +259,7 @@ pub(crate) fn acquire_advisory_lock(client: &mut Client, key: i64) -> Result<()>
 }
 
 pub(crate) fn acquire_template_advisory_lock(
-    client: &mut Client,
+    client: &mut AdminClient,
     key: i64,
     wait_timeout: Duration,
     operation_timeout: Duration,
@@ -198,7 +272,7 @@ pub(crate) fn acquire_template_advisory_lock(
 }
 
 pub(crate) fn acquire_shared_template_advisory_lock(
-    client: &mut Client,
+    client: &mut AdminClient,
     key: i64,
     wait_timeout: Duration,
     operation_timeout: Duration,
@@ -212,21 +286,21 @@ pub(crate) fn acquire_shared_template_advisory_lock(
     configure_session_timeouts(client, operation_timeout)
 }
 
-pub(crate) fn try_acquire_advisory_lock(client: &mut Client, key: i64) -> Result<bool> {
+pub(crate) fn try_acquire_advisory_lock(client: &mut AdminClient, key: i64) -> Result<bool> {
     client
         .query_one("SELECT pg_try_advisory_lock($1)", &[&key])
         .map(|row| row.get(0))
         .map_err(|source| Error::postgres("try PostgreSQL advisory lock", source))
 }
 
-pub(crate) fn release_advisory_lock(client: &mut Client, key: i64) -> Result<()> {
+pub(crate) fn release_advisory_lock(client: &mut AdminClient, key: i64) -> Result<()> {
     client
         .query_one("SELECT pg_advisory_unlock($1)", &[&key])
         .map_err(|source| Error::postgres("release PostgreSQL advisory lock", source))?;
     Ok(())
 }
 
-pub(crate) fn release_shared_advisory_lock(client: &mut Client, key: i64) -> Result<()> {
+pub(crate) fn release_shared_advisory_lock(client: &mut AdminClient, key: i64) -> Result<()> {
     client
         .query_one("SELECT pg_advisory_unlock_shared($1)", &[&key])
         .map_err(|source| Error::postgres("release shared PostgreSQL advisory lock", source))?;
@@ -234,7 +308,7 @@ pub(crate) fn release_shared_advisory_lock(client: &mut Client, key: i64) -> Res
 }
 
 pub(crate) fn create_database(
-    client: &mut Client,
+    client: &mut AdminClient,
     database_name: &DatabaseName,
     template_name: &str,
 ) -> Result<()> {
@@ -247,7 +321,7 @@ pub(crate) fn create_database(
         .map_err(|source| Error::postgres("create disposable PostgreSQL database", source))
 }
 
-pub(crate) fn drop_database(client: &mut Client, database_name: &DatabaseName) -> Result<()> {
+pub(crate) fn drop_database(client: &mut AdminClient, database_name: &DatabaseName) -> Result<()> {
     client
         .batch_execute(&format!(
             "DROP DATABASE IF EXISTS {} WITH (FORCE)",
@@ -256,7 +330,10 @@ pub(crate) fn drop_database(client: &mut Client, database_name: &DatabaseName) -
         .map_err(|source| Error::postgres("drop disposable PostgreSQL database", source))
 }
 
-pub(crate) fn database_exists(client: &mut Client, database_name: &DatabaseName) -> Result<bool> {
+pub(crate) fn database_exists(
+    client: &mut AdminClient,
+    database_name: &DatabaseName,
+) -> Result<bool> {
     client
         .query_one(
             "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)",
@@ -267,7 +344,7 @@ pub(crate) fn database_exists(client: &mut Client, database_name: &DatabaseName)
 }
 
 pub(crate) fn database_comment(
-    client: &mut Client,
+    client: &mut AdminClient,
     database_name: &DatabaseName,
 ) -> Result<Option<String>> {
     client
@@ -280,7 +357,7 @@ pub(crate) fn database_comment(
 }
 
 pub(crate) fn set_database_metadata(
-    client: &mut Client,
+    client: &mut AdminClient,
     database_name: &DatabaseName,
     metadata: &ResourceMetadata,
 ) -> Result<()> {
@@ -294,7 +371,7 @@ pub(crate) fn set_database_metadata(
 }
 
 pub(crate) fn disable_database_connections(
-    client: &mut Client,
+    client: &mut AdminClient,
     database_name: &DatabaseName,
 ) -> Result<()> {
     client
@@ -306,7 +383,7 @@ pub(crate) fn disable_database_connections(
 }
 
 pub(crate) fn terminate_database_connections(
-    client: &mut Client,
+    client: &mut AdminClient,
     database_name: &DatabaseName,
     operation_timeout: Duration,
 ) -> Result<()> {
@@ -344,7 +421,7 @@ pub(crate) fn terminate_database_connections(
     Ok(())
 }
 
-pub(crate) fn list_databases(client: &mut Client) -> Result<Vec<DatabaseRecord>> {
+pub(crate) fn list_databases(client: &mut AdminClient) -> Result<Vec<DatabaseRecord>> {
     client
         .query(
             "SELECT datname, shobj_description(oid, 'pg_database') FROM pg_database",
@@ -401,8 +478,12 @@ fn quote_literal(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AdminDatabaseUrl, advisory_key, quote_identifier, quote_literal};
-    use crate::{FingerprintBuilder, ProjectName, name::DatabaseName};
+    use std::{io::Read, net::TcpListener, thread, time::Duration};
+
+    use super::{
+        AdminDatabaseUrl, advisory_key, connect_admin_with_timeout, quote_identifier, quote_literal,
+    };
+    use crate::{Error, FingerprintBuilder, ProjectName, name::DatabaseName};
 
     #[test]
     fn admin_url_debug_redacts_password_and_rewrites_only_database() {
@@ -426,6 +507,47 @@ mod tests {
         assert_eq!(quote_identifier("template0").unwrap(), "\"template0\"");
         assert!(quote_identifier("unsafe-name").is_err());
         assert_eq!(quote_literal("a'b"), "'a''b'");
+    }
+
+    #[test]
+    fn admin_connection_deadline_covers_a_silent_postgres_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut startup = Vec::new();
+            stream.read_to_end(&mut startup).unwrap();
+            startup
+        });
+        let admin = AdminDatabaseUrl::parse(&format!(
+            "postgres://user:secret@127.0.0.1:{port}/postgres?sslmode=disable"
+        ))
+        .unwrap();
+
+        let error = match connect_admin_with_timeout(
+            &admin,
+            Duration::from_secs(1),
+            "connect to silent PostgreSQL test server",
+            Duration::from_millis(50),
+        ) {
+            Ok(_) => panic!("silent PostgreSQL peer must not complete startup"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            &error,
+            Error::PostgresConnectTimeout {
+                operation: "connect to silent PostgreSQL test server",
+                timeout
+            } if *timeout == Duration::from_millis(50)
+        ));
+        let display = error.to_string();
+        assert!(!display.contains("secret"));
+        assert!(!display.contains(&port.to_string()));
+        assert!(!server.join().unwrap().is_empty());
     }
 
     #[test]

@@ -54,6 +54,22 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         .expect("reuse ready template");
     assert_eq!(template.database_name(), reused.database_name());
 
+    for iteration in 0..16 {
+        let database = template.database().await.unwrap_or_else(|error| {
+            panic!("create repeated disposable database {iteration}: {error}")
+        });
+        assert!(
+            relation_exists(database.database_url().to_owned(), "harness_marker")
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("query repeated disposable database {iteration}: {error}")
+                })
+        );
+        database.cleanup().await.unwrap_or_else(|error| {
+            panic!("clean repeated disposable database {iteration}: {error}")
+        });
+    }
+
     let concurrent_spec = TemplateSpec::new(
         FingerprintBuilder::new("concurrent-schema")
             .add(

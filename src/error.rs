@@ -35,6 +35,19 @@ pub enum Error {
         source: postgres::Error,
     },
 
+    #[error("PostgreSQL test connection timed out during {operation} after {timeout:?}")]
+    PostgresConnectTimeout {
+        operation: &'static str,
+        timeout: Duration,
+    },
+
+    #[error("failed to initialize PostgreSQL admin runtime during {operation}: {source}")]
+    PostgresRuntime {
+        operation: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error(
         "PostgreSQL 18 is required; connected server reported server_version_num={server_version_num}"
     )]

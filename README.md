@@ -79,6 +79,14 @@ real migration suite is still running. Override it with
   client expects a local or CI endpoint that does not require TLS.
 - `POSTGRES_TEST_IMAGE` overrides the default `postgres:18` image.
 
+For an owned container, the harness requests Testcontainers' IPv4 port mapping
+and therefore uses an IPv4 loopback literal when Testcontainers reports
+`localhost`; this prevents the operating system from selecting an unrelated
+IPv6 listener for an IPv4-mapped port. Every administrative connection has a
+ten-second deadline covering TCP connection, PostgreSQL startup, and
+authentication. Query and lock deadlines remain governed separately by the
+configured administrative-operation and template-wait timeouts.
+
 The harness never enables Testcontainers' reusable-container mode. Reuse is
 bounded by the owner process, and ordinary process exit removes an owned
 container. Tagged database metadata and PostgreSQL advisory locks allow a later

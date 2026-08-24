@@ -1,5 +1,6 @@
 use std::{
     fmt,
+    future::Future,
     str::FromStr,
     sync::{Condvar, Mutex},
     time::{Duration, Instant},
@@ -13,6 +14,9 @@ use url::Url;
 use crate::{Error, Result, metadata::ResourceMetadata, name::DatabaseName};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+// Give PostgreSQL enough time to report its own `statement_timeout` error;
+// this client deadline is the backstop for peers that stop responding.
+const CLIENT_OPERATION_TIMEOUT_GRACE: Duration = Duration::from_secs(1);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 const LIFECYCLE_APPLICATION_NAME_PREFIX: &str = "postgres-test-harness lifecycle:";
 
@@ -76,18 +80,21 @@ pub(crate) struct DatabaseRecord {
 /// Tokio-backed PostgreSQL client with a synchronous internal interface.
 ///
 /// Keeping the runtime here lets connection establishment place one deadline
-/// around socket connection, PostgreSQL startup, and authentication. All
-/// callers already execute admin work through `spawn_blocking`.
+/// around socket connection, PostgreSQL startup, and authentication, and lets
+/// every subsequent request carry an end-to-end client deadline. All callers
+/// already execute admin work through `spawn_blocking`.
 pub(crate) struct AdminClient {
     client: tokio_postgres::Client,
     _connection: JoinHandle<std::result::Result<(), tokio_postgres::Error>>,
     runtime: Runtime,
+    request_timeout: Duration,
 }
 
 impl AdminClient {
     fn connect(
         admin_url: &AdminDatabaseUrl,
         connect_timeout: Duration,
+        request_timeout: Duration,
         operation: &'static str,
     ) -> Result<Self> {
         let mut config = tokio_postgres::Config::from_str(admin_url.as_str())
@@ -110,35 +117,69 @@ impl AdminClient {
             client,
             _connection: connection,
             runtime,
+            request_timeout,
         })
     }
 
-    fn batch_execute(&mut self, query: &str) -> std::result::Result<(), tokio_postgres::Error> {
-        self.runtime.block_on(self.client.batch_execute(query))
+    fn batch_execute(&mut self, operation: &'static str, query: &str) -> Result<()> {
+        run_admin_operation(
+            &self.runtime,
+            self.request_timeout,
+            operation,
+            self.client.batch_execute(query),
+        )
     }
 
     fn query(
         &mut self,
+        operation: &'static str,
         query: &str,
         params: &[&(dyn ToSql + Sync)],
-    ) -> std::result::Result<Vec<Row>, tokio_postgres::Error> {
-        self.runtime.block_on(self.client.query(query, params))
+    ) -> Result<Vec<Row>> {
+        run_admin_operation(
+            &self.runtime,
+            self.request_timeout,
+            operation,
+            self.client.query(query, params),
+        )
     }
 
     fn query_one(
         &mut self,
+        operation: &'static str,
         query: &str,
         params: &[&(dyn ToSql + Sync)],
-    ) -> std::result::Result<Row, tokio_postgres::Error> {
-        self.runtime.block_on(self.client.query_one(query, params))
+    ) -> Result<Row> {
+        self.query_one_with_timeout(self.request_timeout, operation, query, params)
+    }
+
+    fn query_one_with_timeout(
+        &mut self,
+        timeout: Duration,
+        operation: &'static str,
+        query: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Row> {
+        run_admin_operation(
+            &self.runtime,
+            timeout,
+            operation,
+            self.client.query_one(query, params),
+        )
     }
 
     fn query_opt(
         &mut self,
+        operation: &'static str,
         query: &str,
         params: &[&(dyn ToSql + Sync)],
-    ) -> std::result::Result<Option<Row>, tokio_postgres::Error> {
-        self.runtime.block_on(self.client.query_opt(query, params))
+    ) -> Result<Option<Row>> {
+        run_admin_operation(
+            &self.runtime,
+            self.request_timeout,
+            operation,
+            self.client.query_opt(query, params),
+        )
     }
 
     fn shutdown_background(self) {
@@ -146,11 +187,28 @@ impl AdminClient {
             client,
             _connection: connection,
             runtime,
+            request_timeout: _,
         } = self;
         drop(client);
         drop(connection);
         runtime.shutdown_background();
     }
+}
+
+fn run_admin_operation<T>(
+    runtime: &Runtime,
+    timeout: Duration,
+    operation: &'static str,
+    future: impl Future<Output = std::result::Result<T, tokio_postgres::Error>>,
+) -> Result<T> {
+    runtime
+        .block_on(async { tokio::time::timeout(timeout, future).await })
+        .map_err(|_| Error::PostgresOperationTimeout { operation, timeout })?
+        .map_err(|source| Error::postgres(operation, source))
+}
+
+fn client_operation_timeout(operation_timeout: Duration) -> Duration {
+    operation_timeout.saturating_add(CLIENT_OPERATION_TIMEOUT_GRACE)
 }
 
 /// Admin client retained across calls or by async code holding an advisory lock.
@@ -281,17 +339,21 @@ impl AdminSessionPool {
                     });
                 }
                 None => {
-                    let connected =
-                        AdminClient::connect(&self.admin_url, CONNECT_TIMEOUT, connect_operation)
-                            .map(PersistentClient::new)
-                            .and_then(|mut client| {
-                                prepare_new_lifecycle_session(
-                                    client.client_mut(),
-                                    self.operation_timeout,
-                                    &self.application_name,
-                                )?;
-                                Ok(client)
-                            });
+                    let connected = AdminClient::connect(
+                        &self.admin_url,
+                        CONNECT_TIMEOUT,
+                        client_operation_timeout(self.operation_timeout),
+                        connect_operation,
+                    )
+                    .map(PersistentClient::new)
+                    .and_then(|mut client| {
+                        prepare_new_lifecycle_session(
+                            client.client_mut(),
+                            self.operation_timeout,
+                            &self.application_name,
+                        )?;
+                        Ok(client)
+                    });
                     match connected {
                         Ok(client) => {
                             return Ok(AdminSession {
@@ -401,7 +463,12 @@ pub(crate) fn connect_admin_with_timeout(
     operation: &'static str,
     connect_timeout: Duration,
 ) -> Result<AdminClient> {
-    let mut client = AdminClient::connect(admin_url, connect_timeout, operation)?;
+    let mut client = AdminClient::connect(
+        admin_url,
+        connect_timeout,
+        client_operation_timeout(operation_timeout),
+        operation,
+    )?;
     configure_session_timeouts(&mut client, operation_timeout)?;
     Ok(client)
 }
@@ -409,11 +476,10 @@ pub(crate) fn connect_admin_with_timeout(
 fn configure_session_timeouts(client: &mut AdminClient, operation_timeout: Duration) -> Result<()> {
     let statement_timeout = duration_millis(operation_timeout)?;
     let lock_timeout = duration_millis(LOCK_TIMEOUT.min(operation_timeout))?;
-    client
-        .batch_execute(&format!(
-            "SET statement_timeout = {statement_timeout}; SET lock_timeout = {lock_timeout};"
-        ))
-        .map_err(|source| Error::postgres("configure admin session timeouts", source))
+    client.batch_execute(
+        "configure admin session timeouts",
+        &format!("SET statement_timeout = {statement_timeout}; SET lock_timeout = {lock_timeout};"),
+    )
 }
 
 fn prepare_new_lifecycle_session(
@@ -429,9 +495,7 @@ fn prepare_reused_lifecycle_session(
     operation_timeout: Duration,
     application_name: &str,
 ) -> Result<()> {
-    client
-        .batch_execute("DISCARD ALL")
-        .map_err(|source| Error::postgres("reset pooled admin session", source))?;
+    client.batch_execute("reset pooled admin session", "DISCARD ALL")?;
     configure_lifecycle_session(client, operation_timeout, application_name)
 }
 
@@ -442,48 +506,54 @@ fn configure_lifecycle_session(
 ) -> Result<()> {
     let statement_timeout = duration_millis(operation_timeout)?;
     let lock_timeout = duration_millis(LOCK_TIMEOUT.min(operation_timeout))?;
-    client
-        .batch_execute(&format!(
+    client.batch_execute(
+        "configure pooled admin session",
+        &format!(
             "SET statement_timeout = {statement_timeout}; \
              SET lock_timeout = {lock_timeout}; \
              SET application_name = {}",
             quote_literal(application_name)
-        ))
-        .map_err(|source| Error::postgres("configure pooled admin session", source))
+        ),
+    )
 }
 
 fn configure_coordination_timeouts(client: &mut AdminClient, wait_timeout: Duration) -> Result<()> {
     let timeout = duration_millis(wait_timeout)?;
-    client
-        .batch_execute(&format!(
-            "SET statement_timeout = {timeout}; SET lock_timeout = {timeout};"
-        ))
-        .map_err(|source| Error::postgres("configure template coordination timeouts", source))
+    client.batch_execute(
+        "configure template coordination timeouts",
+        &format!("SET statement_timeout = {timeout}; SET lock_timeout = {timeout};"),
+    )
 }
 
 pub(crate) fn validate_postgres_18(client: &mut AdminClient) -> Result<()> {
     let server_version_num: i32 = client
-        .query_one("SELECT current_setting('server_version_num')::integer", &[])
-        .map_err(|source| Error::postgres("read PostgreSQL server version", source))?
+        .query_one(
+            "read PostgreSQL server version",
+            "SELECT current_setting('server_version_num')::integer",
+            &[],
+        )?
         .get(0);
     if server_version_num / 10_000 != 18 {
         return Err(Error::UnsupportedPostgresVersion { server_version_num });
     }
     client
-        .query_one("SELECT uuidv7()::text", &[])
+        .query_one(
+            "check PostgreSQL uuidv7 capability",
+            "SELECT uuidv7()::text",
+            &[],
+        )
         .map_err(|_| Error::MissingUuidV7)?;
     Ok(())
 }
 
 pub(crate) fn regular_connection_slots(client: &mut AdminClient) -> Result<usize> {
-    let row = client
-        .query_one(
-            "SELECT current_setting('max_connections')::integer, \
+    let row = client.query_one(
+        "read PostgreSQL connection capacity",
+        "SELECT current_setting('max_connections')::integer, \
                     current_setting('reserved_connections')::integer, \
                     current_setting('superuser_reserved_connections')::integer",
-            &[],
-        )
-        .map_err(|source| Error::postgres("read PostgreSQL connection capacity", source))?;
+        &[],
+    )?;
     let max_connections = row.get::<_, i32>(0).max(1) as usize;
     let reserved_connections = row.get::<_, i32>(1).max(0) as usize;
     let superuser_reserved_connections = row.get::<_, i32>(2).max(0) as usize;
@@ -494,9 +564,11 @@ pub(crate) fn regular_connection_slots(client: &mut AdminClient) -> Result<usize
 }
 
 pub(crate) fn acquire_advisory_lock(client: &mut AdminClient, key: i64) -> Result<()> {
-    client
-        .query_one("SELECT pg_advisory_lock($1)", &[&key])
-        .map_err(|source| Error::postgres("acquire PostgreSQL advisory lock", source))?;
+    client.query_one(
+        "acquire PostgreSQL advisory lock",
+        "SELECT pg_advisory_lock($1)",
+        &[&key],
+    )?;
     Ok(())
 }
 
@@ -507,9 +579,12 @@ pub(crate) fn acquire_template_advisory_lock(
     operation_timeout: Duration,
 ) -> Result<()> {
     configure_coordination_timeouts(client, wait_timeout)?;
-    client
-        .query_one("SELECT pg_advisory_lock($1)", &[&key])
-        .map_err(|source| Error::postgres("acquire PostgreSQL template advisory lock", source))?;
+    client.query_one_with_timeout(
+        client_operation_timeout(wait_timeout),
+        "acquire PostgreSQL template advisory lock",
+        "SELECT pg_advisory_lock($1)",
+        &[&key],
+    )?;
     configure_session_timeouts(client, operation_timeout)
 }
 
@@ -520,32 +595,40 @@ pub(crate) fn acquire_shared_template_advisory_lock(
     operation_timeout: Duration,
 ) -> Result<()> {
     configure_coordination_timeouts(client, wait_timeout)?;
-    client
-        .query_one("SELECT pg_advisory_lock_shared($1)", &[&key])
-        .map_err(|source| {
-            Error::postgres("acquire shared PostgreSQL template advisory lock", source)
-        })?;
+    client.query_one_with_timeout(
+        client_operation_timeout(wait_timeout),
+        "acquire shared PostgreSQL template advisory lock",
+        "SELECT pg_advisory_lock_shared($1)",
+        &[&key],
+    )?;
     configure_session_timeouts(client, operation_timeout)
 }
 
 pub(crate) fn try_acquire_advisory_lock(client: &mut AdminClient, key: i64) -> Result<bool> {
     client
-        .query_one("SELECT pg_try_advisory_lock($1)", &[&key])
+        .query_one(
+            "try PostgreSQL advisory lock",
+            "SELECT pg_try_advisory_lock($1)",
+            &[&key],
+        )
         .map(|row| row.get(0))
-        .map_err(|source| Error::postgres("try PostgreSQL advisory lock", source))
 }
 
 pub(crate) fn release_advisory_lock(client: &mut AdminClient, key: i64) -> Result<()> {
-    client
-        .query_one("SELECT pg_advisory_unlock($1)", &[&key])
-        .map_err(|source| Error::postgres("release PostgreSQL advisory lock", source))?;
+    client.query_one(
+        "release PostgreSQL advisory lock",
+        "SELECT pg_advisory_unlock($1)",
+        &[&key],
+    )?;
     Ok(())
 }
 
 pub(crate) fn release_shared_advisory_lock(client: &mut AdminClient, key: i64) -> Result<()> {
-    client
-        .query_one("SELECT pg_advisory_unlock_shared($1)", &[&key])
-        .map_err(|source| Error::postgres("release shared PostgreSQL advisory lock", source))?;
+    client.query_one(
+        "release shared PostgreSQL advisory lock",
+        "SELECT pg_advisory_unlock_shared($1)",
+        &[&key],
+    )?;
     Ok(())
 }
 
@@ -555,12 +638,13 @@ fn create_database(
     template_name: &str,
 ) -> Result<()> {
     let template = quote_identifier(template_name)?;
-    client
-        .batch_execute(&format!(
+    client.batch_execute(
+        "create disposable PostgreSQL database",
+        &format!(
             "CREATE DATABASE {} TEMPLATE {template}",
             database_name.quoted()
-        ))
-        .map_err(|source| Error::postgres("create disposable PostgreSQL database", source))
+        ),
+    )
 }
 
 pub(crate) fn create_managed_database(
@@ -589,12 +673,13 @@ fn compensate_failed_metadata_write(tagging: Error, cleanup: impl FnOnce() -> Re
 }
 
 pub(crate) fn drop_database(client: &mut AdminClient, database_name: &DatabaseName) -> Result<()> {
-    client
-        .batch_execute(&format!(
+    client.batch_execute(
+        "drop disposable PostgreSQL database",
+        &format!(
             "DROP DATABASE IF EXISTS {} WITH (FORCE)",
             database_name.quoted()
-        ))
-        .map_err(|source| Error::postgres("drop disposable PostgreSQL database", source))
+        ),
+    )
 }
 
 pub(crate) fn find_database(
@@ -603,6 +688,7 @@ pub(crate) fn find_database(
 ) -> Result<Option<DatabaseRecord>> {
     client
         .query_opt(
+            "find disposable PostgreSQL database",
             "SELECT datname, shobj_description(oid, 'pg_database') \
              FROM pg_database WHERE datname = $1",
             &[&database_name.as_str()],
@@ -613,7 +699,6 @@ pub(crate) fn find_database(
                 comment: row.get(1),
             })
         })
-        .map_err(|source| Error::postgres("find disposable PostgreSQL database", source))
 }
 
 pub(crate) fn set_database_metadata(
@@ -621,25 +706,27 @@ pub(crate) fn set_database_metadata(
     database_name: &DatabaseName,
     metadata: &ResourceMetadata,
 ) -> Result<()> {
-    client
-        .batch_execute(&format!(
+    client.batch_execute(
+        "write disposable PostgreSQL database metadata",
+        &format!(
             "COMMENT ON DATABASE {} IS {}",
             database_name.quoted(),
             quote_literal(&metadata.encode())
-        ))
-        .map_err(|source| Error::postgres("write disposable PostgreSQL database metadata", source))
+        ),
+    )
 }
 
 pub(crate) fn disable_database_connections(
     client: &mut AdminClient,
     database_name: &DatabaseName,
 ) -> Result<()> {
-    client
-        .batch_execute(&format!(
+    client.batch_execute(
+        "disable PostgreSQL template connections",
+        &format!(
             "ALTER DATABASE {} ALLOW_CONNECTIONS false",
             database_name.quoted()
-        ))
-        .map_err(|source| Error::postgres("disable PostgreSQL template connections", source))
+        ),
+    )
 }
 
 pub(crate) fn terminate_database_connections(
@@ -652,14 +739,13 @@ pub(crate) fn terminate_database_connections(
             duration: operation_timeout,
         }
     })?;
-    let rows = client
-        .query(
-            "SELECT pg_terminate_backend(pid, $2::bigint) \
+    let rows = client.query(
+        "terminate PostgreSQL template connections",
+        "SELECT pg_terminate_backend(pid, $2::bigint) \
              FROM pg_stat_activity \
              WHERE datname = $1 AND pid <> pg_backend_pid()",
-            &[&database_name.as_str(), &timeout],
-        )
-        .map_err(|source| Error::postgres("terminate PostgreSQL template connections", source))?;
+        &[&database_name.as_str(), &timeout],
+    )?;
     if rows.iter().any(|row| !row.get::<_, bool>(0)) {
         return Err(Error::TemplateConnectionsRemain {
             database_name: database_name.as_str().to_owned(),
@@ -668,10 +754,10 @@ pub(crate) fn terminate_database_connections(
 
     let connections_remain: bool = client
         .query_one(
+            "verify PostgreSQL template connections",
             "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE datname = $1)",
             &[&database_name.as_str()],
-        )
-        .map_err(|source| Error::postgres("verify PostgreSQL template connections", source))?
+        )?
         .get(0);
     if connections_remain {
         return Err(Error::TemplateConnectionsRemain {
@@ -684,6 +770,7 @@ pub(crate) fn terminate_database_connections(
 pub(crate) fn list_databases(client: &mut AdminClient) -> Result<Vec<DatabaseRecord>> {
     client
         .query(
+            "list PostgreSQL databases for stale cleanup",
             "SELECT datname, shobj_description(oid, 'pg_database') FROM pg_database",
             &[],
         )
@@ -695,7 +782,6 @@ pub(crate) fn list_databases(client: &mut AdminClient) -> Result<Vec<DatabaseRec
                 })
                 .collect()
         })
-        .map_err(|source| Error::postgres("list PostgreSQL databases for stale cleanup", source))
 }
 
 pub(crate) fn advisory_key(domain: &str, identity: &str) -> i64 {
@@ -843,7 +929,9 @@ mod tests {
         assert!(!server.join().unwrap().is_empty());
     }
 
-    fn connect_stub_admin_client() -> (
+    fn connect_stub_admin_client(
+        operation_timeout: Duration,
+    ) -> (
         AdminClient,
         mpsc::Receiver<io::Result<()>>,
         thread::JoinHandle<()>,
@@ -878,14 +966,44 @@ mod tests {
         let client = AdminClient::connect(
             &admin,
             Duration::from_secs(1),
+            operation_timeout,
             "connect to stub PostgreSQL server",
         )
         .unwrap();
         (client, closed_receiver, server)
     }
 
+    #[test]
+    fn admin_operation_deadline_covers_a_silent_postgres_peer() {
+        let timeout = Duration::from_millis(50);
+        let (mut client, closed, server) = connect_stub_admin_client(timeout);
+
+        let error = match client.query_one(
+            "run query against silent PostgreSQL test server",
+            "SELECT 1",
+            &[],
+        ) {
+            Ok(_) => panic!("silent PostgreSQL peer must not complete a query"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            Error::PostgresOperationTimeout {
+                operation: "run query against silent PostgreSQL test server",
+                timeout: actual,
+            } if actual == timeout
+        ));
+        drop(client);
+        closed
+            .recv_timeout(Duration::from_secs(1))
+            .expect("timed-out admin connection should close when dropped")
+            .expect("stub PostgreSQL connection should close cleanly");
+        server.join().unwrap();
+    }
+
     fn assert_persistent_client_drop_is_safe(runtime: tokio::runtime::Runtime) {
-        let (client, closed, server) = connect_stub_admin_client();
+        let (client, closed, server) = connect_stub_admin_client(Duration::from_secs(1));
 
         runtime.block_on(async move {
             drop(PersistentClient::new(client));

@@ -83,6 +83,12 @@ pub enum Error {
         timeout: Duration,
     },
 
+    #[error("PostgreSQL test operation timed out during {operation} after {timeout:?}")]
+    PostgresOperationTimeout {
+        operation: &'static str,
+        timeout: Duration,
+    },
+
     #[error("failed to initialize PostgreSQL admin runtime during {operation}: {source}")]
     PostgresRuntime {
         operation: &'static str,

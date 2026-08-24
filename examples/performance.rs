@@ -31,7 +31,7 @@ use tokio::{sync::Semaphore, task::JoinSet};
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const DEFAULT_IMAGE: &str = "postgres:18";
 const OUTPUT_ENV: &str = "PTH_PERF_OUTPUT";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -245,7 +245,7 @@ struct SourceReport {
 struct EnvironmentReport {
     mode: ServerMode,
     image_reference: Option<String>,
-    image_digest: MetadataValue,
+    image_content_id: MetadataValue,
     storage_driver: MetadataValue,
     postgres_version: String,
     postgres_version_num: i32,
@@ -299,7 +299,7 @@ struct StartupReport {
 #[derive(Serialize)]
 struct ReadinessReport {
     postmaster_started_at: String,
-    container_image_digest: Option<String>,
+    container_image_content_id: Option<String>,
     postgres_version: String,
     postgres_version_num: i32,
 }
@@ -557,8 +557,8 @@ async fn main() -> AnyResult<()> {
     let config = BenchmarkConfig::from_environment(benchmark_project())?;
     let source = source_report();
     let output = ReportOutput::prepare(config.output.as_deref())?;
-    let (image_digest, storage_driver) = environment_metadata(&config)?;
-    let expected_owned_image_digest = image_digest.value.as_deref();
+    let (image_content_id, storage_driver) = environment_metadata(&config)?;
+    let expected_owned_image_content_id = image_content_id.value.as_deref();
 
     eprintln!(
         "postgres-test-harness performance: project={}, mode={}, samples={}, sequential={}, concurrent={} at {}, drains={}",
@@ -575,8 +575,13 @@ async fn main() -> AnyResult<()> {
     let mut first_server_metadata = None;
     for sample in 1..=config.samples {
         eprintln!("sample {sample}/{}", config.samples);
-        let (report, metadata) =
-            run_sample(&config, &invocation, sample, expected_owned_image_digest).await?;
+        let (report, metadata) = run_sample(
+            &config,
+            &invocation,
+            sample,
+            expected_owned_image_content_id,
+        )
+        .await?;
         first_server_metadata.get_or_insert(metadata);
         samples.push(report);
     }
@@ -592,7 +597,7 @@ async fn main() -> AnyResult<()> {
         environment: EnvironmentReport {
             mode: config.mode.clone(),
             image_reference: matches!(config.mode, ServerMode::Owned).then(|| config.image.clone()),
-            image_digest,
+            image_content_id,
             storage_driver,
             postgres_version: metadata.version,
             postgres_version_num: metadata.version_num,
@@ -621,7 +626,7 @@ async fn run_sample(
     config: &BenchmarkConfig,
     invocation: &str,
     sample: usize,
-    expected_owned_image_digest: Option<&str>,
+    expected_owned_image_content_id: Option<&str>,
 ) -> AnyResult<(SampleReport, ServerMetadata)> {
     let startup_started = Instant::now();
     let harness = PostgresHarness::start(config.harness_config()?).await?;
@@ -633,7 +638,7 @@ async fn run_sample(
         invocation,
         sample,
         startup_elapsed,
-        expected_owned_image_digest,
+        expected_owned_image_content_id,
     )
     .await;
     let validation = match &measurements {
@@ -655,10 +660,10 @@ async fn measure_started_sample(
     invocation: &str,
     sample: usize,
     startup_elapsed: Duration,
-    expected_owned_image_digest: Option<&str>,
+    expected_owned_image_content_id: Option<&str>,
 ) -> AnyResult<SampleMeasurements> {
-    let container_image_digest =
-        verify_started_image(&config.mode, harness, expected_owned_image_digest)?;
+    let container_image_content_id =
+        verify_started_image(&config.mode, harness, expected_owned_image_content_id)?;
     let admin_url = harness.admin_database_url().to_owned();
     let observer = Observer::connect(&admin_url).await?;
     let measurements = measure_with_observer(
@@ -668,7 +673,7 @@ async fn measure_started_sample(
         invocation,
         sample,
         startup_elapsed,
-        container_image_digest,
+        container_image_content_id,
     )
     .await;
     let closed = observer.close().await;
@@ -683,7 +688,7 @@ async fn measure_with_observer(
     invocation: &str,
     sample: usize,
     startup_elapsed: Duration,
-    container_image_digest: Option<String>,
+    container_image_content_id: Option<String>,
 ) -> AnyResult<SampleMeasurements> {
     let server_metadata = observer.server_metadata().await?;
     let first_postmaster_start = server_metadata.postmaster_started_at.clone();
@@ -718,7 +723,7 @@ async fn measure_with_observer(
             },
             readiness: ReadinessReport {
                 postmaster_started_at: server_metadata.postmaster_started_at.clone(),
-                container_image_digest,
+                container_image_content_id,
                 postgres_version: server_metadata.version.clone(),
                 postgres_version_num: server_metadata.version_num,
             },
@@ -1090,26 +1095,26 @@ fn benchmark_project() -> String {
 fn verify_started_image(
     mode: &ServerMode,
     harness: &PostgresHarness,
-    expected_digest: Option<&str>,
+    expected_content_id: Option<&str>,
 ) -> AnyResult<Option<String>> {
     let ServerMode::Owned = mode else {
         return Ok(None);
     };
-    let expected_digest = expected_digest.ok_or_else(|| {
-        invalid_input("owned benchmark did not resolve a cached image digest before startup")
+    let expected_content_id = expected_content_id.ok_or_else(|| {
+        invalid_input("owned benchmark did not resolve a cached image content ID before startup")
     })?;
     let container_id = harness
         .container_id()
         .ok_or_else(|| invalid_input("owned benchmark started without a container ID"))?;
-    let actual_digest =
+    let actual_content_id =
         command_output("docker", &["inspect", "--format={{.Image}}", container_id])?;
-    if actual_digest != expected_digest {
+    if actual_content_id != expected_content_id {
         return Err(io::Error::other(format!(
-            "started container image digest {actual_digest:?} differs from cached preflight digest {expected_digest:?}"
+            "started container image content ID {actual_content_id:?} differs from cached preflight content ID {expected_content_id:?}"
         ))
         .into());
     }
-    Ok(Some(actual_digest))
+    Ok(Some(actual_content_id))
 }
 
 impl ReportOutput {
@@ -1220,7 +1225,7 @@ fn write_stdout(encoded: &[u8]) -> AnyResult<()> {
 fn environment_metadata(config: &BenchmarkConfig) -> AnyResult<(MetadataValue, MetadataValue)> {
     match config.mode {
         ServerMode::Owned => {
-            let digest = command_output(
+            let content_id = command_output(
                 "docker",
                 &["image", "inspect", "--format={{.Id}}", &config.image],
             )
@@ -1233,8 +1238,8 @@ fn environment_metadata(config: &BenchmarkConfig) -> AnyResult<(MetadataValue, M
             let driver = command_output("docker", &["info", "--format={{.Driver}}"])?;
             Ok((
                 MetadataValue {
-                    value: Some(digest),
-                    source: "docker_image_inspect",
+                    value: Some(content_id),
+                    source: "docker_image_inspect_id",
                 },
                 MetadataValue {
                     value: Some(driver),
@@ -1243,7 +1248,7 @@ fn environment_metadata(config: &BenchmarkConfig) -> AnyResult<(MetadataValue, M
             ))
         }
         ServerMode::External => Ok((
-            external_metadata("PTH_PERF_EXTERNAL_IMAGE_DIGEST"),
+            external_metadata("PTH_PERF_EXTERNAL_IMAGE_CONTENT_ID"),
             external_metadata("PTH_PERF_EXTERNAL_STORAGE_DRIVER"),
         )),
     }
@@ -1558,6 +1563,6 @@ mod tests {
         );
         assert!(projects.iter().all(|project| project.starts_with("pghp_")));
         assert!(projects.iter().all(|project| project.len() == 16));
-        assert_eq!(SCHEMA_VERSION, 2);
+        assert_eq!(SCHEMA_VERSION, 3);
     }
 }

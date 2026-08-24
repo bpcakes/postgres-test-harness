@@ -1,11 +1,11 @@
 # Performance baseline
 
 This baseline characterizes the production library at commit
-`6edc72c936b909438900274d5f3968878875d15e`. The benchmark and documentation
-changes were uncommitted when it ran, so the JSON correctly reported
-`git_worktree_dirty: true`; no `src/` file differed from that commit. The
-reports used schema version 2 and were written beneath ignored `target/`, which
-did not add any worktree change of its own.
+`667557a5bd7ba58dd51a05535552bd3c6a961fc7`. The schema-v3 naming and
+documentation changes were uncommitted when it ran, so the JSON correctly
+reported `git_worktree_dirty: true`; no `src/` file differed from that commit.
+The reports were written beneath ignored `target/`, which did not add any
+worktree change of its own.
 
 Both runs completed on 2026-08-24 with the same workload. These numbers are
 directional observations from one machine, not project thresholds.
@@ -20,7 +20,7 @@ directional observations from one machine, not project thresholds.
 | Docker storage driver | `overlay2` |
 | Host | Linux x86-64, 64 logical CPUs |
 | Samples | 3 independent harness starts per mode |
-| Benchmark projects | `pghp_01a0347fb7` owned; `pghp_01a0347f4f` external |
+| Benchmark projects | `pghp_684b94ae920` owned; `pghp_30d72d80b04` external |
 | Sequential work | 4 clone-cleanup lifecycles per fixture |
 | Concurrent work | 8 clone-cleanup lifecycles, bounded at 4 |
 | Cleanup drains | 4 pre-created databases |
@@ -42,21 +42,21 @@ Elapsed milliseconds across three samples:
 
 | Metric | Fixture | Min | Median | Mean | Max |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Server startup | all | 3401.962 | 4178.939 | 3937.837 | 4232.611 |
-| Cold template acquisition | small | 74.645 | 75.876 | 75.513 | 76.019 |
-| Cold template acquisition | representative | 443.698 | 448.534 | 450.918 | 460.521 |
-| Warm template acquisition | small | 6.438 | 6.818 | 6.786 | 7.101 |
-| Warm template acquisition | representative | 6.396 | 7.042 | 6.857 | 7.134 |
-| Sequential clone-cleanup (4) | small | 205.439 | 211.329 | 211.090 | 216.501 |
-| Sequential clone-cleanup (4) | representative | 327.126 | 332.100 | 338.476 | 356.201 |
-| Bounded concurrent clone-cleanup (8 at 4) | small | 133.174 | 150.196 | 144.747 | 150.871 |
-| Bounded concurrent clone-cleanup (8 at 4) | representative | 391.839 | 526.143 | 559.801 | 761.421 |
-| Explicit cleanup drain (4-way) | small | 23.474 | 25.129 | 26.630 | 31.289 |
-| Explicit cleanup drain (4-way) | representative | 26.266 | 41.782 | 103.687 | 243.013 |
-| Deferred cleanup drain (4 queued to serial worker) | small | 93.974 | 94.080 | 163.598 | 302.740 |
-| Deferred cleanup drain (4 queued to serial worker) | representative | 150.261 | 176.835 | 201.058 | 276.079 |
+| Server startup | all | 2560.538 | 2718.199 | 2751.948 | 2977.107 |
+| Cold template acquisition | small | 82.234 | 83.651 | 84.320 | 87.074 |
+| Cold template acquisition | representative | 458.438 | 468.013 | 474.686 | 497.607 |
+| Warm template acquisition | small | 6.263 | 7.279 | 7.100 | 7.759 |
+| Warm template acquisition | representative | 6.867 | 7.301 | 7.528 | 8.416 |
+| Sequential clone-cleanup (4) | small | 203.312 | 213.823 | 212.756 | 221.132 |
+| Sequential clone-cleanup (4) | representative | 343.458 | 364.284 | 359.004 | 369.269 |
+| Bounded concurrent clone-cleanup (8 at 4) | small | 142.716 | 149.360 | 158.030 | 182.013 |
+| Bounded concurrent clone-cleanup (8 at 4) | representative | 394.330 | 398.280 | 425.215 | 483.034 |
+| Explicit cleanup drain (4-way) | small | 23.014 | 23.386 | 24.366 | 26.699 |
+| Explicit cleanup drain (4-way) | representative | 31.198 | 32.882 | 46.689 | 75.987 |
+| Deferred cleanup drain (4 queued to serial worker) | small | 105.182 | 142.671 | 131.162 | 145.633 |
+| Deferred cleanup drain (4 queued to serial worker) | representative | 167.036 | 199.573 | 192.154 | 209.854 |
 
-Startup's 3.40–4.23 second range is material variance even with a cached image;
+Startup's 2.56–2.98 second range is material variance even with a cached image;
 preserving raw observations is therefore more informative than a single
 headline value.
 
@@ -73,19 +73,19 @@ Elapsed milliseconds across three samples:
 
 | Metric | Fixture | Min | Median | Mean | Max |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Harness attach/startup | all | 6.413 | 7.218 | 6.953 | 7.228 |
-| Cold template acquisition | small | 65.253 | 70.256 | 71.956 | 80.359 |
-| Cold template acquisition | representative | 473.397 | 474.803 | 475.927 | 479.581 |
-| Warm template acquisition | small | 6.200 | 6.860 | 7.105 | 8.255 |
-| Warm template acquisition | representative | 6.544 | 6.910 | 6.889 | 7.213 |
-| Sequential clone-cleanup (4) | small | 195.414 | 203.554 | 206.416 | 220.280 |
-| Sequential clone-cleanup (4) | representative | 333.633 | 410.186 | 422.321 | 523.143 |
-| Bounded concurrent clone-cleanup (8 at 4) | small | 140.805 | 152.712 | 154.482 | 169.928 |
-| Bounded concurrent clone-cleanup (8 at 4) | representative | 523.182 | 736.240 | 683.688 | 791.641 |
-| Explicit cleanup drain (4-way) | small | 24.240 | 24.652 | 24.767 | 25.411 |
-| Explicit cleanup drain (4-way) | representative | 135.964 | 190.120 | 177.462 | 206.302 |
-| Deferred cleanup drain (4 queued to serial worker) | small | 81.773 | 93.937 | 90.166 | 94.787 |
-| Deferred cleanup drain (4 queued to serial worker) | representative | 176.744 | 267.590 | 237.501 | 268.168 |
+| Harness attach/startup | all | 6.444 | 6.855 | 6.970 | 7.612 |
+| Cold template acquisition | small | 69.768 | 70.025 | 73.924 | 81.980 |
+| Cold template acquisition | representative | 464.746 | 470.607 | 469.718 | 473.800 |
+| Warm template acquisition | small | 6.816 | 6.893 | 6.966 | 7.188 |
+| Warm template acquisition | representative | 7.084 | 7.958 | 7.986 | 8.916 |
+| Sequential clone-cleanup (4) | small | 199.359 | 202.395 | 203.685 | 209.301 |
+| Sequential clone-cleanup (4) | representative | 365.680 | 402.629 | 394.186 | 414.251 |
+| Bounded concurrent clone-cleanup (8 at 4) | small | 139.297 | 146.542 | 146.993 | 155.138 |
+| Bounded concurrent clone-cleanup (8 at 4) | representative | 465.725 | 471.586 | 515.216 | 608.337 |
+| Explicit cleanup drain (4-way) | small | 25.657 | 28.214 | 28.317 | 31.079 |
+| Explicit cleanup drain (4-way) | representative | 49.732 | 91.358 | 79.115 | 96.254 |
+| Deferred cleanup drain (4 queued to serial worker) | small | 83.819 | 95.757 | 106.935 | 141.230 |
+| Deferred cleanup drain (4 queued to serial worker) | representative | 153.471 | 155.939 | 177.273 | 222.407 |
 
 Explicit drain used four concurrent cleanup calls. Deferred drain submitted
 four leases to the current process-global serial worker and detected completion
@@ -93,7 +93,7 @@ with 10 ms catalog polling. The rows characterize different public behaviors;
 their ratio is not an estimate of intrinsic explicit-versus-deferred cleanup
 overhead.
 
-The external cleanup pass took 35.0–38.5 ms per sample and dropped exactly two
+The external cleanup pass took 32.9–39.1 ms per sample and dropped exactly two
 run-unique templates each time. Every pass completed in one attempt with all
 three skipped counters at zero. It found no residual test database, and a final
 catalog query confirmed that the unique project had no database remaining.

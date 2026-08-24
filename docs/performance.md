@@ -27,7 +27,9 @@ The example refuses to start owned mode if `docker image inspect` cannot find
 the image locally. It passes that resolved reference explicitly to the harness,
 then verifies every started container's actual image ID against the cached
 content ID. It also records the Docker daemon storage driver.
-`POSTGRES_TEST_IMAGE` selects a different image.
+`POSTGRES_TEST_IMAGE` selects a different image. This value is Docker's local
+image configuration/content ID (`docker image inspect .Id`), not a registry
+manifest from `RepoDigests`.
 
 ## External-server run
 
@@ -35,7 +37,7 @@ Set the same administrative URL accepted by the library:
 
 ```bash
 POSTGRES_TEST_ADMIN_URL='postgres://postgres:secret@127.0.0.1/postgres' \
-PTH_PERF_EXTERNAL_IMAGE_DIGEST='sha256:provisioned-image-id' \
+PTH_PERF_EXTERNAL_IMAGE_CONTENT_ID='sha256:provisioned-image-id' \
 PTH_PERF_EXTERNAL_STORAGE_DRIVER='provisioner-or-filesystem' \
 PTH_PERF_OUTPUT=target/performance-external.json \
 cargo run --locked --release --example performance
@@ -43,9 +45,10 @@ cargo run --locked --release --example performance
 
 The URL and credentials are never written to the report. Image and storage
 metadata cannot be discovered portably from PostgreSQL, so the two external
-metadata variables are optional provenance supplied by the operator. Their
-fields remain present with a `not_reported_for_external_server` source when the
-values are unavailable.
+metadata variables are optional provenance supplied by the operator. Supply
+the same Docker content-ID kind used by owned mode, rather than a registry
+manifest digest. Their fields remain present with a
+`not_reported_for_external_server` source when the values are unavailable.
 
 An external run disables the startup stale sweep so that unrelated cleanup is
 not folded into startup. Each invocation uses a random, valid project namespace
@@ -133,7 +136,7 @@ connection policy.
 | `PTH_PERF_DRAIN_DATABASES` | 4 | Pre-created leases in each cleanup-drain measurement |
 | `PTH_PERF_REPRESENTATIVE_ROWS` | 50000 | Rows migrated into the representative fixture |
 | `PTH_PERF_OUTPUT` | stdout | JSON output path; use ignored `target/` for clean provenance |
-| `PTH_PERF_EXTERNAL_IMAGE_DIGEST` | unset | External-server image provenance |
+| `PTH_PERF_EXTERNAL_IMAGE_CONTENT_ID` | unset | External-server Docker image content ID |
 | `PTH_PERF_EXTERNAL_STORAGE_DRIVER` | unset | External-server storage provenance |
 
 Keep the workload configuration equal when comparing reports. Multiple raw

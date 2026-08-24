@@ -58,7 +58,7 @@ jobs:
         if: inputs.mode == 'external'
         env:
           POSTGRES_TEST_ADMIN_URL: ${{ secrets.POSTGRES_TEST_ADMIN_URL }}
-          PTH_PERF_EXTERNAL_IMAGE_DIGEST: ${{ vars.PTH_PERF_EXTERNAL_IMAGE_DIGEST }}
+          PTH_PERF_EXTERNAL_IMAGE_CONTENT_ID: ${{ vars.PTH_PERF_EXTERNAL_IMAGE_CONTENT_ID }}
           PTH_PERF_EXTERNAL_STORAGE_DRIVER: ${{ vars.PTH_PERF_EXTERNAL_STORAGE_DRIVER }}
         run: |
           if [[ -z "$POSTGRES_TEST_ADMIN_URL" ]]; then
@@ -74,7 +74,7 @@ jobs:
             "## Performance characterization (`" + .environment.mode + "`)",
             "",
             "PostgreSQL: `" + .environment.postgres_version + "`  ",
-            "Image: `" + (.environment.image_digest.value // "not reported") + "`  ",
+            "Image content ID: `" + (.environment.image_content_id.value // "not reported") + "`  ",
             "Storage: `" + (.environment.storage_driver.value // "not reported") + "`  ",
             "",
             "| Metric | Fixture | Min ms | Median ms | Mean ms | Max ms |",

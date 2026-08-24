@@ -217,3 +217,31 @@ four-session limit, blocks four simultaneous metadata operations, and observes
 exactly four project-labeled lifecycle backends through `pg_stat_activity`.
 
 The raw local report is `target/performance-owned-perf02.json`.
+
+## PERF04 bounded deferred-cleanup follow-up
+
+On 2026-08-24, the default owned workload was rerun three times after replacing
+the process-global fallback worker with bounded per-server cleanup workers and
+an awaited sequence barrier. The schema-v6 run used the same cached image
+content ID, 1 GiB tmpfs profile, 50,000-row representative fixture, operation
+counts, and four-database drain as the PERF02 sample. It records base commit
+`10b7f5a59f7b35eceb8bf6389aa82f1cb1cb6853` and a dirty worktree containing the
+PERF04 implementation. Its project was `pghp_b9be2276762`.
+
+Schema v6 separates the time required to hand four leases to the bounded queue
+from the subsequent final drain:
+
+| Fixture | Caller return median | Final drain median | Caller-to-final median |
+| --- | ---: | ---: | ---: |
+| Small | 0.155 ms | 6.740 ms | 6.899 ms |
+| Representative | 0.167 ms | 12.085 ms | 12.257 ms |
+
+The former PERF02 `deferred_cleanup_drain` measured Drop-to-catalog-poll
+completion and had medians of 47.352 ms and 117.607 ms respectively. Those
+values are useful directional context, not an apples-to-apples speedup claim:
+the old observation included 10 ms polling granularity, while PERF04 ends on
+the explicit drain barrier and performs one untimed catalog assertion after it
+returns. All six PERF04 deferred phases opened zero new lifecycle sessions,
+showing reuse of the already-warm per-server pool.
+
+The raw local report is `target/performance-owned-perf04.json`.

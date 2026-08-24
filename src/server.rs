@@ -23,6 +23,7 @@ use crate::{
         advisory_key, connect_admin, connect_admin_with_timeout, regular_connection_slots,
         validate_postgres_18,
     },
+    cleanup::DatabaseCleanupQueue,
     config::{ImageReference, OwnedContainerProfile, ResolvedConnectionLimits},
 };
 
@@ -59,7 +60,8 @@ pub(crate) struct ServerInner {
     pub(crate) cleanup_on_start: bool,
     pub(crate) connections_per_database: u32,
     budget: Arc<Semaphore>,
-    admin_sessions: AdminSessionPool,
+    pub(crate) database_cleanup: Arc<DatabaseCleanupQueue>,
+    admin_sessions: Arc<AdminSessionPool>,
     _owner_lock: Mutex<Option<PersistentClient>>,
     container: Option<Arc<ContainerOwner>>,
 }
@@ -169,12 +171,21 @@ impl ServerInner {
             regular_connection_slots(&mut owner_lock)?,
         );
         acquire_advisory_lock(&mut owner_lock, owner_key)?;
-        let admin_sessions = AdminSessionPool::new(
+        let admin_sessions = Arc::new(AdminSessionPool::new(
             admin_url.clone(),
             config.operation_timeout,
             config.project.as_str(),
             admin_pool_size,
-        );
+        ));
+        let budget = Arc::new(Semaphore::new(connection_limits.budget));
+        // One waiting slot per worker bounds deferred residual databases while
+        // still allowing the lifecycle pool's safe concurrency to make progress.
+        let database_cleanup = DatabaseCleanupQueue::new(
+            config.project.as_str(),
+            admin_pool_size,
+            admin_pool_size,
+            budget.clone(),
+        )?;
 
         Ok(Arc::new(Self {
             admin_url,
@@ -185,7 +196,8 @@ impl ServerInner {
             stale_after: config.stale_after,
             cleanup_on_start: config.cleanup_on_start,
             connections_per_database: connection_limits.per_database,
-            budget: Arc::new(Semaphore::new(connection_limits.budget)),
+            budget,
+            database_cleanup,
             admin_sessions,
             _owner_lock: Mutex::new(Some(PersistentClient::new(owner_lock))),
             container,
@@ -223,8 +235,42 @@ impl ServerInner {
         else {
             return Ok(());
         };
-        self.admin_sessions.close();
-        run_blocking(move || container.shutdown()).await
+        let database_cleanup = self.database_cleanup.clone();
+        let admin_sessions = self.admin_sessions.clone();
+        // Keep the whole terminal sequence in one blocking task. Cancellation
+        // of the async caller can detach this task, but cannot skip pool closure
+        // or container removal after the cleanup barrier has begun.
+        let outcome = run_blocking(move || {
+            let cleanup = database_cleanup.close_and_begin_drain();
+            admin_sessions.close();
+            let shutdown = container.shutdown();
+            Ok(OwnedShutdownOutcome { cleanup, shutdown })
+        })
+        .await?;
+        outcome.finish()
+    }
+}
+
+struct OwnedShutdownOutcome {
+    cleanup: crate::cleanup::CleanupDrainOutcome,
+    shutdown: Result<()>,
+}
+
+impl OwnedShutdownOutcome {
+    fn finish(self) -> Result<()> {
+        combine_cleanup_and_shutdown(self.cleanup.finish(), self.shutdown)
+    }
+}
+
+fn combine_cleanup_and_shutdown(cleanup: Result<()>, shutdown: Result<()>) -> Result<()> {
+    match (cleanup, shutdown) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(cleanup), Ok(())) => Err(cleanup),
+        (Ok(()), Err(shutdown)) => Err(shutdown),
+        (Err(cleanup), Err(shutdown)) => Err(Error::CleanupAndContainerShutdown {
+            cleanup: Box::new(cleanup),
+            shutdown: Box::new(shutdown),
+        }),
     }
 }
 
@@ -733,9 +779,10 @@ mod tests {
 
     use super::{
         ContainerCommand, ContainerOwner, ContainerWorker, POSTGRES_INITDB_NO_SYNC,
-        POSTGRES_STORAGE_PATH, ServerInner, begin_owned_container_shutdown, container_request,
-        ipv4_mapped_container_host, map_container_start_error, memory_exhaustion_evidence,
-        per_harness_admin_session_pool_size, storage_exhaustion_evidence,
+        POSTGRES_STORAGE_PATH, ServerInner, begin_owned_container_shutdown,
+        combine_cleanup_and_shutdown, container_request, ipv4_mapped_container_host,
+        map_container_start_error, memory_exhaustion_evidence, per_harness_admin_session_pool_size,
+        storage_exhaustion_evidence,
     };
     use crate::{
         Error, HarnessConfig, OwnedContainerProfile,
@@ -952,6 +999,22 @@ mod tests {
         assert!(begin_owned_container_shutdown(None, &budget).is_none());
         assert!(!budget.is_closed());
         assert_eq!(budget.available_permits(), 1);
+    }
+
+    #[test]
+    fn owned_shutdown_preserves_cleanup_and_container_failures() {
+        let error = combine_cleanup_and_shutdown(
+            Err(Error::InvalidConfiguration { reason: "cleanup" }),
+            Err(Error::InvalidConfiguration {
+                reason: "container",
+            }),
+        )
+        .unwrap_err();
+        let Error::CleanupAndContainerShutdown { cleanup, shutdown } = error else {
+            panic!("unexpected combined shutdown error: {error:?}");
+        };
+        assert!(cleanup.to_string().contains("cleanup"));
+        assert!(shutdown.to_string().contains("container"));
     }
 
     #[test]

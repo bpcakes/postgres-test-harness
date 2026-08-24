@@ -54,7 +54,8 @@ project-specific policy:
 4. Close every initializer connection or pool before returning from the
    initializer. The harness defensively terminates stragglers before cloning.
 5. Preserve a separate empty-database constructor for migration-order tests.
-6. Close application pools before calling `DatabaseLease::cleanup`.
+6. Close application pools before calling `DatabaseLease::cleanup` or
+   `DatabaseLease::defer_cleanup`.
 
 Server startup, PostgreSQL version validation, template coordination, database
 names, connection permits, container ownership, and stale cleanup belong in
@@ -82,9 +83,43 @@ Sessions are checked out exclusively; independent lifecycle operations can
 progress concurrently without holding the pool lock during SQL. A reused
 session is reset and has the configured operation and lock timeouts restored
 before work. Waiting for a session is also bounded by the configured operation
-timeout. Failed or uncertain sessions are evicted and reconnected lazily. Owned
-shutdown closes this pool along with database admission, while external
-shutdown remains a no-op.
+timeout. Failed or uncertain sessions are evicted and reconnected lazily.
+
+Database cleanup has two explicit completion contracts. `DatabaseLease::cleanup`
+uses the server's bounded workers, retains the lease's connection-budget permit,
+and returns only after `DROP DATABASE ... WITH (FORCE)` succeeds or fails.
+`DatabaseLease::defer_cleanup` returns after a bounded server-scoped queue
+accepts the database. It applies backpressure when that queue is full and
+releases the permit only after acceptance. The ordinary `Drop` implementation
+uses the same deferred path as a fallback and can therefore briefly block under
+saturation; code that needs an async backpressure point should call
+`defer_cleanup` explicitly.
+
+Each server has as many cleanup workers as its lifecycle admin-session limit and
+the waiting queue has the same capacity. Cleanup is therefore concurrent across
+servers rather than process-globally serialized. If `L` is the effective live
+lease limit and `C` is the per-server lifecycle limit, at most `L + 2C`
+disposable databases can be live, running cleanup, or waiting for cleanup in
+one server. Awaited jobs still consume their lease permits, so this formula is a
+conservative mixed-workload bound. Every later lease is created under a fresh
+unique name from `template0` or the immutable project template; a returned
+database is never reset or reused. Any cleanup failure closes new database
+admission for that harness before the worker releases its slot. Already-live
+leases remain cleanable, but callers must observe the drain error and recover or
+replace the harness; repeated failures cannot accumulate an unbounded residual
+set.
+
+Call `PostgresHarness::drain_deferred_cleanup` to wait for everything accepted
+before the call. The barrier returns retained failures from explicit deferred
+returns, fallback drops, and cancelled awaited callers exactly once. Owned
+`shutdown` closes admission, closes the cleanup queue, drains it, reports any
+failure, then closes the lifecycle pool and removes the container. It is safe
+to cancel the async shutdown caller after the terminal sequence starts because
+the sequence continues in its blocking worker. External `shutdown` remains a
+no-op so an external server stays usable; external users must call the drain
+barrier before teardown. If the process is terminated before a drain, owned
+container cleanup removes the whole server and tagged external databases remain
+eligible for the next owner-aware stale sweep.
 
 Template coordination has a separate 15-minute wait timeout so a short
 administrative-operation timeout does not make concurrent callers fail while a

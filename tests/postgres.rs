@@ -1,4 +1,5 @@
 use std::{
+    fs,
     process::Command,
     sync::{
         Arc, Mutex,
@@ -374,8 +375,50 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
 
         let second_name = second.database_name().to_owned();
         drop(second);
-        wait_until_database_is_absent(&admin_url, &second_name).await;
+        harness
+            .drain_deferred_cleanup()
+            .await
+            .expect("drain Drop fallback cleanup");
+        assert!(
+            !database_exists(admin_url.clone(), second_name)
+                .await
+                .expect("check Drop fallback cleanup")
+        );
         empty.cleanup().await.expect("clean empty database");
+    }
+
+    {
+        let deferred = harness
+            .empty_database()
+            .await
+            .expect("create explicitly deferred database");
+        let deferred_name = deferred.database_name().to_owned();
+        let held_application_client = HeldClient::connect(deferred.database_url().to_owned()).await;
+        deferred
+            .defer_cleanup()
+            .await
+            .expect("admit explicit deferred cleanup");
+        harness
+            .drain_deferred_cleanup()
+            .await
+            .expect("drain explicit deferred cleanup with an active client");
+        assert!(
+            !database_exists(admin_url.clone(), deferred_name.clone())
+                .await
+                .expect("check explicitly deferred cleanup")
+        );
+        drop(held_application_client);
+
+        let recreated = harness
+            .empty_database()
+            .await
+            .expect("create a fresh database after deferred cleanup");
+        assert_ne!(
+            recreated.database_name(),
+            deferred_name,
+            "a returned database must never be reused"
+        );
+        recreated.cleanup().await.expect("clean fresh database");
     }
 
     {
@@ -801,6 +844,137 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
     }
 
     {
+        let failure_harness = PostgresHarness::start(
+            HarnessConfig::new("cleanup_fail_it")
+                .unwrap()
+                .with_admin_database_url(admin_url.clone())
+                .with_operation_timeout(Duration::from_millis(100))
+                .unwrap()
+                .with_cleanup_on_start(false),
+        )
+        .await
+        .expect("start deferred-cleanup failure harness");
+
+        let awaited_database = failure_harness
+            .empty_database()
+            .await
+            .expect("create awaited-cleanup failure database");
+        let awaited_database_name = awaited_database.database_name().to_owned();
+        let database = failure_harness
+            .empty_database()
+            .await
+            .expect("create deferred-cleanup failure database before admission closes");
+        let database_name = database.database_name().to_owned();
+        let catalog_lock = CatalogLock::acquire(admin_url.clone()).await;
+        let error = awaited_database
+            .cleanup()
+            .await
+            .expect_err("the catalog lock should make awaited DROP time out");
+        assert!(matches!(
+            error,
+            Error::Postgres {
+                operation: "drop disposable PostgreSQL database",
+                ..
+            }
+        ));
+        failure_harness
+            .drain_deferred_cleanup()
+            .await
+            .expect("a delivered awaited failure must not be repeated by drain");
+        assert!(matches!(
+            failure_harness.empty_database().await,
+            Err(Error::ConnectionBudgetClosed)
+        ));
+        drop(catalog_lock);
+        execute(
+            admin_url.clone(),
+            format!("DROP DATABASE IF EXISTS \"{awaited_database_name}\" WITH (FORCE)"),
+        )
+        .await
+        .expect("remove injected awaited-cleanup residual");
+
+        let catalog_lock = CatalogLock::acquire(admin_url.clone()).await;
+        database
+            .defer_cleanup()
+            .await
+            .expect("admit cleanup before its injected PostgreSQL failure");
+        wait_until_database_statement(&admin_url, &database_name, "DROP DATABASE").await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            failure_harness.drain_deferred_cleanup(),
+        )
+        .await
+        .expect("deferred failure drain should remain bounded")
+        .expect_err("the catalog lock should make deferred DROP time out");
+        let Error::DeferredCleanup {
+            failure_count,
+            failures,
+        } = error
+        else {
+            panic!("unexpected deferred failure: {error:?}");
+        };
+        assert_eq!(failure_count, 1);
+        assert_eq!(failures[0].database_name(), database_name);
+        assert!(matches!(
+            failures[0].source_error(),
+            Error::Postgres {
+                operation: "drop disposable PostgreSQL database",
+                ..
+            }
+        ));
+        failure_harness
+            .drain_deferred_cleanup()
+            .await
+            .expect("a deferred failure is reported exactly once");
+        drop(catalog_lock);
+        execute(
+            admin_url.clone(),
+            format!("DROP DATABASE IF EXISTS \"{database_name}\" WITH (FORCE)"),
+        )
+        .await
+        .expect("remove injected deferred-cleanup residual");
+    }
+
+    {
+        let cancellation_harness = PostgresHarness::start(
+            HarnessConfig::new("cancel_clean_it")
+                .unwrap()
+                .with_admin_database_url(admin_url.clone())
+                .with_cleanup_on_start(false),
+        )
+        .await
+        .expect("start cleanup-cancellation harness");
+        let database = cancellation_harness
+            .empty_database()
+            .await
+            .expect("create cleanup-cancellation database");
+        let database_name = database.database_name().to_owned();
+        let catalog_lock = CatalogLock::acquire(admin_url.clone()).await;
+        let cleanup = tokio::spawn(async move { database.cleanup().await });
+        wait_until_database_statement(&admin_url, &database_name, "DROP DATABASE").await;
+        cleanup.abort();
+        assert!(
+            cleanup
+                .await
+                .expect_err("cancelled awaited cleanup should not return")
+                .is_cancelled()
+        );
+        drop(catalog_lock);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            cancellation_harness.drain_deferred_cleanup(),
+        )
+        .await
+        .expect("cancelled awaited cleanup should finish in its worker")
+        .expect("successful cancelled cleanup should not report a failure");
+        assert!(
+            !database_exists(admin_url.clone(), database_name)
+                .await
+                .expect("check cancelled awaited cleanup")
+        );
+    }
+
+    {
         let external = PostgresHarness::start(
             HarnessConfig::new("external_it")
                 .unwrap()
@@ -829,6 +1003,17 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
             .cleanup()
             .await
             .expect("clean external-mode database");
+        let lifetime_database = external
+            .empty_database()
+            .await
+            .expect("create external lifetime database");
+        let lifetime_database_name = lifetime_database.database_name().to_owned();
+        lifetime_database
+            .defer_cleanup()
+            .await
+            .expect("defer external lifetime cleanup");
+        drop(external);
+        wait_until_database_is_absent(&admin_url, &lifetime_database_name).await;
     }
 
     {
@@ -843,6 +1028,13 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         )
         .await
         .expect("start owned-shutdown harness");
+        shutdown_harness
+            .empty_database()
+            .await
+            .expect("create cleanup accepted before owned shutdown")
+            .defer_cleanup()
+            .await
+            .expect("queue cleanup before owned shutdown");
         let active_database = shutdown_harness
             .empty_database()
             .await
@@ -869,10 +1061,10 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
             .shutdown()
             .await
             .expect("repeated owned shutdown");
-        assert!(
-            active_database.cleanup().await.is_err(),
-            "an active lease remains owned but cannot contact a removed server"
-        );
+        assert!(matches!(
+            active_database.cleanup().await,
+            Err(Error::CleanupQueueClosed)
+        ));
     }
 
     harness
@@ -880,6 +1072,57 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         .await
         .expect("remove owned PostgreSQL container");
     wait_until_container_is_absent(&container_id).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn process_exit_removes_an_owned_container_with_a_live_lease() {
+    const CHILD_ENV: &str = "PTH_PROCESS_TEARDOWN_CHILD";
+    const MARKER_ENV: &str = "PTH_PROCESS_TEARDOWN_MARKER";
+    if std::env::var_os(CHILD_ENV).is_some() {
+        let marker = std::env::var_os(MARKER_ENV).expect("child marker path is configured");
+        let harness = PostgresHarness::start(
+            HarnessConfig::new("exit_clean_it")
+                .unwrap()
+                .with_cleanup_on_start(false),
+        )
+        .await
+        .expect("start process-teardown harness");
+        let container_id = harness
+            .container_id()
+            .expect("process-teardown harness owns a container");
+        fs::write(&marker, container_id).expect("publish process-teardown container ID");
+        let _live_database = harness
+            .empty_database()
+            .await
+            .expect("create a live lease before process exit");
+        std::process::exit(0);
+    }
+
+    let marker = std::env::temp_dir().join(format!(
+        "postgres-test-harness-process-teardown-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let output = Command::new(std::env::current_exe().expect("resolve integration-test binary"))
+        .args([
+            "--ignored",
+            "--exact",
+            "process_exit_removes_an_owned_container_with_a_live_lease",
+            "--nocapture",
+        ])
+        .env(CHILD_ENV, "1")
+        .env(MARKER_ENV, &marker)
+        .output()
+        .expect("run process-teardown child");
+    assert!(
+        output.status.success(),
+        "process-teardown child failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let container_id = fs::read_to_string(&marker).expect("read process-teardown container ID");
+    let _ = fs::remove_file(&marker);
+    wait_until_container_is_absent(container_id.trim()).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1137,6 +1380,31 @@ async fn execute(database_url: String, sql: impl Into<String>) -> Result<(), Box
 struct HeldClient {
     release: Option<Sender<()>>,
     worker: Option<JoinHandle<()>>,
+}
+
+impl HeldClient {
+    async fn connect(database_url: String) -> Self {
+        let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || match Client::connect(&database_url, NoTls) {
+            Ok(client) => {
+                let _ = ready_sender.send(Ok(()));
+                let _ = release_receiver.recv();
+                drop(client);
+            }
+            Err(error) => {
+                let _ = ready_sender.send(Err(error.to_string()));
+            }
+        });
+        ready_receiver
+            .await
+            .expect("held application client stopped before reporting readiness")
+            .expect("connect held application client");
+        Self {
+            release: Some(release_sender),
+            worker: Some(worker),
+        }
+    }
 }
 
 struct CatalogLock {

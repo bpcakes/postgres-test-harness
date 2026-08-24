@@ -1,5 +1,47 @@
 use std::time::Duration;
 
+/// One database cleanup failure retained by the server-scoped deferred queue.
+#[derive(Debug)]
+pub struct DeferredCleanupFailure {
+    database_name: String,
+    source: Box<Error>,
+}
+
+impl DeferredCleanupFailure {
+    pub(crate) fn new(database_name: String, source: Error) -> Self {
+        Self {
+            database_name,
+            source: Box::new(source),
+        }
+    }
+
+    /// Returns the exact disposable database whose cleanup failed.
+    pub fn database_name(&self) -> &str {
+        &self.database_name
+    }
+
+    /// Returns the underlying lifecycle error.
+    pub fn source_error(&self) -> &Error {
+        &self.source
+    }
+}
+
+impl std::fmt::Display for DeferredCleanupFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "deferred cleanup failed for database '{}': {}",
+            self.database_name, self.source
+        )
+    }
+}
+
+impl std::error::Error for DeferredCleanupFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Error type accepted from a project-owned template initializer.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -145,6 +187,21 @@ pub enum Error {
     #[error("timed out waiting for a disposable PostgreSQL admin session after {timeout:?}")]
     AdminSessionCheckoutTimeout { timeout: Duration },
 
+    #[error("the deferred PostgreSQL database cleanup queue is closed")]
+    CleanupQueueClosed,
+
+    #[error("a deferred PostgreSQL database cleanup worker stopped unexpectedly")]
+    CleanupWorkerStopped,
+
+    #[error("a deferred PostgreSQL database cleanup worker panicked")]
+    CleanupWorkerPanicked,
+
+    #[error("deferred PostgreSQL database cleanup failed for {failure_count} database(s)")]
+    DeferredCleanup {
+        failure_count: usize,
+        failures: Vec<DeferredCleanupFailure>,
+    },
+
     #[error("template initialization failed: {source}")]
     TemplateInitializer {
         #[source]
@@ -178,16 +235,32 @@ pub enum Error {
     )]
     TemplateConnectionsRemain { database_name: String },
 
-    #[error("failed to start the PostgreSQL fallback cleanup worker: {source}")]
+    #[error("failed to start a deferred PostgreSQL database cleanup worker: {source}")]
     CleanupWorkerStart {
         #[source]
         source: std::io::Error,
+    },
+
+    #[error(
+        "deferred PostgreSQL database cleanup failed ({cleanup}); owned-container shutdown also failed ({shutdown})"
+    )]
+    CleanupAndContainerShutdown {
+        #[source]
+        cleanup: Box<Error>,
+        shutdown: Box<Error>,
     },
 }
 
 impl Error {
     pub(crate) fn postgres(operation: &'static str, source: tokio_postgres::Error) -> Self {
         Self::Postgres { operation, source }
+    }
+
+    pub(crate) fn deferred_cleanup(failures: Vec<DeferredCleanupFailure>) -> Self {
+        Self::DeferredCleanup {
+            failure_count: failures.len(),
+            failures,
+        }
     }
 }
 

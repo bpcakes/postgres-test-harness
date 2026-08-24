@@ -92,8 +92,8 @@ jobs:
                   + ", image_default_storage"
               end
             ) + "`  ",
-            "Deferred completion observation: catalog polling every `"
-              + (.configuration.deferred_drain_poll_interval_ms | tostring) + " ms`  ",
+            "Deferred completion observation: awaited bounded cleanup drain (guarded by `"
+              + (.configuration.deferred_drain_timeout_ms | tostring) + " ms`)  ",
             "",
             "| Metric | Fixture | Min ms | Median ms | Mean ms | Max ms |",
             "| --- | --- | ---: | ---: | ---: | ---: |",

@@ -114,16 +114,17 @@ The JSON records these boundaries for every sample and fixture:
 - `explicit_cleanup_drain`: creates the configured leases before timing, then
   awaits their explicit cleanups concurrently. Its `method.execution` is
   `caller_bounded` and records the configured drain count as its concurrency.
-- `deferred_cleanup_drain`: creates the configured leases before timing, drops
-  all of them, and ends only after a persistent observer confirms every exact
-  database name is absent from `pg_database`. The 120-second guard prevents a
-  broken run from hanging; it is not a benchmark threshold. Its execution is
-  reported as `implementation_managed`, because the public API does not promise
-  worker concurrency. Completion is reported separately as `catalog_polling`
-  with a 10 ms interval; that interval is observation granularity, not measured
-  work or a latency threshold. This is therefore not an apples-to-apples latency
-  comparison with the concurrent explicit drain. Its purpose is to record
-  caller-to-observed-final-drain behavior for PERF04.
+- `deferred_cleanup`: creates the configured leases before timing, explicitly
+  awaits `DatabaseLease::defer_cleanup` for each lease, and then awaits
+  `PostgresHarness::drain_deferred_cleanup`. The report separates aggregate and
+  per-lease caller-return latency from final drain-barrier latency and total
+  elapsed time. The 120-second guard prevents a broken barrier from hanging; it
+  is not a benchmark threshold. Execution is reported as
+  `implementation_managed` and completion as `awaited_drain_barrier`. A single
+  untimed post-barrier catalog query verifies every exact database name is
+  absent; polling is no longer the completion mechanism. The sequential caller
+  returns intentionally expose bounded-queue backpressure and are not an
+  apples-to-apples comparison with the concurrent explicit drain.
 
 One persistent observer connection reads `pg_stat_database.sessions` before
 and after every phase. The report includes the cumulative values, delta, and
@@ -154,9 +155,11 @@ PostgreSQL version and critical settings, postmaster start, logical CPU count,
 OS, architecture, server mode, image metadata, storage driver, the effective
 owned initdb/storage profile, fixture rows, execution and completion methods,
 concurrency where caller-controlled, sample counts, connection budget,
-per-database permits, timeouts, polling interval, and cleanup retry policy.
-Owned-profile and checksum/WAL provenance are report schema version 5;
-consumers should branch on `schema_version`.
+per-database permits, timeouts, the cleanup barrier guard, and external cleanup
+retry policy. Schema version 6 replaces catalog-polled deferred completion with
+explicit caller-return and awaited-drain timings. Owned-profile and checksum/WAL
+provenance were introduced in schema version 5; consumers should branch on
+`schema_version`.
 
 ## Configuration
 

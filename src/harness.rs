@@ -1,9 +1,6 @@
 use std::{
     future::Future,
-    sync::{
-        Arc, Mutex, OnceLock,
-        mpsc::{self, Sender},
-    },
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
 
@@ -19,14 +16,13 @@ use crate::{
         set_database_metadata, terminate_database_connections, try_acquire_advisory_lock,
         validate_postgres_18,
     },
+    cleanup::log_cleanup,
     metadata::{ResourceMetadata, TemplateState},
     name::{DatabaseKind, DatabaseName},
     server::{ServerInner, run_blocking},
 };
 
 const DEFAULT_CLEANUP_OPERATION_TIMEOUT: Duration = Duration::from_secs(90);
-
-static DATABASE_CLEANUP_WORKER: OnceLock<Option<Sender<DatabaseLeaseInner>>> = OnceLock::new();
 
 /// Process-local owner of a PostgreSQL 18 server and its database capacity.
 #[derive(Clone)]
@@ -66,16 +62,34 @@ impl PostgresHarness {
         self.server.container_id()
     }
 
-    /// Closes database admission and removes an owned container immediately.
+    /// Closes database admission, drains accepted cleanup, and removes an owned
+    /// container.
     ///
     /// Admission remains closed after the first owned shutdown attempt, even
     /// if container removal fails. External servers and their admission remain
     /// untouched. Repeated and concurrent calls do not retry removal; the call
     /// that completes the terminal worker reports any removal error, while
     /// later calls observe completed shutdown. Active leases remain owned but
-    /// can no longer contact a successfully removed server.
+    /// can no longer contact a successfully removed server. Cleanup submissions
+    /// already accepted by the bounded server queue finish before its pooled
+    /// admin sessions and container are closed. Deferred failures are returned
+    /// from this barrier. External-server shutdown remains a no-op; call
+    /// [`Self::drain_deferred_cleanup`] explicitly for an external server.
     pub async fn shutdown(&self) -> Result<()> {
         self.server.shutdown_container().await
+    }
+
+    /// Waits for every database cleanup accepted before this call.
+    ///
+    /// Failures from [`DatabaseLease::defer_cleanup`], the `Drop` fallback, or
+    /// an awaited cleanup whose caller was cancelled are retained and returned
+    /// exactly once. Cleanup submitted concurrently after the barrier begins is
+    /// covered by a later drain. Any cleanup failure closes new database
+    /// admission so residual databases cannot accumulate without bound.
+    pub async fn drain_deferred_cleanup(&self) -> Result<()> {
+        let database_cleanup = self.server.database_cleanup.clone();
+        let outcome = run_blocking(move || Ok(database_cleanup.begin_drain())).await?;
+        outcome.finish()
     }
 
     /// Creates a pristine database from PostgreSQL's built-in `template0`.
@@ -180,12 +194,39 @@ impl DatabaseLease {
         &self.database_url
     }
 
+    /// Drops this database and waits for confirmation.
+    ///
+    /// The database's connection-budget permit remains held until cleanup
+    /// finishes. A failed database drop closes new database admission for this
+    /// harness so residual storage remains bounded. Close all application
+    /// connections and pools before calling.
     pub async fn cleanup(mut self) -> Result<()> {
         let inner = self
             .inner
             .take()
             .expect("database lease cleanup runs at most once");
-        run_blocking(move || inner.cleanup()).await
+        let completion = run_blocking(move || inner.queue_awaited_cleanup()).await?;
+        completion
+            .await
+            .map_err(|_| Error::CleanupWorkerStopped)?
+            .finish()
+    }
+
+    /// Returns this database to the bounded server-scoped cleanup queue.
+    ///
+    /// This future completes once the queue accepts the database, not when its
+    /// `DROP` finishes. It applies backpressure while the bounded queue is full,
+    /// then releases the database's connection-budget permit. Call
+    /// [`PostgresHarness::drain_deferred_cleanup`] before process or external
+    /// server teardown to await final completion and observe cleanup failures.
+    /// A failed drop closes new database admission for this harness. Close all
+    /// application connections and pools before calling.
+    pub async fn defer_cleanup(mut self) -> Result<()> {
+        let inner = self
+            .inner
+            .take()
+            .expect("database lease cleanup runs at most once");
+        run_blocking(move || inner.queue_deferred_cleanup()).await
     }
 }
 
@@ -204,8 +245,14 @@ impl std::fmt::Debug for DatabaseLease {
 
 impl Drop for DatabaseLease {
     fn drop(&mut self) {
-        if let Some(inner) = self.inner.take() {
-            queue_database_cleanup(inner);
+        if let Some(inner) = self.inner.take()
+            && let Err(error) = inner.queue_deferred_cleanup()
+        {
+            // Owned shutdown removes the containing server. On an external
+            // server the tagged residual is left for the next stale sweep.
+            log_cleanup(format_args!(
+                "fallback database cleanup could not be queued: {error}"
+            ));
         }
     }
 }
@@ -213,14 +260,39 @@ impl Drop for DatabaseLease {
 struct DatabaseLeaseInner {
     server: Arc<ServerInner>,
     name: DatabaseName,
-    _permit: OwnedSemaphorePermit,
+    permit: OwnedSemaphorePermit,
 }
 
 impl DatabaseLeaseInner {
-    fn cleanup(self) -> Result<()> {
-        let Self { server, name, .. } = self;
-        server.with_lifecycle_admin("connect for disposable database cleanup", |client| {
-            drop_database(client, &name)
+    fn queue_awaited_cleanup(
+        self,
+    ) -> Result<tokio::sync::oneshot::Receiver<crate::cleanup::AwaitedCleanupOutcome>> {
+        let Self {
+            server,
+            name,
+            permit,
+        } = self;
+        let database_name = name.as_str().to_owned();
+        let database_cleanup = server.database_cleanup.clone();
+        database_cleanup.submit_awaited(database_name, permit, move || {
+            server.with_lifecycle_admin("connect for disposable database cleanup", |client| {
+                drop_database(client, &name)
+            })
+        })
+    }
+
+    fn queue_deferred_cleanup(self) -> Result<()> {
+        let Self {
+            server,
+            name,
+            permit,
+        } = self;
+        let database_name = name.as_str().to_owned();
+        let database_cleanup = server.database_cleanup.clone();
+        database_cleanup.submit_deferred(database_name, Some(permit), move || {
+            server.with_lifecycle_admin("connect for disposable database cleanup", |client| {
+                drop_database(client, &name)
+            })
         })
     }
 }
@@ -507,50 +579,12 @@ async fn create_test_database(
             inner: Some(DatabaseLeaseInner {
                 server,
                 name,
-                _permit: permit,
+                permit,
             }),
             database_url,
         })
     })
     .await
-}
-
-fn queue_database_cleanup(inner: DatabaseLeaseInner) {
-    let worker = DATABASE_CLEANUP_WORKER.get_or_init(|| {
-        let (sender, receiver) = mpsc::channel::<DatabaseLeaseInner>();
-        match std::thread::Builder::new()
-            .name("postgres-test-harness-cleanup".to_owned())
-            .spawn(move || {
-                while let Ok(inner) = receiver.recv() {
-                    let database_name = inner.name.as_str().to_owned();
-                    if let Err(error) = inner.cleanup() {
-                        eprintln!(
-                            "postgres-test-harness: fallback cleanup failed for database '{database_name}': {error}"
-                        );
-                    }
-                }
-            })
-        {
-            Ok(_) => Some(sender),
-            Err(error) => {
-                eprintln!(
-                    "postgres-test-harness: failed to start fallback database cleanup worker: {error}"
-                );
-                None
-            }
-        }
-    });
-    let Some(worker) = worker else {
-        // The database remains tagged for the next owner-aware stale sweep.
-        drop(inner);
-        return;
-    };
-    if let Err(error) = worker.send(inner) {
-        // The worker can only disappear during process teardown. Retain the
-        // tagged database for the external server's next sweep while releasing
-        // the per-harness permit and server ownership.
-        drop(error.0);
-    }
 }
 
 /// Counts from an owner-aware stale database cleanup pass.

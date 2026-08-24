@@ -32,7 +32,7 @@ use tokio::{sync::Semaphore, task::JoinSet};
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 const DEFAULT_IMAGE: &str = "postgres:18";
 const OUTPUT_ENV: &str = "PTH_PERF_OUTPUT";
 const OWNED_INITDB_NO_SYNC_ENV: &str = "PTH_PERF_OWNED_INITDB_NO_SYNC";
@@ -49,7 +49,6 @@ const DEFAULT_CONCURRENT_OPERATIONS: usize = 8;
 const DEFAULT_DRAIN_DATABASES: usize = 4;
 const DEFAULT_REPRESENTATIVE_ROWS: usize = 50_000;
 const DEFERRED_DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
-const DEFERRED_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const EXTERNAL_CLEANUP_RETRY_WINDOW: Duration = Duration::from_secs(120);
 const EXTERNAL_CLEANUP_INITIAL_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const EXTERNAL_CLEANUP_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -279,7 +278,6 @@ impl BenchmarkConfig {
             operation_timeout_ms: millis(OPERATION_TIMEOUT),
             template_wait_timeout_ms: millis(TEMPLATE_WAIT_TIMEOUT),
             deferred_drain_timeout_ms: millis(DEFERRED_DRAIN_TIMEOUT),
-            deferred_drain_poll_interval_ms: millis(DEFERRED_DRAIN_POLL_INTERVAL),
             external_cleanup_retry_window_ms: millis(EXTERNAL_CLEANUP_RETRY_WINDOW),
             external_cleanup_initial_retry_interval_ms: millis(
                 EXTERNAL_CLEANUP_INITIAL_RETRY_INTERVAL,
@@ -347,7 +345,6 @@ struct ConfigurationReport {
     operation_timeout_ms: u128,
     template_wait_timeout_ms: u128,
     deferred_drain_timeout_ms: u128,
-    deferred_drain_poll_interval_ms: u128,
     external_cleanup_retry_window_ms: u128,
     external_cleanup_initial_retry_interval_ms: u128,
     external_cleanup_max_retry_interval_ms: u128,
@@ -417,7 +414,7 @@ struct FixtureReport {
     sequential_clone_cleanup: BatchOperation,
     bounded_concurrent_clone_cleanup: BatchOperation,
     explicit_cleanup_drain: BatchOperation,
-    deferred_cleanup_drain: BatchOperation,
+    deferred_cleanup: DeferredCleanupOperation,
 }
 
 #[derive(Serialize)]
@@ -433,6 +430,18 @@ struct BatchOperation {
     elapsed_ns: u128,
     operations_per_second: f64,
     individual_elapsed_ns: Vec<u128>,
+    admin_sessions: SessionDelta,
+}
+
+#[derive(Serialize)]
+struct DeferredCleanupOperation {
+    operations: usize,
+    method: BatchMethodReport,
+    caller_return_elapsed_ns: u128,
+    caller_returns_per_second: f64,
+    individual_caller_return_elapsed_ns: Vec<u128>,
+    final_drain_elapsed_ns: u128,
+    total_elapsed_ns: u128,
     admin_sessions: SessionDelta,
 }
 
@@ -453,7 +462,7 @@ enum BatchExecutionReport {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum CompletionObservationReport {
     OperationReturn,
-    CatalogPolling { interval_ns: u128 },
+    AwaitedDrainBarrier,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -480,12 +489,10 @@ impl BatchMethodReport {
         }
     }
 
-    fn implementation_managed_polling(interval: Duration) -> Self {
+    fn implementation_managed_barrier() -> Self {
         Self {
             execution: BatchExecutionReport::ImplementationManaged,
-            completion: CompletionObservationReport::CatalogPolling {
-                interval_ns: interval.as_nanos(),
-            },
+            completion: CompletionObservationReport::AwaitedDrainBarrier,
         }
     }
 }
@@ -685,34 +692,24 @@ impl Observer {
         Ok(row.get(0))
     }
 
-    async fn wait_until_databases_are_absent(&self, names: &[String]) -> AnyResult<()> {
-        let deadline = Deadline::after(DEFERRED_DRAIN_TIMEOUT);
-        let mut remaining = names.len() as i64;
-        loop {
-            let row = deadline
-                .run(run_observer_operation(
-                    "poll deferred cleanup",
-                    self.operation_timeout,
-                    self.client().query_one(
-                        "SELECT count(*) FROM pg_database WHERE datname = ANY($1)",
-                        &[&names],
-                    ),
-                ))
-                .await
-                .map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!(
-                            "deferred cleanup did not drain {remaining} database(s) within {} ms",
-                            millis(DEFERRED_DRAIN_TIMEOUT)
-                        ),
-                    )
-                })??;
-            remaining = row.get(0);
-            if remaining == 0 {
-                return Ok(());
-            }
-            deadline.sleep_up_to(DEFERRED_DRAIN_POLL_INTERVAL).await;
+    async fn ensure_databases_are_absent(&self, names: &[String]) -> AnyResult<()> {
+        let row = run_observer_operation(
+            "verify deferred cleanup barrier",
+            self.operation_timeout,
+            self.client().query_one(
+                "SELECT count(*) FROM pg_database WHERE datname = ANY($1)",
+                &[&names],
+            ),
+        )
+        .await?;
+        let remaining: i64 = row.get(0);
+        if remaining == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "deferred cleanup barrier returned with {remaining} database(s) still present"
+            ))
+            .into())
         }
     }
 
@@ -874,8 +871,8 @@ async fn main() -> AnyResult<()> {
             "Owned startup requires a cached image and excludes image-pull time.",
             "Owned profile settings record initdb synchronization and the effective harness storage mount; image-default storage adds no harness tmpfs mount.",
             "The owned profile does not disable data checksums or lower wal_level; reports record both server settings.",
-            "Deferred cleanup drain ends only after every dropped lease name is absent from pg_database.",
-            "Deferred cleanup completion is observed by catalog polling; the recorded interval describes detection granularity, not a latency threshold.",
+            "Deferred cleanup records caller-return latency separately from the awaited final drain barrier.",
+            "The drain barrier reports worker failures; one post-barrier catalog query verifies that every exact lease name is absent.",
             "Run both modes under comparable load and compare the versioned JSON output; URLs and credentials are never recorded.",
         ],
     };
@@ -1094,8 +1091,8 @@ async fn run_fixture(
     .await?;
     let explicit_cleanup_drain =
         run_explicit_drain(&template, observer, config.drain_databases).await?;
-    let deferred_cleanup_drain =
-        run_deferred_drain(&template, observer, config.drain_databases).await?;
+    let deferred_cleanup =
+        run_deferred_cleanup(harness, &template, observer, config.drain_databases).await?;
 
     drop(warm_template);
     drop(template);
@@ -1108,7 +1105,7 @@ async fn run_fixture(
         sequential_clone_cleanup,
         bounded_concurrent_clone_cleanup,
         explicit_cleanup_drain,
-        deferred_cleanup_drain,
+        deferred_cleanup,
     })
 }
 
@@ -1219,11 +1216,12 @@ async fn run_explicit_drain(
     ))
 }
 
-async fn run_deferred_drain(
+async fn run_deferred_cleanup(
+    harness: &PostgresHarness,
     template: &postgres_test_harness::DatabaseTemplate,
     observer: &Observer,
     databases: usize,
-) -> AnyResult<BatchOperation> {
+) -> AnyResult<DeferredCleanupOperation> {
     let mut leases = Vec::with_capacity(databases);
     let mut names = Vec::with_capacity(databases);
     for _ in 0..databases {
@@ -1232,18 +1230,41 @@ async fn run_deferred_drain(
         leases.push(lease);
     }
     let before = observer.session_snapshot().await?;
-    let started = Instant::now();
-    drop(leases);
-    observer.wait_until_databases_are_absent(&names).await?;
-    let elapsed = started.elapsed();
+    let total_started = Instant::now();
+    let caller_started = Instant::now();
+    let mut individual = Vec::with_capacity(databases);
+    for lease in leases {
+        let operation_started = Instant::now();
+        lease.defer_cleanup().await?;
+        individual.push(operation_started.elapsed().as_nanos());
+    }
+    let caller_return_elapsed = caller_started.elapsed();
+    let drain_started = Instant::now();
+    tokio::time::timeout(DEFERRED_DRAIN_TIMEOUT, harness.drain_deferred_cleanup())
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "deferred cleanup barrier did not finish within {} ms",
+                    millis(DEFERRED_DRAIN_TIMEOUT)
+                ),
+            )
+        })??;
+    let final_drain_elapsed = drain_started.elapsed();
+    let total_elapsed = total_started.elapsed();
+    observer.ensure_databases_are_absent(&names).await?;
     let after = observer.session_snapshot().await?;
-    Ok(batch_operation(
-        databases,
-        BatchMethodReport::implementation_managed_polling(DEFERRED_DRAIN_POLL_INTERVAL),
-        elapsed,
-        Vec::new(),
-        before.delta(after),
-    ))
+    Ok(DeferredCleanupOperation {
+        operations: databases,
+        method: BatchMethodReport::implementation_managed_barrier(),
+        caller_return_elapsed_ns: caller_return_elapsed.as_nanos(),
+        caller_returns_per_second: databases as f64 / caller_return_elapsed.as_secs_f64(),
+        individual_caller_return_elapsed_ns: individual,
+        final_drain_elapsed_ns: final_drain_elapsed.as_nanos(),
+        total_elapsed_ns: total_elapsed.as_nanos(),
+        admin_sessions: before.delta(after),
+    })
 }
 
 fn batch_operation(
@@ -1670,8 +1691,16 @@ fn summarize(samples: &[SampleReport]) -> Vec<SummaryReport> {
                     fixture.explicit_cleanup_drain.elapsed_ns,
                 ),
                 (
-                    "deferred_cleanup_drain",
-                    fixture.deferred_cleanup_drain.elapsed_ns,
+                    "deferred_cleanup_caller_return",
+                    fixture.deferred_cleanup.caller_return_elapsed_ns,
+                ),
+                (
+                    "deferred_cleanup_final_drain",
+                    fixture.deferred_cleanup.final_drain_elapsed_ns,
+                ),
+                (
+                    "deferred_cleanup_total",
+                    fixture.deferred_cleanup.total_elapsed_ns,
                 ),
             ];
             for (metric, elapsed_ns) in metrics {
@@ -1934,8 +1963,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_v5_encodes_measurement_method_storage_and_provenance() {
-        assert_eq!(SCHEMA_VERSION, 5);
+    fn schema_v6_encodes_cleanup_barrier_storage_and_provenance() {
+        assert_eq!(SCHEMA_VERSION, 6);
         assert_eq!(
             serde_json::to_value(BatchMethodReport::caller_bounded(4))
                 .expect("serialize caller-bounded method"),
@@ -1945,13 +1974,11 @@ mod tests {
             })
         );
         assert_eq!(
-            serde_json::to_value(BatchMethodReport::implementation_managed_polling(
-                Duration::from_millis(10),
-            ))
-            .expect("serialize implementation-managed method"),
+            serde_json::to_value(BatchMethodReport::implementation_managed_barrier())
+                .expect("serialize implementation-managed method"),
             serde_json::json!({
                 "execution": { "kind": "implementation_managed" },
-                "completion": { "kind": "catalog_polling", "interval_ns": 10_000_000 }
+                "completion": { "kind": "awaited_drain_barrier" }
             })
         );
         assert_eq!(

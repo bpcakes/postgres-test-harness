@@ -133,6 +133,14 @@ the single-purpose owned server. On a shared external server it is intentionally
 labeled server-wide and can include ambient clients, so run under controlled
 load or interpret it as an upper bound. A server-side statistics reset during a
 phase can also invalidate a delta; retain the raw before/after counters.
+Disposable lifecycle sessions are pooled lazily, so a phase delta now reports
+only connections added while the pool grows or replaces a failed backend. The
+`active_after` snapshot includes already-idle pooled sessions. The workload
+orders sequential work before bounded-concurrent work intentionally: this
+shows one-session warm-up, growth to the caller's concurrency, and zero-churn
+reuse in later phases. Correctness tests separately identify these sessions by
+their `postgres-test-harness lifecycle:<project>` application name and prove
+the configured bound with `pg_stat_activity`.
 The startup field is explicitly named
 `admin_sessions_after_observer_connect`: it is an untimed post-start snapshot
 and includes the observer itself, while each phase delta keeps the same

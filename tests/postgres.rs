@@ -60,6 +60,58 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
     );
 
     {
+        let first = harness
+            .empty_database()
+            .await
+            .expect("create database through a cold lifecycle admin pool");
+        first
+            .cleanup()
+            .await
+            .expect("return the first lifecycle admin session");
+        let first_pids = lifecycle_admin_pids(admin_url.clone(), "harness_it")
+            .await
+            .expect("inspect the warmed lifecycle admin pool");
+        assert_eq!(first_pids.len(), 1);
+
+        let second = harness
+            .empty_database()
+            .await
+            .expect("create database through a warm lifecycle admin pool");
+        second
+            .cleanup()
+            .await
+            .expect("reuse the lifecycle admin session for cleanup");
+        assert_eq!(
+            lifecycle_admin_pids(admin_url.clone(), "harness_it")
+                .await
+                .expect("inspect the reused lifecycle admin pool"),
+            first_pids,
+            "sequential create and cleanup operations should reuse one backend"
+        );
+
+        assert!(
+            terminate_backend(admin_url.clone(), first_pids[0])
+                .await
+                .expect("terminate the idle lifecycle admin backend")
+        );
+        wait_until_lifecycle_admin_session_count(&admin_url, "harness_it", 0).await;
+
+        let reconnected = harness
+            .empty_database()
+            .await
+            .expect("replace a terminated lifecycle admin backend");
+        reconnected
+            .cleanup()
+            .await
+            .expect("reuse the replacement backend for cleanup");
+        let replacement_pids = lifecycle_admin_pids(admin_url.clone(), "harness_it")
+            .await
+            .expect("inspect the replacement lifecycle admin backend");
+        assert_eq!(replacement_pids.len(), 1);
+        assert_ne!(replacement_pids, first_pids);
+    }
+
+    {
         let cleanup_spec = TemplateSpec::new(FingerprintBuilder::new("cleanup-schema").finish());
         let cleanup_template = harness
             .template(cleanup_spec, |_| async { Ok(()) })
@@ -180,6 +232,62 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
             .cleanup()
             .await
             .expect("clean the connection-limit regression database");
+    }
+
+    {
+        const PROJECT: &str = "admin_pool_it";
+        const POOL_LIMIT: usize = 4;
+        const OPERATIONS: usize = 8;
+        let pooled_harness = PostgresHarness::start(
+            HarnessConfig::new(PROJECT)
+                .unwrap()
+                .with_admin_database_url(admin_url.clone())
+                .with_connection_budget(POOL_LIMIT)
+                .unwrap()
+                .with_connections_per_database(1)
+                .unwrap()
+                .with_cleanup_on_start(false),
+        )
+        .await
+        .expect("start bounded admin-pool harness");
+        let catalog_lock = CatalogLock::acquire(admin_url.clone()).await;
+        let mut lifecycles = tokio::task::JoinSet::new();
+        for _ in 0..OPERATIONS {
+            let pooled_harness = pooled_harness.clone();
+            lifecycles.spawn(async move {
+                let database = pooled_harness.empty_database().await?;
+                database.cleanup().await
+            });
+        }
+
+        wait_until_lifecycle_admin_session_count(&admin_url, PROJECT, POOL_LIMIT).await;
+        assert_eq!(
+            lifecycle_admin_pids(admin_url.clone(), PROJECT)
+                .await
+                .expect("inspect concurrent lifecycle admin sessions")
+                .len(),
+            POOL_LIMIT,
+            "lifecycle SQL should progress concurrently up to the configured bound"
+        );
+        drop(catalog_lock);
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(result) = lifecycles.join_next().await {
+                result
+                    .expect("bounded lifecycle task should not panic")
+                    .expect("bounded lifecycle should create and clean its database");
+            }
+        })
+        .await
+        .expect("bounded lifecycle work should complete after catalog unlock");
+        assert_eq!(
+            lifecycle_admin_pids(admin_url.clone(), PROJECT)
+                .await
+                .expect("inspect the idle bounded admin pool")
+                .len(),
+            POOL_LIMIT,
+            "the lazy pool must retain no more sessions than its bound"
+        );
     }
 
     {
@@ -608,12 +716,31 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         )
         .await
         .expect("start metadata-compensation harness");
+        let warm_database = compensation_harness
+            .empty_database()
+            .await
+            .expect("warm the short-timeout lifecycle admin pool");
+        warm_database
+            .cleanup()
+            .await
+            .expect("return the short-timeout lifecycle admin session");
+        let warm_session = lifecycle_admin_pids(admin_url.clone(), "tag_fail_it")
+            .await
+            .expect("inspect the warm short-timeout lifecycle admin pool");
+        assert_eq!(warm_session.len(), 1);
         let catalog_lock = CatalogLock::acquire(admin_url.clone()).await;
 
         let creation_harness = compensation_harness.clone();
         let creation = tokio::spawn(async move { creation_harness.empty_database().await });
         let database_name =
             wait_until_database_with_prefix(&admin_url, "pgh_tag_fail_it_test_").await;
+        let failed_session = lifecycle_admin_pids(admin_url.clone(), "tag_fail_it")
+            .await
+            .expect("inspect the session running the forced metadata failure");
+        assert_eq!(
+            failed_session, warm_session,
+            "the forced timeout should run on the reused session"
+        );
         wait_until_database_statement(&admin_url, &database_name, "DROP DATABASE").await;
         drop(catalog_lock);
 
@@ -633,6 +760,20 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
                 .await
                 .expect("verify metadata compensation removed the database")
         );
+        wait_until_lifecycle_admin_session_count(&admin_url, "tag_fail_it", 0).await;
+        let recovered = compensation_harness
+            .empty_database()
+            .await
+            .expect("replace the session after an uncertain operation failure");
+        recovered
+            .cleanup()
+            .await
+            .expect("clean a database through the replacement session");
+        let replacement_session = lifecycle_admin_pids(admin_url.clone(), "tag_fail_it")
+            .await
+            .expect("inspect replacement after poisoned-session eviction");
+        assert_eq!(replacement_session.len(), 1);
+        assert_ne!(replacement_session, failed_session);
     }
 
     {
@@ -1231,6 +1372,32 @@ async fn database_exists(database_url: String, database_name: String) -> Result<
     .await
 }
 
+async fn lifecycle_admin_pids(database_url: String, project: &str) -> Result<Vec<i32>, BoxError> {
+    let application_name = format!("postgres-test-harness lifecycle:{project}");
+    with_client(database_url, move |client| {
+        Ok(client
+            .query(
+                "SELECT pid FROM pg_stat_activity \
+                 WHERE datname = current_database() AND application_name = $1 \
+                 ORDER BY pid",
+                &[&application_name],
+            )?
+            .into_iter()
+            .map(|row| row.get(0))
+            .collect())
+    })
+    .await
+}
+
+async fn terminate_backend(database_url: String, pid: i32) -> Result<bool, BoxError> {
+    with_client(database_url, move |client| {
+        Ok(client
+            .query_one("SELECT pg_terminate_backend($1)", &[&pid])?
+            .get(0))
+    })
+    .await
+}
+
 async fn postgres_activity(database_url: String) -> Result<Vec<String>, BoxError> {
     with_client(database_url, move |client| {
         Ok(client
@@ -1327,6 +1494,24 @@ async fn wait_until_database_is_absent(admin_url: &str, database_name: &str) {
             "fallback cleanup did not drop database '{database_name}'"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn wait_until_lifecycle_admin_session_count(admin_url: &str, project: &str, expected: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let count = lifecycle_admin_pids(admin_url.to_owned(), project)
+            .await
+            .expect("poll lifecycle admin sessions")
+            .len();
+        if count == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected {expected} lifecycle admin sessions for '{project}', observed {count}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 

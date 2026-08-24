@@ -139,6 +139,9 @@ pub enum Error {
     #[error("PostgreSQL test connection budget is closed")]
     ConnectionBudgetClosed,
 
+    #[error("the disposable PostgreSQL admin-session pool is closed")]
+    AdminSessionPoolClosed,
+
     #[error("template initialization failed: {source}")]
     TemplateInitializer {
         #[source]

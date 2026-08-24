@@ -218,12 +218,10 @@ struct DatabaseLeaseInner {
 
 impl DatabaseLeaseInner {
     fn cleanup(self) -> Result<()> {
-        let mut client = connect_admin(
-            &self.server.admin_url,
-            self.server.operation_timeout,
-            "connect for disposable database cleanup",
-        )?;
-        drop_database(&mut client, &self.name)
+        let Self { server, name, .. } = self;
+        server.with_lifecycle_admin("connect for disposable database cleanup", |client| {
+            drop_database(client, &name)
+        })
     }
 }
 
@@ -497,17 +495,14 @@ async fn create_test_database(
     let name = DatabaseName::test(&server.project);
     let database_url = server.admin_url.database_url(&name);
     run_blocking(move || {
-        let mut client = connect_admin(
-            &server.admin_url,
-            server.operation_timeout,
-            "connect for disposable database creation",
-        )?;
-        create_managed_database(
-            &mut client,
-            &name,
-            &template_name,
-            &ResourceMetadata::test(server.project.clone(), server.owner_key),
-        )?;
+        server.with_lifecycle_admin("connect for disposable database creation", |client| {
+            create_managed_database(
+                client,
+                &name,
+                &template_name,
+                &ResourceMetadata::test(server.project.clone(), server.owner_key),
+            )
+        })?;
         Ok(DatabaseLease {
             inner: Some(DatabaseLeaseInner {
                 server,

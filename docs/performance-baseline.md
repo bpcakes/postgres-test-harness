@@ -171,3 +171,49 @@ The raw local reports are:
 - `target/performance-owned-perf06-image-storage.json`
 - `target/performance-owned-perf06.json`
 - `target/performance-external-perf06.json`
+
+## PERF02 lifecycle admin-session pool follow-up
+
+On 2026-08-24, the default owned schema-v5 workload was rerun three times after
+adding the lazy bounded lifecycle admin-session pool. The run used the same
+host, cached image content ID, 1 GiB tmpfs profile, 50,000-row representative
+fixture, operation counts, and four-way caller concurrency as the PERF06
+default-profile comparison. The JSON records base commit
+`2d6c30f7d433cb5cab1fa138ca6158b37c368f56` and a dirty worktree containing the
+PERF02 implementation. Its project was `pghp_fdc593bc995`.
+
+Median elapsed milliseconds, compared with the PERF06 default-profile medians:
+
+| Metric | Fixture | PERF06 fresh sessions | PERF02 pooled sessions | Directional reduction |
+| --- | --- | ---: | ---: | ---: |
+| Sequential clone-cleanup (4) | small | 154.001 | 110.150 | 28.5% |
+| Sequential clone-cleanup (4) | representative | 257.206 | 187.691 | 27.0% |
+| Bounded concurrent clone-cleanup (8 at 4) | small | 99.835 | 81.440 | 18.4% |
+| Bounded concurrent clone-cleanup (8 at 4) | representative | 263.934 | 238.148 | 9.8% |
+| Explicit cleanup drain (4-way) | small | 12.669 | 9.383 | 25.9% |
+| Explicit cleanup drain (4-way) | representative | 15.476 | 11.690 | 24.5% |
+| Deferred cleanup drain (4 queued) | small | 70.354 | 47.352 | 32.7% |
+| Deferred cleanup drain (4 queued) | representative | 129.677 | 117.607 | 9.3% |
+
+These are cross-run observations rather than latency thresholds. Startup was
+again noisy and is not attributed to the pool. Every measured lifecycle median
+improved, while the connection counter gives the more direct mechanism check.
+
+All three PERF02 samples reported identical lifecycle session deltas:
+
+| Fixture | Sequential clone-cleanup | Bounded concurrent clone-cleanup | Explicit drain | Deferred drain |
+| --- | ---: | ---: | ---: | ---: |
+| Small (pool cold) | 1 | 3 | 0 | 0 |
+| Representative (pool warm) | 0 | 0 | 0 | 0 |
+
+The comparable pre-pool workload opened 8, 16, 4, and 4 sessions in those four
+phases for each fixture: 64 new lifecycle sessions per sample. PERF02 opened
+four, a 93.75% reduction. After the first bounded-concurrent phase,
+`active_after=8` exactly accounted for one owner lock, one observer, two live
+template locks, and four lazy lifecycle-pool sessions. This shows that the
+pool grew to actual caller concurrency rather than eagerly filling its default
+limit of ten. The ignored PostgreSQL regression suite separately configures a
+four-session limit, blocks four simultaneous metadata operations, and observes
+exactly four project-labeled lifecycle backends through `pg_stat_activity`.
+
+The raw local report is `target/performance-owned-perf02.json`.

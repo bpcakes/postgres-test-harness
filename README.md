@@ -71,6 +71,19 @@ raised again. Zero and out-of-range values fail at their setter; an explicit
 per-database value larger than the final budget is rejected when
 `PostgresHarness::start` resolves the complete configuration.
 
+Disposable `CREATE`/metadata and `DROP` work reuses a lazy per-server pool of
+administrative sessions. Its limit is the smaller of the effective lease
+concurrency (`connection_budget / connections_per_database`) and one quarter
+of PostgreSQL's non-reserved connection slots, with a minimum of one. The
+quarter-share cap deliberately leaves most server capacity for test clients,
+retained owner and template-lock sessions, and other users of an external
+server. Sessions are checked out exclusively; independent lifecycle operations
+can progress concurrently without holding the pool lock during SQL. A reused
+session is reset and has the configured operation and lock timeouts restored
+before work. Failed or uncertain sessions are evicted and reconnected lazily.
+Owned shutdown closes this pool along with database admission, while external
+shutdown remains a no-op.
+
 Template coordination has a separate 15-minute wait timeout so a short
 administrative-operation timeout does not make concurrent callers fail while a
 real migration suite is still running. Override it with

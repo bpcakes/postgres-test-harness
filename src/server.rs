@@ -19,8 +19,9 @@ use uuid::Uuid;
 use crate::{
     Error, HarnessConfig, ProjectName, Result,
     admin::{
-        AdminClient, AdminDatabaseUrl, PersistentClient, acquire_advisory_lock, advisory_key,
-        connect_admin, connect_admin_with_timeout, validate_postgres_18,
+        AdminClient, AdminDatabaseUrl, AdminSessionPool, PersistentClient, acquire_advisory_lock,
+        advisory_key, connect_admin, connect_admin_with_timeout, regular_connection_slots,
+        validate_postgres_18,
     },
     config::{ImageReference, OwnedContainerProfile, ResolvedConnectionLimits},
 };
@@ -36,6 +37,10 @@ const CONTAINER_ENGINE_STARTUP_TIMEOUT_FLOOR: Duration = Duration::from_secs(60)
 const STARTUP_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const STARTUP_STATUS_INTERVAL: Duration = Duration::from_millis(25);
 const STARTUP_LOG_LIMIT_BYTES: u64 = 64 * 1024;
+// Lifecycle sessions may occupy at most one quarter of PostgreSQL's regular
+// connection slots. The remainder is headroom for test clients, retained
+// owner/template locks, and unrelated users of an external server.
+const LIFECYCLE_ADMIN_CONNECTION_SHARE_DIVISOR: usize = 4;
 const MANAGED_LABEL: &str = "org.postgres-test-harness.managed";
 const PROJECT_LABEL: &str = "org.postgres-test-harness.project";
 const RUN_LABEL: &str = "org.postgres-test-harness.run";
@@ -54,6 +59,7 @@ pub(crate) struct ServerInner {
     pub(crate) cleanup_on_start: bool,
     pub(crate) connections_per_database: u32,
     budget: Arc<Semaphore>,
+    admin_sessions: AdminSessionPool,
     _owner_lock: Mutex<Option<PersistentClient>>,
     container: Option<Arc<ContainerOwner>>,
 }
@@ -158,7 +164,17 @@ impl ServerInner {
         mut owner_lock: AdminClient,
     ) -> Result<Arc<Self>> {
         validate_postgres_18(&mut owner_lock)?;
+        let admin_pool_size = admin_session_pool_size(
+            connection_limits,
+            regular_connection_slots(&mut owner_lock)?,
+        );
         acquire_advisory_lock(&mut owner_lock, owner_key)?;
+        let admin_sessions = AdminSessionPool::new(
+            admin_url.clone(),
+            config.operation_timeout,
+            config.project.as_str(),
+            admin_pool_size,
+        );
 
         Ok(Arc::new(Self {
             admin_url,
@@ -170,6 +186,7 @@ impl ServerInner {
             cleanup_on_start: config.cleanup_on_start,
             connections_per_database: connection_limits.per_database,
             budget: Arc::new(Semaphore::new(connection_limits.budget)),
+            admin_sessions,
             _owner_lock: Mutex::new(Some(PersistentClient::new(owner_lock))),
             container,
         }))
@@ -181,6 +198,14 @@ impl ServerInner {
             .acquire_many_owned(self.connections_per_database)
             .await
             .map_err(|_| Error::ConnectionBudgetClosed)
+    }
+
+    pub(crate) fn with_lifecycle_admin<T>(
+        &self,
+        connect_operation: &'static str,
+        operation: impl FnOnce(&mut AdminClient) -> Result<T>,
+    ) -> Result<T> {
+        self.admin_sessions.execute(connect_operation, operation)
     }
 
     pub(crate) fn is_external(&self) -> bool {
@@ -198,8 +223,21 @@ impl ServerInner {
         else {
             return Ok(());
         };
+        self.admin_sessions.close();
         run_blocking(move || container.shutdown()).await
     }
+}
+
+fn admin_session_pool_size(
+    connection_limits: ResolvedConnectionLimits,
+    regular_connection_slots: usize,
+) -> usize {
+    let lifecycle_concurrency = connection_limits.budget
+        / usize::try_from(connection_limits.per_database)
+            .expect("u32 per-database connection limit fits usize");
+    let postgres_headroom_limit =
+        (regular_connection_slots / LIFECYCLE_ADMIN_CONNECTION_SHARE_DIVISOR).max(1);
+    lifecycle_concurrency.min(postgres_headroom_limit).max(1)
 }
 
 fn begin_owned_container_shutdown(
@@ -695,13 +733,14 @@ mod tests {
 
     use super::{
         ContainerCommand, ContainerOwner, ContainerWorker, POSTGRES_INITDB_NO_SYNC,
-        POSTGRES_STORAGE_PATH, ServerInner, begin_owned_container_shutdown, container_request,
-        ipv4_mapped_container_host, map_container_start_error, memory_exhaustion_evidence,
-        storage_exhaustion_evidence,
+        POSTGRES_STORAGE_PATH, ServerInner, admin_session_pool_size,
+        begin_owned_container_shutdown, container_request, ipv4_mapped_container_host,
+        map_container_start_error, memory_exhaustion_evidence, storage_exhaustion_evidence,
     };
     use crate::{
-        Error, HarnessConfig, OwnedContainerProfile, admin::AdminDatabaseUrl,
-        config::ImageReference,
+        Error, HarnessConfig, OwnedContainerProfile,
+        admin::AdminDatabaseUrl,
+        config::{ImageReference, ResolvedConnectionLimits},
     };
 
     fn test_container_owner(
@@ -752,6 +791,23 @@ mod tests {
         };
 
         assert!(matches!(error, Error::InvalidConfiguration { .. }));
+    }
+
+    #[test]
+    fn admin_pool_policy_obeys_lifecycle_concurrency_and_server_headroom() {
+        let limits = ResolvedConnectionLimits {
+            budget: 120,
+            per_database: 11,
+        };
+        assert_eq!(admin_session_pool_size(limits, 297), 10);
+        assert_eq!(admin_session_pool_size(limits, 20), 5);
+        assert_eq!(admin_session_pool_size(limits, 3), 1);
+
+        let single_lifecycle = ResolvedConnectionLimits {
+            budget: 2,
+            per_database: 2,
+        };
+        assert_eq!(admin_session_pool_size(single_lifecycle, 297), 1);
     }
 
     #[test]

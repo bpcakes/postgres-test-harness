@@ -1,4 +1,9 @@
-use std::{fmt, str::FromStr, time::Duration};
+use std::{
+    fmt,
+    str::FromStr,
+    sync::{Condvar, Mutex},
+    time::Duration,
+};
 
 use sha2::{Digest, Sha256};
 use tokio::{runtime::Runtime, task::JoinHandle};
@@ -9,6 +14,7 @@ use crate::{Error, Result, metadata::ResourceMetadata, name::DatabaseName};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+const LIFECYCLE_APPLICATION_NAME_PREFIX: &str = "postgres-test-harness lifecycle:";
 
 #[derive(Clone)]
 pub(crate) struct AdminDatabaseUrl(Url);
@@ -147,7 +153,7 @@ impl AdminClient {
     }
 }
 
-/// Admin client that may be retained by async code to hold an advisory lock.
+/// Admin client retained across calls or by async code holding an advisory lock.
 ///
 /// Dropping a Tokio runtime directly from another Tokio runtime panics. This
 /// wrapper shuts down the client's private runtime without blocking.
@@ -170,6 +176,211 @@ impl Drop for PersistentClient {
         if let Some(client) = self.0.take() {
             client.shutdown_background();
         }
+    }
+}
+
+/// Lazy, bounded pool for disposable database lifecycle work.
+///
+/// A checked-out client is removed from the state mutex before any connection
+/// or PostgreSQL work runs. Failed or panicking operations never return their
+/// session to the idle set because the resulting protocol and session state is
+/// not known to be reusable.
+pub(crate) struct AdminSessionPool {
+    admin_url: AdminDatabaseUrl,
+    operation_timeout: Duration,
+    application_name: String,
+    max_size: usize,
+    state: Mutex<AdminSessionPoolState>,
+    available: Condvar,
+}
+
+struct AdminSessionPoolState {
+    idle: Vec<PersistentClient>,
+    total: usize,
+    closed: bool,
+}
+
+struct AdminSession<'a> {
+    pool: &'a AdminSessionPool,
+    client: Option<PersistentClient>,
+    reusable: bool,
+}
+
+impl AdminSessionPool {
+    pub(crate) fn new(
+        admin_url: AdminDatabaseUrl,
+        operation_timeout: Duration,
+        project: &str,
+        max_size: usize,
+    ) -> Self {
+        debug_assert!(max_size > 0);
+        Self {
+            admin_url,
+            operation_timeout,
+            application_name: format!("{LIFECYCLE_APPLICATION_NAME_PREFIX}{project}"),
+            max_size: max_size.max(1),
+            state: Mutex::new(AdminSessionPoolState {
+                idle: Vec::new(),
+                total: 0,
+                closed: false,
+            }),
+            available: Condvar::new(),
+        }
+    }
+
+    pub(crate) fn execute<T>(
+        &self,
+        connect_operation: &'static str,
+        operation: impl FnOnce(&mut AdminClient) -> Result<T>,
+    ) -> Result<T> {
+        let mut session = self.checkout(connect_operation)?;
+        let result = operation(session.client_mut());
+        if result.is_ok() {
+            session.reusable = true;
+        }
+        result
+    }
+
+    pub(crate) fn close(&self) {
+        let idle = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.closed = true;
+            state.total = state
+                .total
+                .checked_sub(state.idle.len())
+                .expect("idle admin sessions are included in the pool total");
+            let idle = std::mem::take(&mut state.idle);
+            self.available.notify_all();
+            idle
+        };
+        drop(idle);
+    }
+
+    fn checkout(&self, connect_operation: &'static str) -> Result<AdminSession<'_>> {
+        loop {
+            let checkout = {
+                let mut state = self.state.lock().map_err(|_| Error::StatePoisoned {
+                    operation: "lock disposable admin-session pool",
+                })?;
+                loop {
+                    if state.closed {
+                        return Err(Error::AdminSessionPoolClosed);
+                    }
+                    if let Some(client) = state.idle.pop() {
+                        break Some(client);
+                    }
+                    if state.total < self.max_size {
+                        state.total += 1;
+                        break None;
+                    }
+                    state = self
+                        .available
+                        .wait(state)
+                        .map_err(|_| Error::StatePoisoned {
+                            operation: "wait for disposable admin session",
+                        })?;
+                }
+            };
+
+            match checkout {
+                Some(mut client) => {
+                    if prepare_lifecycle_session(
+                        client.client_mut(),
+                        self.operation_timeout,
+                        &self.application_name,
+                        true,
+                    )
+                    .is_err()
+                    {
+                        drop(client);
+                        self.release_slot();
+                        continue;
+                    }
+                    return Ok(AdminSession {
+                        pool: self,
+                        client: Some(client),
+                        reusable: false,
+                    });
+                }
+                None => {
+                    let connected =
+                        AdminClient::connect(&self.admin_url, CONNECT_TIMEOUT, connect_operation)
+                            .map(PersistentClient::new)
+                            .and_then(|mut client| {
+                                prepare_lifecycle_session(
+                                    client.client_mut(),
+                                    self.operation_timeout,
+                                    &self.application_name,
+                                    false,
+                                )?;
+                                Ok(client)
+                            });
+                    match connected {
+                        Ok(client) => {
+                            return Ok(AdminSession {
+                                pool: self,
+                                client: Some(client),
+                                reusable: false,
+                            });
+                        }
+                        Err(error) => {
+                            self.release_slot();
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn release_slot(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.total = state
+            .total
+            .checked_sub(1)
+            .expect("a reserved admin-session slot exists until release");
+        self.available.notify_one();
+    }
+}
+
+impl AdminSession<'_> {
+    fn client_mut(&mut self) -> &mut AdminClient {
+        self.client
+            .as_mut()
+            .expect("checked-out admin session exists until drop")
+            .client_mut()
+    }
+}
+
+impl Drop for AdminSession<'_> {
+    fn drop(&mut self) {
+        let client = self
+            .client
+            .take()
+            .expect("checked-out admin session is returned at most once");
+        let mut state = self
+            .pool
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.reusable && !state.closed {
+            state.idle.push(client);
+            self.pool.available.notify_one();
+            return;
+        }
+        state.total = state
+            .total
+            .checked_sub(1)
+            .expect("a checked-out admin session is included in the pool total");
+        self.pool.available.notify_one();
+        drop(state);
+        drop(client);
     }
 }
 
@@ -202,6 +413,29 @@ fn configure_session_timeouts(client: &mut AdminClient, operation_timeout: Durat
         .map_err(|source| Error::postgres("configure admin session timeouts", source))
 }
 
+fn prepare_lifecycle_session(
+    client: &mut AdminClient,
+    operation_timeout: Duration,
+    application_name: &str,
+    reused: bool,
+) -> Result<()> {
+    if reused {
+        client
+            .batch_execute("DISCARD ALL")
+            .map_err(|source| Error::postgres("reset pooled admin session", source))?;
+    }
+    let statement_timeout = duration_millis(operation_timeout)?;
+    let lock_timeout = duration_millis(LOCK_TIMEOUT.min(operation_timeout))?;
+    client
+        .batch_execute(&format!(
+            "SET statement_timeout = {statement_timeout}; \
+             SET lock_timeout = {lock_timeout}; \
+             SET application_name = {}",
+            quote_literal(application_name)
+        ))
+        .map_err(|source| Error::postgres("configure pooled admin session", source))
+}
+
 fn configure_coordination_timeouts(client: &mut AdminClient, wait_timeout: Duration) -> Result<()> {
     let timeout = duration_millis(wait_timeout)?;
     client
@@ -223,6 +457,24 @@ pub(crate) fn validate_postgres_18(client: &mut AdminClient) -> Result<()> {
         .query_one("SELECT uuidv7()::text", &[])
         .map_err(|_| Error::MissingUuidV7)?;
     Ok(())
+}
+
+pub(crate) fn regular_connection_slots(client: &mut AdminClient) -> Result<usize> {
+    let row = client
+        .query_one(
+            "SELECT current_setting('max_connections')::integer, \
+                    current_setting('reserved_connections')::integer, \
+                    current_setting('superuser_reserved_connections')::integer",
+            &[],
+        )
+        .map_err(|source| Error::postgres("read PostgreSQL connection capacity", source))?;
+    let max_connections = row.get::<_, i32>(0).max(1) as usize;
+    let reserved_connections = row.get::<_, i32>(1).max(0) as usize;
+    let superuser_reserved_connections = row.get::<_, i32>(2).max(0) as usize;
+    Ok(max_connections
+        .saturating_sub(reserved_connections)
+        .saturating_sub(superuser_reserved_connections)
+        .max(1))
 }
 
 pub(crate) fn acquire_advisory_lock(client: &mut AdminClient, key: i64) -> Result<()> {

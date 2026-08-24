@@ -32,7 +32,7 @@ pub enum Error {
     Postgres {
         operation: &'static str,
         #[source]
-        source: postgres::Error,
+        source: tokio_postgres::Error,
     },
 
     #[error("PostgreSQL test connection timed out during {operation} after {timeout:?}")]
@@ -136,7 +136,7 @@ pub enum Error {
 }
 
 impl Error {
-    pub(crate) fn postgres(operation: &'static str, source: postgres::Error) -> Self {
+    pub(crate) fn postgres(operation: &'static str, source: tokio_postgres::Error) -> Self {
         Self::Postgres { operation, source }
     }
 }

@@ -56,6 +56,37 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
                 .expect("check untagged database")
         );
 
+        const RACING_DATABASE: &str = "pgh_harness_it_test_11111111111111111111111111111111";
+        let racing_database =
+            TemporaryDatabase::create(admin_url.clone(), RACING_DATABASE.to_owned()).await;
+        execute(
+            admin_url.clone(),
+            format!(
+                "COMMENT ON DATABASE \"{RACING_DATABASE}\" IS \
+                 'postgres-test-harness:v1;kind=test;project=harness_it;owner=123456789;created=0'"
+            ),
+        )
+        .await
+        .expect("tag stale database for concurrent cleanup");
+        let (left_report, right_report) = tokio::join!(
+            cleanup_stale_databases(&admin_url, "harness_it", Duration::ZERO),
+            cleanup_stale_databases(&admin_url, "harness_it", Duration::ZERO),
+        );
+        let left_report = left_report.expect("run first concurrent cleanup");
+        let right_report = right_report.expect("run second concurrent cleanup");
+        assert_eq!(
+            left_report.dropped_test_databases + right_report.dropped_test_databases,
+            1
+        );
+        assert_eq!(left_report.dropped_templates, 0);
+        assert_eq!(right_report.dropped_templates, 0);
+        assert!(
+            !database_exists(admin_url.clone(), RACING_DATABASE.to_owned())
+                .await
+                .expect("verify concurrent cleanup removed the stale database once")
+        );
+
+        racing_database.remove().await;
         untagged_database.remove().await;
         active_database
             .cleanup()
@@ -370,6 +401,30 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
                 .await
                 .expect("verify metadata compensation removed the database")
         );
+    }
+
+    {
+        let cancellation_harness = PostgresHarness::start(
+            HarnessConfig::new("cancel_lease_it")
+                .unwrap()
+                .with_admin_database_url(admin_url.clone())
+                .with_cleanup_on_start(false),
+        )
+        .await
+        .expect("start lease-cancellation harness");
+        let catalog_lock = CatalogLock::acquire(admin_url.clone()).await;
+        let creation_harness = cancellation_harness.clone();
+        let creation = tokio::spawn(async move { creation_harness.empty_database().await });
+        let database_name =
+            wait_until_database_with_prefix(&admin_url, "pgh_cancel_lease_it_test_").await;
+
+        creation.abort();
+        let join_error = creation
+            .await
+            .expect_err("cancelled lease creation should not return a result");
+        assert!(join_error.is_cancelled());
+        drop(catalog_lock);
+        wait_until_database_is_absent(&admin_url, &database_name).await;
     }
 
     {

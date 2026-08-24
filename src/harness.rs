@@ -220,34 +220,6 @@ impl DatabaseLeaseInner {
     }
 }
 
-struct CancellationGuard<T> {
-    value: Option<T>,
-    cleanup: fn(T),
-}
-
-impl<T> CancellationGuard<T> {
-    fn new(value: T, cleanup: fn(T)) -> Self {
-        Self {
-            value: Some(value),
-            cleanup,
-        }
-    }
-
-    fn into_inner(mut self) -> T {
-        self.value
-            .take()
-            .expect("cancellation guard contains its value until consumed")
-    }
-}
-
-impl<T> Drop for CancellationGuard<T> {
-    fn drop(&mut self) {
-        if let Some(value) = self.value.take() {
-            (self.cleanup)(value);
-        }
-    }
-}
-
 enum TemplatePreparation {
     Ready(PersistentClient),
     Initialize(TemplateInitialization),
@@ -469,39 +441,30 @@ async fn create_test_database(
 ) -> Result<DatabaseLease> {
     let permit = server.acquire_database_permit().await?;
     let template_name = template_name.to_owned();
-    let server_for_create = server.clone();
-    let pending = run_blocking(move || {
-        let name = DatabaseName::test(&server_for_create.project);
+    let name = DatabaseName::test(&server.project);
+    let database_url = server.admin_url.database_url(&name);
+    run_blocking(move || {
         let mut client = connect_admin(
-            &server_for_create.admin_url,
-            server_for_create.operation_timeout,
+            &server.admin_url,
+            server.operation_timeout,
             "connect for disposable database creation",
         )?;
         create_managed_database(
             &mut client,
             &name,
             &template_name,
-            &ResourceMetadata::test(
-                server_for_create.project.clone(),
-                server_for_create.owner_key,
-            ),
+            &ResourceMetadata::test(server.project.clone(), server.owner_key),
         )?;
-        Ok(CancellationGuard::new(
-            DatabaseLeaseInner {
-                server: server_for_create,
+        Ok(DatabaseLease {
+            inner: Some(DatabaseLeaseInner {
+                server,
                 name,
                 _permit: permit,
-            },
-            queue_database_cleanup,
-        ))
+            }),
+            database_url,
+        })
     })
-    .await?;
-    let inner = pending.into_inner();
-    let database_url = server.admin_url.database_url(&inner.name);
-    Ok(DatabaseLease {
-        inner: Some(inner),
-        database_url,
-    })
+    .await
 }
 
 fn queue_database_cleanup(inner: DatabaseLeaseInner) {
@@ -608,7 +571,7 @@ fn cleanup_stale_blocking(
     let mut report = CleanupReport::default();
 
     for record in records {
-        let (name, lock_key) = match classify_cleanup_record(project, record, now, stale_after) {
+        let lock_key = match classify_cleanup_record(project, &record, now, stale_after) {
             CleanupClassification::Ignore => continue,
             CleanupClassification::Unrecognized => {
                 report.skipped_unrecognized += 1;
@@ -618,22 +581,74 @@ fn cleanup_stale_blocking(
                 report.skipped_fresh += 1;
                 continue;
             }
-            CleanupClassification::Candidate { name, lock_key } => (name, lock_key),
+            CleanupClassification::Candidate { lock_key, .. } => lock_key,
         };
         if !try_acquire_advisory_lock(&mut client, lock_key)? {
             report.skipped_active += 1;
             continue;
         }
-        let drop_result = drop_database(&mut client, &name);
-        let unlock_result = release_advisory_lock(&mut client, lock_key);
-        drop_result?;
-        unlock_result?;
-        match name.kind() {
+        let cleanup_result = cleanup_candidate_after_lock(
+            &mut client,
+            project,
+            &record,
+            lock_key,
+            now,
+            stale_after,
+            &mut report,
+        );
+        let Some(dropped_kind) = finish_locked_cleanup(cleanup_result, || {
+            release_advisory_lock(&mut client, lock_key)
+        })?
+        else {
+            continue;
+        };
+        match dropped_kind {
             DatabaseKind::Test => report.dropped_test_databases += 1,
             DatabaseKind::Template => report.dropped_templates += 1,
         }
     }
     Ok(report)
+}
+
+fn cleanup_candidate_after_lock(
+    client: &mut AdminClient,
+    project: &ProjectName,
+    snapshot: &DatabaseRecord,
+    held_key: i64,
+    now: u64,
+    stale_after: Duration,
+    report: &mut CleanupReport,
+) -> Result<Option<DatabaseKind>> {
+    let snapshot_name = DatabaseName::from_existing(project, snapshot.name.clone())
+        .expect("classified cleanup candidate has a valid managed database name");
+    let current = find_database(client, &snapshot_name)?;
+    let Some(name) = revalidate_cleanup_candidate(
+        project,
+        snapshot,
+        current.as_ref(),
+        held_key,
+        now,
+        stale_after,
+        report,
+    ) else {
+        return Ok(None);
+    };
+    drop_database(client, &name)?;
+    Ok(Some(name.kind()))
+}
+
+fn finish_locked_cleanup<T>(
+    operation: Result<T>,
+    unlock: impl FnOnce() -> Result<()>,
+) -> Result<T> {
+    let unlock = unlock();
+    match operation {
+        Ok(value) => {
+            unlock?;
+            Ok(value)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 enum CleanupClassification {
@@ -645,11 +660,11 @@ enum CleanupClassification {
 
 fn classify_cleanup_record(
     project: &ProjectName,
-    record: DatabaseRecord,
+    record: &DatabaseRecord,
     now: u64,
     stale_after: Duration,
 ) -> CleanupClassification {
-    let Some(name) = DatabaseName::from_existing(project, record.name) else {
+    let Some(name) = DatabaseName::from_existing(project, record.name.clone()) else {
         return CleanupClassification::Ignore;
     };
     let Some(metadata) = record.comment.as_deref().and_then(ResourceMetadata::parse) else {
@@ -664,6 +679,35 @@ fn classify_cleanup_record(
     CleanupClassification::Candidate {
         name,
         lock_key: metadata.lock_key(),
+    }
+}
+
+fn revalidate_cleanup_candidate(
+    project: &ProjectName,
+    snapshot: &DatabaseRecord,
+    current: Option<&DatabaseRecord>,
+    held_key: i64,
+    now: u64,
+    stale_after: Duration,
+    report: &mut CleanupReport,
+) -> Option<DatabaseName> {
+    let current = current?;
+    match classify_cleanup_record(project, current, now, stale_after) {
+        CleanupClassification::Ignore => None,
+        CleanupClassification::Unrecognized => {
+            report.skipped_unrecognized += 1;
+            None
+        }
+        CleanupClassification::Fresh => {
+            report.skipped_fresh += 1;
+            None
+        }
+        CleanupClassification::Candidate { name, lock_key }
+            if current == snapshot && lock_key == held_key =>
+        {
+            Some(name)
+        }
+        CleanupClassification::Candidate { .. } => None,
     }
 }
 
@@ -696,23 +740,70 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::{
-        CancellationGuard, CleanupClassification, classify_cleanup_record,
-        recoverable_template_initialization, run_blocking, template_lock_key,
-        template_record_is_ready,
+        CleanupClassification, CleanupReport, classify_cleanup_record, finish_locked_cleanup,
+        recoverable_template_initialization, revalidate_cleanup_candidate, run_blocking,
+        template_lock_key, template_record_is_ready,
     };
     use crate::{
-        FingerprintBuilder, ProjectName,
+        Error, FingerprintBuilder, ProjectName,
         admin::DatabaseRecord,
         metadata::{ResourceMetadata, TemplateState},
-        name::DatabaseName,
+        name::{DatabaseKind, DatabaseName},
     };
 
-    fn mark_cleaned(cleaned: Arc<AtomicBool>) {
-        cleaned.store(true, Ordering::SeqCst);
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn test_record(
+        project: &ProjectName,
+        name: &DatabaseName,
+        owner_key: i64,
+        created_at: u64,
+    ) -> DatabaseRecord {
+        DatabaseRecord {
+            name: name.as_str().to_owned(),
+            comment: Some(
+                ResourceMetadata::Test {
+                    project: project.clone(),
+                    owner_key,
+                    created_at,
+                }
+                .encode(),
+            ),
+        }
+    }
+
+    fn template_record(
+        project: &ProjectName,
+        fingerprint: crate::TemplateFingerprint,
+        lock_key: i64,
+        state: TemplateState,
+        created_at: u64,
+    ) -> DatabaseRecord {
+        DatabaseRecord {
+            name: DatabaseName::template(project, fingerprint)
+                .as_str()
+                .to_owned(),
+            comment: Some(
+                ResourceMetadata::Template {
+                    project: project.clone(),
+                    lock_key,
+                    fingerprint,
+                    state,
+                    created_at,
+                }
+                .encode(),
+            ),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn detached_blocking_results_run_their_cancellation_cleanup() {
+    async fn detached_blocking_results_are_dropped() {
         let cleaned = Arc::new(AtomicBool::new(false));
         let cleaned_for_task = cleaned.clone();
         let (started_sender, started_receiver) = oneshot::channel();
@@ -722,7 +813,7 @@ mod tests {
             run_blocking(move || {
                 let _ = started_sender.send(());
                 release_receiver.recv().unwrap();
-                Ok(CancellationGuard::new(cleaned_for_task, mark_cleaned))
+                Ok(DropProbe(cleaned_for_task))
             })
             .await
         });
@@ -861,7 +952,7 @@ mod tests {
 
         let unrecognized = classify_cleanup_record(
             &project,
-            DatabaseRecord {
+            &DatabaseRecord {
                 name: test_name.as_str().to_owned(),
                 comment: None,
             },
@@ -872,7 +963,7 @@ mod tests {
 
         let fresh = classify_cleanup_record(
             &project,
-            DatabaseRecord {
+            &DatabaseRecord {
                 name: test_name.as_str().to_owned(),
                 comment: Some(metadata.encode()),
             },
@@ -883,7 +974,7 @@ mod tests {
 
         let candidate = classify_cleanup_record(
             &project,
-            DatabaseRecord {
+            &DatabaseRecord {
                 name: test_name.as_str().to_owned(),
                 comment: Some(metadata.encode()),
             },
@@ -897,7 +988,7 @@ mod tests {
 
         let malformed_name = classify_cleanup_record(
             &project,
-            DatabaseRecord {
+            &DatabaseRecord {
                 name: "pgh_creditkit_test_backup".to_owned(),
                 comment: Some(metadata.encode()),
             },
@@ -905,5 +996,123 @@ mod tests {
             Duration::from_secs(10),
         );
         assert!(matches!(malformed_name, CleanupClassification::Ignore));
+    }
+
+    #[test]
+    fn locked_cleanup_requires_an_unchanged_candidate() {
+        let project = ProjectName::new("creditkit").unwrap();
+        let test_name = DatabaseName::test(&project);
+        let snapshot = test_record(&project, &test_name, 42, 10);
+        let mut report = CleanupReport::default();
+
+        let unchanged = revalidate_cleanup_candidate(
+            &project,
+            &snapshot,
+            Some(&snapshot),
+            42,
+            100,
+            Duration::from_secs(10),
+            &mut report,
+        );
+        assert_eq!(
+            unchanged.as_ref().map(DatabaseName::kind),
+            Some(DatabaseKind::Test)
+        );
+
+        let refreshed = test_record(&project, &test_name, 42, 95);
+        assert!(
+            revalidate_cleanup_candidate(
+                &project,
+                &snapshot,
+                Some(&refreshed),
+                42,
+                100,
+                Duration::from_secs(10),
+                &mut report,
+            )
+            .is_none()
+        );
+        assert_eq!(report.skipped_fresh, 1);
+
+        let changed_key = test_record(&project, &test_name, 84, 10);
+        assert!(
+            revalidate_cleanup_candidate(
+                &project,
+                &snapshot,
+                Some(&changed_key),
+                42,
+                100,
+                Duration::from_secs(10),
+                &mut report,
+            )
+            .is_none()
+        );
+        assert!(
+            revalidate_cleanup_candidate(
+                &project,
+                &snapshot,
+                None,
+                42,
+                100,
+                Duration::from_secs(10),
+                &mut report,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn locked_cleanup_rejects_a_finalized_template_snapshot() {
+        let project = ProjectName::new("creditkit").unwrap();
+        let fingerprint = FingerprintBuilder::new("cleanup-race").finish();
+        let initializing =
+            template_record(&project, fingerprint, 42, TemplateState::Initializing, 10);
+        let ready = template_record(&project, fingerprint, 42, TemplateState::Ready, 10);
+        let mut report = CleanupReport::default();
+
+        assert!(
+            revalidate_cleanup_candidate(
+                &project,
+                &initializing,
+                Some(&ready),
+                42,
+                100,
+                Duration::from_secs(10),
+                &mut report,
+            )
+            .is_none()
+        );
+        assert_eq!(report, CleanupReport::default());
+    }
+
+    #[test]
+    fn locked_cleanup_keeps_the_operation_error_primary() {
+        let unlocked = AtomicBool::new(false);
+        let error = finish_locked_cleanup::<()>(
+            Err(Error::InvalidConfiguration {
+                reason: "locked reread",
+            }),
+            || {
+                unlocked.store(true, Ordering::SeqCst);
+                Err(Error::InvalidConfiguration { reason: "unlock" })
+            },
+        )
+        .unwrap_err();
+        assert!(unlocked.load(Ordering::SeqCst));
+        assert!(matches!(
+            error,
+            Error::InvalidConfiguration {
+                reason: "locked reread"
+            }
+        ));
+
+        let error = finish_locked_cleanup(Ok(()), || {
+            Err(Error::InvalidConfiguration { reason: "unlock" })
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::InvalidConfiguration { reason: "unlock" }
+        ));
     }
 }

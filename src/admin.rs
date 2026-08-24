@@ -8,10 +8,9 @@ use std::{
     time::Duration,
 };
 
-use postgres::{Row, types::ToSql};
 use sha2::{Digest, Sha256};
 use tokio::{runtime::Runtime, task::JoinHandle};
-use tokio_postgres::NoTls;
+use tokio_postgres::{NoTls, Row, types::ToSql};
 use url::Url;
 
 use crate::{Error, Result, metadata::ResourceMetadata, name::DatabaseName};
@@ -72,6 +71,7 @@ impl fmt::Debug for AdminDatabaseUrl {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct DatabaseRecord {
     pub(crate) name: String,
     pub(crate) comment: Option<String>,
@@ -117,7 +117,7 @@ impl AdminClient {
         })
     }
 
-    fn batch_execute(&mut self, query: &str) -> std::result::Result<(), postgres::Error> {
+    fn batch_execute(&mut self, query: &str) -> std::result::Result<(), tokio_postgres::Error> {
         self.runtime.block_on(self.client.batch_execute(query))
     }
 
@@ -125,7 +125,7 @@ impl AdminClient {
         &mut self,
         query: &str,
         params: &[&(dyn ToSql + Sync)],
-    ) -> std::result::Result<Vec<Row>, postgres::Error> {
+    ) -> std::result::Result<Vec<Row>, tokio_postgres::Error> {
         self.runtime.block_on(self.client.query(query, params))
     }
 
@@ -133,7 +133,7 @@ impl AdminClient {
         &mut self,
         query: &str,
         params: &[&(dyn ToSql + Sync)],
-    ) -> std::result::Result<Row, postgres::Error> {
+    ) -> std::result::Result<Row, tokio_postgres::Error> {
         self.runtime.block_on(self.client.query_one(query, params))
     }
 
@@ -141,7 +141,7 @@ impl AdminClient {
         &mut self,
         query: &str,
         params: &[&(dyn ToSql + Sync)],
-    ) -> std::result::Result<Option<Row>, postgres::Error> {
+    ) -> std::result::Result<Option<Row>, tokio_postgres::Error> {
         self.runtime.block_on(self.client.query_opt(query, params))
     }
 }

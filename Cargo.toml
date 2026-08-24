@@ -13,7 +13,6 @@ categories = ["development-tools::testing", "database"]
 
 [dependencies]
 libc = "0.2"
-postgres = "0.19"
 sha2 = "0.10"
 testcontainers = { version = "0.27.3", default-features = false, features = ["blocking", "ring", "watchdog"] }
 thiserror = "2"
@@ -23,4 +22,5 @@ url = "2"
 uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
+postgres = "0.19"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

@@ -932,8 +932,8 @@ impl ExternalCleanupReport {
 }
 
 fn benchmark_project() -> String {
-    let token = Uuid::now_v7().simple().to_string();
-    format!("pghp_{}", &token[..10])
+    let token = Uuid::new_v4().simple().to_string();
+    format!("pghp_{}", &token[..11])
 }
 
 fn verify_started_image(
@@ -1180,7 +1180,7 @@ fn ns_to_ms(nanoseconds: u128) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{collections::HashSet, time::Duration};
 
     use postgres_test_harness::ProjectName;
 
@@ -1236,10 +1236,16 @@ mod tests {
     }
 
     #[test]
-    fn generated_projects_are_valid_and_schema_change_is_explicit() {
-        let project = benchmark_project();
-        assert!(ProjectName::new(project.clone()).is_ok());
-        assert!(project.starts_with("pghp_"));
+    fn generated_projects_are_random_valid_names_and_schema_change_is_explicit() {
+        let projects = (0..64).map(|_| benchmark_project()).collect::<HashSet<_>>();
+        assert_eq!(projects.len(), 64);
+        assert!(
+            projects
+                .iter()
+                .all(|project| ProjectName::new(project.clone()).is_ok())
+        );
+        assert!(projects.iter().all(|project| project.starts_with("pghp_")));
+        assert!(projects.iter().all(|project| project.len() == 16));
         assert_eq!(SCHEMA_VERSION, 2);
     }
 }

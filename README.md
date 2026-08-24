@@ -64,7 +64,12 @@ Docker CLI cleanup commands, or delete databases by a name prefix.
 The default connection budget is 120 permits and each live database lease
 holds 11. Projects with different pool geometry can override both values on
 `HarnessConfig`; the per-database value must cover every connection pool a
-single test may open.
+single test may open. Connection-limit setters are order-independent and the
+last override for each value wins. With no explicit per-database override, its
+default is clamped to a smaller budget and returns to 11 if that budget is
+raised again. Zero and out-of-range values fail at their setter; an explicit
+per-database value larger than the final budget is rejected when
+`PostgresHarness::start` resolves the complete configuration.
 
 Template coordination has a separate 15-minute wait timeout so a short
 administrative-operation timeout does not make concurrent callers fail while a

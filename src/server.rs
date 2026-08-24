@@ -21,7 +21,7 @@ use crate::{
         AdminClient, AdminDatabaseUrl, PersistentClient, acquire_advisory_lock, advisory_key,
         connect_admin, validate_postgres_18,
     },
-    config::ImageReference,
+    config::{ImageReference, ResolvedConnectionLimits},
 };
 
 const POSTGRES_PORT: u16 = 5432;
@@ -56,6 +56,7 @@ impl ServerInner {
     }
 
     fn start_blocking(config: HarnessConfig) -> Result<Arc<Self>> {
+        let connection_limits = config.resolved_connection_limits()?;
         let run_id = Uuid::now_v7().simple().to_string();
         let owner_key = advisory_key("run", &run_id);
         let (admin_url, container) = if let Some(admin_url) = config.resolved_admin_database_url() {
@@ -67,20 +68,29 @@ impl ServerInner {
             (admin_url, Some(container))
         };
 
-        Self::finish_start(config, admin_url, container, owner_key)
+        Self::finish_start(config, connection_limits, admin_url, container, owner_key)
     }
 
     fn finish_start(
         config: HarnessConfig,
+        connection_limits: ResolvedConnectionLimits,
         admin_url: AdminDatabaseUrl,
         container: Option<Arc<ContainerOwner>>,
         owner_key: i64,
     ) -> Result<Arc<Self>> {
-        Self::finish_start_with(config, admin_url, container, owner_key, connect_admin)
+        Self::finish_start_with(
+            config,
+            connection_limits,
+            admin_url,
+            container,
+            owner_key,
+            connect_admin,
+        )
     }
 
     fn finish_start_with<F>(
         config: HarnessConfig,
+        connection_limits: ResolvedConnectionLimits,
         admin_url: AdminDatabaseUrl,
         container: Option<Arc<ContainerOwner>>,
         owner_key: i64,
@@ -105,8 +115,8 @@ impl ServerInner {
             template_wait_timeout: config.template_wait_timeout,
             stale_after: config.stale_after,
             cleanup_on_start: config.cleanup_on_start,
-            connections_per_database: config.connections_per_database,
-            budget: Arc::new(Semaphore::new(config.connection_budget)),
+            connections_per_database: connection_limits.per_database,
+            budget: Arc::new(Semaphore::new(connection_limits.budget)),
             _owner_lock: Mutex::new(Some(PersistentClient::new(owner_lock))),
             container,
         }))
@@ -148,8 +158,11 @@ where
         .map_err(|source| Error::BlockingTask { source })?
 }
 
-enum ContainerCommand {
-    Shutdown(Sender<std::result::Result<(), testcontainers::TestcontainersError>>),
+type RemovalResult = std::result::Result<(), testcontainers::TestcontainersError>;
+
+struct ContainerWorker {
+    shutdown: Sender<()>,
+    handle: JoinHandle<RemovalResult>,
 }
 
 struct StartedContainer {
@@ -160,8 +173,7 @@ struct StartedContainer {
 
 pub(crate) struct ContainerOwner {
     id: String,
-    commands: Mutex<Option<Sender<ContainerCommand>>>,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    worker: Mutex<Option<ContainerWorker>>,
 }
 
 impl ContainerOwner {
@@ -172,7 +184,7 @@ impl ContainerOwner {
         startup_timeout: Duration,
     ) -> Result<(Arc<Self>, AdminDatabaseUrl)> {
         let (started_sender, started_receiver) = mpsc::sync_channel(1);
-        let (command_sender, command_receiver) = mpsc::channel();
+        let (shutdown_sender, shutdown_receiver) = mpsc::channel();
         let project_label = project.as_str().to_owned();
         let run_label = run_id.to_owned();
         let created_label = unix_now().to_string();
@@ -207,31 +219,22 @@ impl ContainerOwner {
                     Ok(container) => container,
                     Err(source) => {
                         let _ = started_sender.send(Err(source));
-                        return;
+                        return Ok(());
                     }
                 };
                 let started = resolve_started_container(&container);
                 if started_sender.send(started).is_err() {
-                    let _ = container.rm();
-                    return;
+                    return container.rm();
                 }
 
-                let removal_result = match command_receiver.recv() {
-                    Ok(ContainerCommand::Shutdown(result_sender)) => {
-                        let result = container.rm();
-                        let result_for_sender = result.as_ref().map(|_| ()).map_err(|error| {
-                            testcontainers::TestcontainersError::other(error.to_string())
-                        });
-                        let _ = result_sender.send(result_for_sender);
-                        result
-                    }
-                    Err(_) => container.rm(),
-                };
-                if let Err(error) = removal_result {
+                let _ = shutdown_receiver.recv();
+                let removal_result = container.rm();
+                if let Err(error) = &removal_result {
                     eprintln!(
                         "postgres-test-harness: failed to remove owned PostgreSQL container: {error}"
                     );
                 }
+                removal_result
             })
             .map_err(|source| Error::ContainerWorkerStart { source })?;
 
@@ -245,44 +248,29 @@ impl ContainerOwner {
         ))?;
         let owner = Arc::new(Self {
             id: started.id,
-            commands: Mutex::new(Some(command_sender)),
-            worker: Mutex::new(Some(worker)),
+            worker: Mutex::new(Some(ContainerWorker {
+                shutdown: shutdown_sender,
+                handle: worker,
+            })),
         });
         register_container(&owner)?;
         Ok((owner, admin_url))
     }
 
     fn shutdown(&self) -> Result<()> {
-        let command_sender = self
-            .commands
-            .lock()
-            .map_err(|_| Error::StatePoisoned {
-                operation: "lock PostgreSQL container command sender",
-            })?
-            .take();
-        if let Some(command_sender) = command_sender {
-            let (result_sender, result_receiver) = mpsc::channel();
-            if command_sender
-                .send(ContainerCommand::Shutdown(result_sender))
-                .is_ok()
-            {
-                result_receiver
-                    .recv()
-                    .map_err(|_| Error::ContainerWorkerStopped)?
-                    .map_err(|source| Error::ContainerRemove { source })?;
-            }
-        }
-        if let Some(worker) = self
-            .worker
-            .lock()
-            .map_err(|_| Error::StatePoisoned {
-                operation: "lock PostgreSQL container worker",
-            })?
-            .take()
-        {
-            worker.join().map_err(|_| Error::ContainerWorkerPanicked)?;
-        }
-        Ok(())
+        let mut worker = self.worker.lock().map_err(|_| Error::StatePoisoned {
+            operation: "lock PostgreSQL container worker",
+        })?;
+        let Some(ContainerWorker { shutdown, handle }) = worker.take() else {
+            return Ok(());
+        };
+
+        let _ = shutdown.send(());
+        drop(shutdown);
+        handle
+            .join()
+            .map_err(|_| Error::ContainerWorkerPanicked)?
+            .map_err(|source| Error::ContainerRemove { source })
     }
 }
 
@@ -365,13 +353,30 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{Arc, Mutex, mpsc},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
         thread,
         time::Duration,
     };
 
-    use super::{ContainerCommand, ContainerOwner, ServerInner, ipv4_mapped_container_host};
+    use super::{ContainerOwner, ContainerWorker, ServerInner, ipv4_mapped_container_host};
     use crate::{Error, HarnessConfig, admin::AdminDatabaseUrl};
+
+    fn test_container_owner(
+        work: impl FnOnce(mpsc::Receiver<()>) -> super::RemovalResult + Send + 'static,
+    ) -> Arc<ContainerOwner> {
+        let (shutdown, shutdown_receiver) = mpsc::channel();
+        Arc::new(ContainerOwner {
+            id: "test-container".to_owned(),
+            worker: Mutex::new(Some(ContainerWorker {
+                shutdown,
+                handle: thread::spawn(move || work(shutdown_receiver)),
+            })),
+        })
+    }
 
     #[test]
     fn ipv4_port_mapping_uses_an_ipv4_loopback_literal() {
@@ -394,21 +399,39 @@ mod tests {
     }
 
     #[test]
+    fn invalid_connection_limits_fail_before_server_startup_side_effects() {
+        let config = HarnessConfig::new("limits")
+            .unwrap()
+            .with_admin_database_url("not a PostgreSQL URL")
+            .with_connections_per_database(121)
+            .unwrap();
+
+        let error = match ServerInner::start_blocking(config) {
+            Ok(_) => panic!("incompatible connection limits must fail server startup"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, Error::InvalidConfiguration { .. }));
+    }
+
+    #[test]
     fn owned_container_is_shut_down_when_admin_connection_times_out() {
-        let (command_sender, command_receiver) = mpsc::channel();
+        let (shutdown_request_sender, shutdown_request_receiver) = mpsc::channel();
         let (shutdown_sender, shutdown_receiver) = mpsc::channel();
-        let worker = thread::spawn(move || match command_receiver.recv().unwrap() {
-            ContainerCommand::Shutdown(result_sender) => {
-                shutdown_sender.send(()).unwrap();
-                result_sender.send(Ok(())).unwrap();
-            }
+        let worker = thread::spawn(move || {
+            shutdown_request_receiver.recv().unwrap();
+            shutdown_sender.send(()).unwrap();
+            Ok(())
         });
         let container = Arc::new(ContainerOwner {
             id: "test-container".to_owned(),
-            commands: Mutex::new(Some(command_sender)),
-            worker: Mutex::new(Some(worker)),
+            worker: Mutex::new(Some(ContainerWorker {
+                shutdown: shutdown_request_sender,
+                handle: worker,
+            })),
         });
         let config = HarnessConfig::new("cleanup").unwrap();
+        let connection_limits = config.resolved_connection_limits().unwrap();
         let admin_url = AdminDatabaseUrl::parse(
             "postgres://postgres:secret@127.0.0.1:5432/postgres?sslmode=disable",
         )
@@ -416,6 +439,7 @@ mod tests {
 
         let error = match ServerInner::finish_start_with(
             config,
+            connection_limits,
             admin_url,
             Some(container),
             1,
@@ -434,5 +458,95 @@ mod tests {
         shutdown_receiver
             .recv_timeout(Duration::from_secs(1))
             .expect("owned container shutdown should run before startup returns");
+    }
+
+    #[test]
+    fn container_shutdown_is_successful_and_idempotent() {
+        let removals = Arc::new(AtomicUsize::new(0));
+        let worker_removals = removals.clone();
+        let container = test_container_owner(move |shutdown| {
+            shutdown.recv().unwrap();
+            worker_removals.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+
+        container.shutdown().unwrap();
+        container.shutdown().unwrap();
+
+        assert_eq!(removals.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn concurrent_container_shutdown_waits_for_the_terminal_transition() {
+        let (removal_started_sender, removal_started_receiver) = mpsc::channel();
+        let (release_removal_sender, release_removal_receiver) = mpsc::channel();
+        let container = test_container_owner(move |shutdown| {
+            shutdown.recv().unwrap();
+            removal_started_sender.send(()).unwrap();
+            release_removal_receiver.recv().unwrap();
+            Ok(())
+        });
+
+        let first_container = container.clone();
+        let first = thread::spawn(move || first_container.shutdown());
+        removal_started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first shutdown should begin container removal");
+
+        let (second_started_sender, second_started_receiver) = mpsc::channel();
+        let (second_finished_sender, second_finished_receiver) = mpsc::channel();
+        let second = thread::spawn(move || {
+            second_started_sender.send(()).unwrap();
+            let result = container.shutdown();
+            second_finished_sender.send(()).unwrap();
+            result
+        });
+        second_started_receiver.recv().unwrap();
+        assert!(
+            second_finished_receiver
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "concurrent shutdown returned before removal finished"
+        );
+
+        release_removal_sender.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn container_shutdown_returns_the_worker_removal_error() {
+        let container = test_container_owner(|shutdown| {
+            shutdown.recv().unwrap();
+            Err(testcontainers::TestcontainersError::other(
+                "forced removal failure",
+            ))
+        });
+
+        let error = container.shutdown().unwrap_err();
+
+        assert!(matches!(error, Error::ContainerRemove { .. }));
+        assert!(error.to_string().contains("forced removal failure"));
+        assert!(container.shutdown().is_ok());
+    }
+
+    #[test]
+    fn container_shutdown_reports_a_worker_panic() {
+        let container = test_container_owner(|shutdown| {
+            shutdown.recv().unwrap();
+            panic!("forced container worker panic");
+        });
+
+        assert!(matches!(
+            container.shutdown().unwrap_err(),
+            Error::ContainerWorkerPanicked
+        ));
+    }
+
+    #[test]
+    fn container_shutdown_uses_the_result_of_an_already_stopped_worker() {
+        let container = test_container_owner(|_| Ok(()));
+
+        container.shutdown().unwrap();
     }
 }

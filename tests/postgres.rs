@@ -13,6 +13,7 @@ use postgres_test_harness::{
     BoxError, Error, FingerprintBuilder, HarnessConfig, PostgresHarness, TemplateSpec,
     cleanup_stale_databases,
 };
+use sha2::{Digest, Sha256};
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a local Docker-compatible daemon"]
@@ -92,6 +93,63 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
             .cleanup()
             .await
             .expect("clean active cleanup database");
+    }
+
+    {
+        let fingerprint = FingerprintBuilder::new("drop-lock-regression").finish();
+        let lock_key = advisory_key("template", &format!("harness_it:{}", fingerprint.to_hex()));
+        let template = harness
+            .template(TemplateSpec::new(fingerprint), |_| async { Ok(()) })
+            .await
+            .expect("initialize template for retained-lock drop regression");
+        assert!(
+            !advisory_lock_is_acquirable(admin_url.clone(), lock_key)
+                .await
+                .expect("check retained template lock"),
+            "template should retain its shared advisory lock"
+        );
+
+        drop(template);
+
+        wait_until_advisory_lock_is_acquirable(&admin_url, lock_key).await;
+    }
+
+    {
+        let limited_harness = PostgresHarness::start(
+            HarnessConfig::new("limits_it")
+                .unwrap()
+                .with_admin_database_url(admin_url.clone())
+                .with_connection_budget(2)
+                .unwrap()
+                .with_connections_per_database(2)
+                .unwrap()
+                .with_cleanup_on_start(false),
+        )
+        .await
+        .expect("start connection-limited harness");
+        let first = limited_harness
+            .empty_database()
+            .await
+            .expect("acquire the full connection budget");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), limited_harness.empty_database())
+                .await
+                .is_err(),
+            "a second lease should wait while the resolved budget is exhausted"
+        );
+
+        first
+            .cleanup()
+            .await
+            .expect("release the full connection budget");
+        let second = tokio::time::timeout(Duration::from_secs(5), limited_harness.empty_database())
+            .await
+            .expect("a released connection budget should become available")
+            .expect("create a database after releasing the budget");
+        second
+            .cleanup()
+            .await
+            .expect("clean the connection-limit regression database");
     }
 
     {
@@ -604,6 +662,30 @@ async fn database_exists(database_url: String, database_name: String) -> Result<
     .await
 }
 
+fn advisory_key(domain: &str, identity: &str) -> i64 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"postgres-test-harness-advisory-v1");
+    hasher.update((domain.len() as u64).to_be_bytes());
+    hasher.update(domain.as_bytes());
+    hasher.update((identity.len() as u64).to_be_bytes());
+    hasher.update(identity.as_bytes());
+    let digest = hasher.finalize();
+    i64::from_be_bytes(digest[..8].try_into().unwrap())
+}
+
+async fn advisory_lock_is_acquirable(database_url: String, key: i64) -> Result<bool, BoxError> {
+    with_client(database_url, move |client| {
+        let acquired: bool = client
+            .query_one("SELECT pg_try_advisory_lock($1)", &[&key])?
+            .get(0);
+        if acquired {
+            client.query_one("SELECT pg_advisory_unlock($1)", &[&key])?;
+        }
+        Ok(acquired)
+    })
+    .await
+}
+
 async fn with_client<T, F>(database_url: String, operation: F) -> Result<T, BoxError>
 where
     T: Send + 'static,
@@ -632,6 +714,23 @@ async fn wait_until_database_is_absent(admin_url: &str, database_name: &str) {
             "fallback cleanup did not drop database '{database_name}'"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn wait_until_advisory_lock_is_acquirable(admin_url: &str, key: i64) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if advisory_lock_is_acquirable(admin_url.to_owned(), key)
+            .await
+            .expect("poll retained advisory lock")
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "retained advisory lock was not released after client drop"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 

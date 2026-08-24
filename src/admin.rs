@@ -1,12 +1,4 @@
-use std::{
-    fmt,
-    str::FromStr,
-    sync::{
-        OnceLock,
-        mpsc::{self, Sender},
-    },
-    time::Duration,
-};
+use std::{fmt, str::FromStr, time::Duration};
 
 use sha2::{Digest, Sha256};
 use tokio::{runtime::Runtime, task::JoinHandle};
@@ -17,8 +9,6 @@ use crate::{Error, Result, metadata::ResourceMetadata, name::DatabaseName};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
-
-static CLIENT_DROP_WORKER: OnceLock<Option<Sender<AdminClient>>> = OnceLock::new();
 
 #[derive(Clone)]
 pub(crate) struct AdminDatabaseUrl(Url);
@@ -144,13 +134,23 @@ impl AdminClient {
     ) -> std::result::Result<Option<Row>, tokio_postgres::Error> {
         self.runtime.block_on(self.client.query_opt(query, params))
     }
+
+    fn shutdown_background(self) {
+        let Self {
+            client,
+            _connection: connection,
+            runtime,
+        } = self;
+        drop(client);
+        drop(connection);
+        runtime.shutdown_background();
+    }
 }
 
 /// Admin client that may be retained by async code to hold an advisory lock.
 ///
 /// Dropping a Tokio runtime directly from another Tokio runtime panics. This
-/// wrapper transfers the complete client to a plain dedicated thread for
-/// destruction.
+/// wrapper shuts down the client's private runtime without blocking.
 pub(crate) struct PersistentClient(Option<AdminClient>);
 
 impl PersistentClient {
@@ -167,34 +167,8 @@ impl PersistentClient {
 
 impl Drop for PersistentClient {
     fn drop(&mut self) {
-        let Some(client) = self.0.take() else {
-            return;
-        };
-        let worker = CLIENT_DROP_WORKER.get_or_init(|| {
-            let (sender, receiver) = mpsc::channel::<AdminClient>();
-            match std::thread::Builder::new()
-                .name("postgres-test-harness-client-drop".to_owned())
-                .spawn(move || {
-                    while let Ok(client) = receiver.recv() {
-                        drop(client);
-                    }
-                })
-            {
-                Ok(_) => Some(sender),
-                Err(error) => {
-                    eprintln!(
-                        "postgres-test-harness: failed to start PostgreSQL client drop worker: {error}"
-                    );
-                    None
-                }
-            }
-        });
-        let Some(worker) = worker else {
-            std::mem::forget(client);
-            return;
-        };
-        if let Err(error) = worker.send(client) {
-            std::mem::forget(error.0);
+        if let Some(client) = self.0.take() {
+            client.shutdown_background();
         }
     }
 }
@@ -496,11 +470,18 @@ fn quote_literal(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Read, net::TcpListener, thread, time::Duration};
+    use std::{
+        io::{self, Read, Write},
+        net::TcpListener,
+        sync::mpsc,
+        thread,
+        time::Duration,
+    };
 
     use super::{
-        AdminDatabaseUrl, advisory_key, compensate_failed_metadata_write,
-        connect_admin_with_timeout, quote_identifier, quote_literal,
+        AdminClient, AdminDatabaseUrl, PersistentClient, advisory_key,
+        compensate_failed_metadata_write, connect_admin_with_timeout, quote_identifier,
+        quote_literal,
     };
     use crate::{Error, FingerprintBuilder, ProjectName, name::DatabaseName};
 
@@ -567,6 +548,82 @@ mod tests {
         assert!(!display.contains("secret"));
         assert!(!display.contains(&port.to_string()));
         assert!(!server.join().unwrap().is_empty());
+    }
+
+    fn connect_stub_admin_client() -> (
+        AdminClient,
+        mpsc::Receiver<io::Result<()>>,
+        thread::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (closed_sender, closed_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut startup_length = [0; 4];
+            stream.read_exact(&mut startup_length).unwrap();
+            let startup_length = u32::from_be_bytes(startup_length) as usize;
+            let mut startup = vec![0; startup_length - 4];
+            stream.read_exact(&mut startup).unwrap();
+            stream
+                .write_all(&[
+                    b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'K', 0, 0, 0, 12, 0, 0, 0, 1, 0, 0, 0, 2, b'Z',
+                    0, 0, 0, 5, b'I',
+                ])
+                .unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut remaining = Vec::new();
+            let result = stream.read_to_end(&mut remaining).map(|_| ());
+            let _ = closed_sender.send(result);
+        });
+        let admin = AdminDatabaseUrl::parse(&format!(
+            "postgres://user@127.0.0.1:{port}/postgres?sslmode=disable"
+        ))
+        .unwrap();
+        let client = AdminClient::connect(
+            &admin,
+            Duration::from_secs(1),
+            "connect to stub PostgreSQL server",
+        )
+        .unwrap();
+        (client, closed_receiver, server)
+    }
+
+    fn assert_persistent_client_drop_is_safe(runtime: tokio::runtime::Runtime) {
+        let (client, closed, server) = connect_stub_admin_client();
+
+        runtime.block_on(async move {
+            drop(PersistentClient::new(client));
+        });
+
+        closed
+            .recv_timeout(Duration::from_secs(1))
+            .expect("admin connection should close during background runtime shutdown")
+            .expect("stub PostgreSQL connection should close cleanly");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn persistent_client_drops_inside_a_current_thread_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        assert_persistent_client_drop_is_safe(runtime);
+    }
+
+    #[test]
+    fn persistent_client_drops_inside_a_multithread_runtime() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        assert_persistent_client_drop_is_safe(runtime);
     }
 
     #[test]

@@ -176,6 +176,10 @@ struct TemplateInner {
 }
 
 /// Exclusive ownership of one disposable test database.
+///
+/// Dropping a lease enqueues cleanup without waiting for queue capacity. The
+/// fallback retains its connection-budget permit until cleanup finishes, so
+/// saturation delays later database acquisition instead of blocking `Drop`.
 pub struct DatabaseLease {
     inner: Option<DatabaseLeaseInner>,
     database_url: String,
@@ -246,7 +250,7 @@ impl std::fmt::Debug for DatabaseLease {
 impl Drop for DatabaseLease {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take()
-            && let Err(error) = inner.queue_deferred_cleanup()
+            && let Err(error) = inner.queue_fallback_cleanup()
         {
             // Owned shutdown removes the containing server. On an external
             // server the tagged residual is left for the next stale sweep.
@@ -290,6 +294,21 @@ impl DatabaseLeaseInner {
         let database_name = name.as_str().to_owned();
         let database_cleanup = server.database_cleanup.clone();
         database_cleanup.submit_deferred(database_name, Some(permit), move || {
+            server.with_lifecycle_admin("connect for disposable database cleanup", |client| {
+                drop_database(client, &name)
+            })
+        })
+    }
+
+    fn queue_fallback_cleanup(self) -> Result<()> {
+        let Self {
+            server,
+            name,
+            permit,
+        } = self;
+        let database_name = name.as_str().to_owned();
+        let database_cleanup = server.database_cleanup.clone();
+        database_cleanup.submit_fallback(database_name, permit, move || {
             server.with_lifecycle_admin("connect for disposable database cleanup", |client| {
                 drop_database(client, &name)
             })

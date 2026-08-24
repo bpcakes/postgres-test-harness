@@ -42,6 +42,11 @@ const STARTUP_LOG_LIMIT_BYTES: u64 = 64 * 1024;
 // regular connection slots. Separate harnesses and processes do not coordinate
 // this local bound.
 const LIFECYCLE_ADMIN_CONNECTION_SHARE_DIVISOR: usize = 4;
+// Cleanup is I/O-bound, but each worker owns an OS thread while it is idle.
+// Reserve at least half of a multi-session lifecycle pool for creates and
+// other lifecycle work, and cap the per-server thread footprint explicitly.
+const CLEANUP_ADMIN_SESSION_SHARE_DIVISOR: usize = 2;
+const MAX_CLEANUP_WORKERS: usize = 4;
 const MANAGED_LABEL: &str = "org.postgres-test-harness.managed";
 const PROJECT_LABEL: &str = "org.postgres-test-harness.project";
 const RUN_LABEL: &str = "org.postgres-test-harness.run";
@@ -178,12 +183,13 @@ impl ServerInner {
             admin_pool_size,
         ));
         let budget = Arc::new(Semaphore::new(connection_limits.budget));
+        let cleanup_limits = cleanup_queue_limits(admin_pool_size);
         // One waiting slot per worker bounds deferred residual databases while
-        // still allowing the lifecycle pool's safe concurrency to make progress.
+        // the separate worker limit preserves lifecycle-pool headroom.
         let database_cleanup = DatabaseCleanupQueue::new(
             config.project.as_str(),
-            admin_pool_size,
-            admin_pool_size,
+            cleanup_limits.worker_count,
+            cleanup_limits.queue_capacity,
             budget.clone(),
         )?;
 
@@ -284,6 +290,22 @@ fn per_harness_admin_session_pool_size(
     let postgres_headroom_limit =
         (regular_connection_slots / LIFECYCLE_ADMIN_CONNECTION_SHARE_DIVISOR).max(1);
     lifecycle_concurrency.min(postgres_headroom_limit).max(1)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CleanupQueueLimits {
+    worker_count: usize,
+    queue_capacity: usize,
+}
+
+fn cleanup_queue_limits(admin_pool_size: usize) -> CleanupQueueLimits {
+    debug_assert!(admin_pool_size > 0);
+    let worker_count =
+        (admin_pool_size / CLEANUP_ADMIN_SESSION_SHARE_DIVISOR).clamp(1, MAX_CLEANUP_WORKERS);
+    CleanupQueueLimits {
+        worker_count,
+        queue_capacity: worker_count,
+    }
 }
 
 fn begin_owned_container_shutdown(
@@ -779,7 +801,7 @@ mod tests {
 
     use super::{
         ContainerCommand, ContainerOwner, ContainerWorker, POSTGRES_INITDB_NO_SYNC,
-        POSTGRES_STORAGE_PATH, ServerInner, begin_owned_container_shutdown,
+        POSTGRES_STORAGE_PATH, ServerInner, begin_owned_container_shutdown, cleanup_queue_limits,
         combine_cleanup_and_shutdown, container_request, ipv4_mapped_container_host,
         map_container_start_error, memory_exhaustion_evidence, per_harness_admin_session_pool_size,
         storage_exhaustion_evidence,
@@ -858,6 +880,22 @@ mod tests {
             per_harness_admin_session_pool_size(single_lifecycle, 297),
             1
         );
+    }
+
+    #[test]
+    fn cleanup_policy_preserves_pool_headroom_and_caps_worker_threads() {
+        for admin_pool_size in 2..=64 {
+            let limits = cleanup_queue_limits(admin_pool_size);
+            assert!(limits.worker_count < admin_pool_size);
+            assert!(limits.worker_count <= 4);
+            assert_eq!(limits.queue_capacity, limits.worker_count);
+        }
+
+        assert_eq!(cleanup_queue_limits(1).worker_count, 1);
+        assert_eq!(cleanup_queue_limits(2).worker_count, 1);
+        assert_eq!(cleanup_queue_limits(4).worker_count, 2);
+        assert_eq!(cleanup_queue_limits(10).worker_count, 4);
+        assert_eq!(cleanup_queue_limits(100).worker_count, 4);
     }
 
     #[test]

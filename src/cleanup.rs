@@ -2,10 +2,7 @@ use std::{
     collections::{BTreeSet, VecDeque},
     io::Write as _,
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::{
-        Arc, Condvar, Mutex,
-        mpsc::{Receiver, SyncSender, sync_channel},
-    },
+    sync::{Arc, Condvar, Mutex},
     thread::JoinHandle,
 };
 
@@ -18,21 +15,29 @@ type CleanupOperation = Box<dyn FnOnce() -> Result<()> + Send + 'static>;
 /// Server-scoped execution and completion tracking for disposable database
 /// cleanup.
 ///
-/// The channel holds at most `queue_capacity` waiting operations and exactly
-/// `worker_count` workers can execute cleanup concurrently. A submitted job
-/// retains the queue until its completion sequence has been recorded, which
-/// lets an external-server harness outlive all public handles while cleanup is
-/// still running.
+/// Explicit submissions backpressure at `queue_capacity` waiting operations,
+/// while destructor fallbacks remain nonblocking and retain their database
+/// permits until completion. Exactly `worker_count` workers can execute cleanup
+/// concurrently. A submitted job retains the queue until its completion
+/// sequence has been recorded, which lets an external-server harness outlive
+/// all public handles while cleanup is still running.
 pub(crate) struct DatabaseCleanupQueue {
-    submission: Mutex<SubmissionState>,
+    submission: Arc<SubmissionQueue>,
     completion: Arc<CompletionState>,
     drain: Mutex<()>,
     workers: Mutex<Vec<JoinHandle<()>>>,
 }
 
+struct SubmissionQueue {
+    capacity: usize,
+    state: Mutex<SubmissionState>,
+    changed: Condvar,
+}
+
 struct SubmissionState {
-    sender: Option<SyncSender<CleanupJob>>,
+    jobs: VecDeque<CleanupJob>,
     next_sequence: u64,
+    closed: bool,
 }
 
 struct CompletionState {
@@ -85,6 +90,12 @@ enum CleanupCompletion {
     Deferred,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CleanupAdmission {
+    Backpressured,
+    NonblockingFallback,
+}
+
 impl DatabaseCleanupQueue {
     pub(crate) fn new(
         project: &str,
@@ -94,8 +105,15 @@ impl DatabaseCleanupQueue {
     ) -> Result<Arc<Self>> {
         debug_assert!(worker_count > 0);
         debug_assert!(queue_capacity > 0);
-        let (sender, receiver) = sync_channel(queue_capacity.max(1));
-        let receiver = Arc::new(Mutex::new(receiver));
+        let submission = Arc::new(SubmissionQueue {
+            capacity: queue_capacity.max(1),
+            state: Mutex::new(SubmissionState {
+                jobs: VecDeque::new(),
+                next_sequence: 0,
+                closed: false,
+            }),
+            changed: Condvar::new(),
+        });
         let completion = Arc::new(CompletionState {
             state: Mutex::new(CompletionStateInner {
                 completed_through: 0,
@@ -108,16 +126,16 @@ impl DatabaseCleanupQueue {
         });
         let mut workers = Vec::with_capacity(worker_count.max(1));
         for index in 0..worker_count.max(1) {
-            let worker_receiver = receiver.clone();
+            let worker_submission = submission.clone();
             let worker_completion = completion.clone();
             let thread_name = format!("postgres-test-harness-cleanup-{project}-{index}");
             match std::thread::Builder::new()
                 .name(thread_name)
-                .spawn(move || cleanup_worker(worker_receiver, worker_completion))
+                .spawn(move || cleanup_worker(worker_submission, worker_completion))
             {
                 Ok(worker) => workers.push(worker),
                 Err(source) => {
-                    drop(sender);
+                    submission.close();
                     for worker in workers {
                         let _ = worker.join();
                     }
@@ -127,10 +145,7 @@ impl DatabaseCleanupQueue {
         }
 
         Ok(Arc::new(Self {
-            submission: Mutex::new(SubmissionState {
-                sender: Some(sender),
-                next_sequence: 0,
-            }),
+            submission,
             completion,
             drain: Mutex::new(()),
             workers: Mutex::new(workers),
@@ -147,11 +162,12 @@ impl DatabaseCleanupQueue {
         F: FnOnce() -> Result<()> + Send + 'static,
     {
         let (sender, receiver) = oneshot::channel();
-        self.submit(
+        self.enqueue(
             database_name,
             Box::new(operation),
             CleanupCompletion::Awaited(sender),
             Some(permit),
+            CleanupAdmission::Backpressured,
         )?;
         Ok(receiver)
     }
@@ -165,11 +181,12 @@ impl DatabaseCleanupQueue {
     where
         F: FnOnce() -> Result<()> + Send + 'static,
     {
-        self.submit(
+        self.enqueue(
             database_name,
             Box::new(operation),
             CleanupCompletion::Deferred,
             None,
+            CleanupAdmission::Backpressured,
         )?;
         // Deferred submission hands application capacity back only after the
         // bounded queue has accepted responsibility for the residual database.
@@ -177,14 +194,59 @@ impl DatabaseCleanupQueue {
         Ok(())
     }
 
-    fn submit(
+    /// Enqueues destructor fallback without waiting for queue capacity.
+    ///
+    /// The retained permit bounds these extra waiting jobs by the live database
+    /// limit and transfers any backpressure to the next database acquisition.
+    pub(crate) fn submit_fallback<F>(
+        self: &Arc<Self>,
+        database_name: String,
+        permit: OwnedSemaphorePermit,
+        operation: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Result<()> + Send + 'static,
+    {
+        self.enqueue(
+            database_name,
+            Box::new(operation),
+            CleanupCompletion::Deferred,
+            Some(permit),
+            CleanupAdmission::NonblockingFallback,
+        )
+    }
+
+    fn enqueue(
         self: &Arc<Self>,
         database_name: String,
         operation: CleanupOperation,
         completion: CleanupCompletion,
         permit: Option<OwnedSemaphorePermit>,
+        admission: CleanupAdmission,
     ) -> Result<()> {
-        let (sequence, sender) = self.reserve_submission()?;
+        let mut submission = self
+            .submission
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while admission == CleanupAdmission::Backpressured
+            && submission.jobs.len() >= self.submission.capacity
+            && !submission.closed
+        {
+            submission = self
+                .submission
+                .changed
+                .wait(submission)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        if submission.closed {
+            return Err(Error::CleanupQueueClosed);
+        }
+        submission.next_sequence = submission
+            .next_sequence
+            .checked_add(1)
+            .expect("a process cannot submit u64::MAX database cleanups");
+        let sequence = submission.next_sequence;
         let job = CleanupJob {
             sequence,
             database_name,
@@ -193,36 +255,9 @@ impl DatabaseCleanupQueue {
             permit,
             queue_guard: self.clone(),
         };
-        if let Err(error) = sender.send(job) {
-            self.completion.close_database_admission();
-            let job = error.0;
-            let failure =
-                DeferredCleanupFailure::new(job.database_name.clone(), Error::CleanupWorkerStopped);
-            self.completion.complete(sequence, Some(failure));
-            // Completion must be visible before the job's queue guard is
-            // dropped; otherwise an unexpected receiver shutdown could make
-            // final queue teardown wait on this sequence from the same thread.
-            drop(job);
-            return Err(Error::CleanupWorkerStopped);
-        }
+        submission.jobs.push_back(job);
+        self.submission.changed.notify_one();
         Ok(())
-    }
-
-    fn reserve_submission(&self) -> Result<(u64, SyncSender<CleanupJob>)> {
-        let mut submission = self
-            .submission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let sender = submission
-            .sender
-            .as_ref()
-            .ok_or(Error::CleanupQueueClosed)?
-            .clone();
-        submission.next_sequence = submission
-            .next_sequence
-            .checked_add(1)
-            .expect("a process cannot submit u64::MAX database cleanups");
-        Ok((submission.next_sequence, sender))
     }
 
     /// Waits for every operation admitted before this call and reports each
@@ -265,19 +300,11 @@ impl DatabaseCleanupQueue {
     }
 
     fn current_target(&self) -> u64 {
-        self.submission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .next_sequence
+        self.submission.current_target()
     }
 
     fn close_submissions(&self) -> u64 {
-        let mut submission = self
-            .submission
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        submission.sender.take();
-        submission.next_sequence
+        self.submission.close()
     }
 
     fn join_workers(&self) {
@@ -297,6 +324,46 @@ impl DatabaseCleanupQueue {
             }
             let _ = worker.join();
         }
+    }
+}
+
+impl SubmissionQueue {
+    fn next_job(&self) -> Option<CleanupJob> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Some(job) = state.jobs.pop_front() {
+                self.changed.notify_all();
+                return Some(job);
+            }
+            if state.closed {
+                return None;
+            }
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn current_target(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .next_sequence
+    }
+
+    fn close(&self) -> u64 {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.closed = true;
+        let target = state.next_sequence;
+        self.changed.notify_all();
+        target
     }
 }
 
@@ -500,17 +567,8 @@ impl Drop for AwaitedCleanupOutcome {
     }
 }
 
-fn cleanup_worker(receiver: Arc<Mutex<Receiver<CleanupJob>>>, completion: Arc<CompletionState>) {
-    loop {
-        let job = {
-            let receiver = receiver
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            receiver.recv()
-        };
-        let Ok(job) = job else {
-            return;
-        };
+fn cleanup_worker(submission: Arc<SubmissionQueue>, completion: Arc<CompletionState>) {
+    while let Some(job) = submission.next_job() {
         run_cleanup_job(job, &completion);
     }
 }
@@ -534,7 +592,8 @@ fn run_cleanup_job(job: CleanupJob, completion_state: &CompletionState) {
         // without bound; already-live leases remain cleanable.
         completion_state.close_database_admission();
     }
-    // Awaited cleanup retains application capacity through the database drop.
+    // Awaited cleanup and nonblocking destructor fallback retain application
+    // capacity through the database drop.
     drop(permit);
 
     let failure = match completion {
@@ -673,6 +732,60 @@ mod tests {
         assert_eq!(blocked_budget.available_permits(), 1);
         queue.drain().unwrap();
         assert_eq!(maximum.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn fallback_submission_does_not_wait_for_queue_capacity() {
+        let queue = test_queue("fallback", 1, 1);
+        let gate = Gate::closed();
+        let worker_gate = gate.clone();
+        let (started_sender, started_receiver) = mpsc::channel();
+        queue
+            .submit_deferred("running".to_owned(), None, move || {
+                let _ = started_sender.send(());
+                worker_gate.wait();
+                Ok(())
+            })
+            .unwrap();
+        started_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the cleanup worker should start the first job");
+        queue
+            .submit_deferred("waiting".to_owned(), None, || Ok(()))
+            .unwrap();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = runtime.block_on(budget.clone().acquire_owned()).unwrap();
+        let fallback_queue = queue.clone();
+        let (returned_sender, returned_receiver) = mpsc::channel();
+        let submitter = std::thread::spawn(move || {
+            let result = fallback_queue.submit_fallback("fallback".to_owned(), permit, || Ok(()));
+            let _ = returned_sender.send(result);
+        });
+
+        returned_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("fallback submission must not wait for worker progress")
+            .unwrap();
+        submitter.join().unwrap();
+        assert_eq!(
+            budget.available_permits(),
+            0,
+            "fallback overflow must retain its permit as the residual bound"
+        );
+        assert_eq!(
+            queue.submission.state.lock().unwrap().jobs.len(),
+            2,
+            "fallback may exceed only the explicit waiting-queue capacity"
+        );
+
+        gate.open();
+        queue.drain().unwrap();
+        assert_eq!(budget.available_permits(), 1);
     }
 
     #[test]

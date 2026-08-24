@@ -91,23 +91,28 @@ and returns only after `DROP DATABASE ... WITH (FORCE)` succeeds or fails.
 `DatabaseLease::defer_cleanup` returns after a bounded server-scoped queue
 accepts the database. It applies backpressure when that queue is full and
 releases the permit only after acceptance. The ordinary `Drop` implementation
-uses the same deferred path as a fallback and can therefore briefly block under
-saturation; code that needs an async backpressure point should call
-`defer_cleanup` explicitly.
+never waits for queue capacity: it enqueues a fallback and retains the lease's
+permit until cleanup finishes. This keeps destructor latency independent of
+database I/O and transfers saturation backpressure to the next database
+acquisition. Code that wants to release capacity after an explicit async
+backpressure point should call `defer_cleanup`.
 
-Each server has as many cleanup workers as its lifecycle admin-session limit and
-the waiting queue has the same capacity. Cleanup is therefore concurrent across
-servers rather than process-globally serialized. If `L` is the effective live
-lease limit and `C` is the per-server lifecycle limit, at most `L + 2C`
-disposable databases can be live, running cleanup, or waiting for cleanup in
-one server. Awaited jobs still consume their lease permits, so this formula is a
-conservative mixed-workload bound. Every later lease is created under a fresh
-unique name from `template0` or the immutable project template; a returned
-database is never reset or reused. Any cleanup failure closes new database
-admission for that harness before the worker releases its slot. Already-live
-leases remain cleanable, but callers must observe the drain error and recover or
-replace the harness; repeated failures cannot accumulate an unbounded residual
-set.
+Each server reserves at least half of a multi-session lifecycle pool for creates
+and other lifecycle work, and caps cleanup at four worker threads. A one-session
+pool necessarily shares that session with its single cleanup worker. The
+explicit waiting queue has one slot per worker. Cleanup is therefore concurrent
+across servers without allowing a cleanup burst to occupy the entire lifecycle
+pool or multiplying the default thread count by the full pool size. If `L` is
+the effective live lease limit, `W` the cleanup worker count, and `Q` the waiting
+capacity, at most `L + W + Q` disposable databases can be live, running cleanup,
+or waiting for cleanup in one server. Awaited and fallback jobs retain their
+lease permits, so this formula is a conservative mixed-workload bound. Every
+later lease is created under a fresh unique name from `template0` or the
+immutable project template; a returned database is never reset or reused. Any
+cleanup failure closes new database admission for that harness before the
+worker releases its slot. Already-live leases remain cleanable, but callers must
+observe the drain error and recover or replace the harness; repeated failures
+cannot accumulate an unbounded residual set.
 
 Call `PostgresHarness::drain_deferred_cleanup` to wait for everything accepted
 before the call. The barrier returns retained failures from explicit deferred

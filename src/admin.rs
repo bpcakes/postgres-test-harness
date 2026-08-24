@@ -261,37 +261,12 @@ impl AdminSessionPool {
 
     fn checkout(&self, connect_operation: &'static str) -> Result<AdminSession<'_>> {
         loop {
-            let checkout = {
-                let mut state = self.state.lock().map_err(|_| Error::StatePoisoned {
-                    operation: "lock disposable admin-session pool",
-                })?;
-                loop {
-                    if state.closed {
-                        return Err(Error::AdminSessionPoolClosed);
-                    }
-                    if let Some(client) = state.idle.pop() {
-                        break Some(client);
-                    }
-                    if state.total < self.max_size {
-                        state.total += 1;
-                        break None;
-                    }
-                    state = self
-                        .available
-                        .wait(state)
-                        .map_err(|_| Error::StatePoisoned {
-                            operation: "wait for disposable admin session",
-                        })?;
-                }
-            };
-
-            match checkout {
+            match self.acquire_checkout()? {
                 Some(mut client) => {
-                    if prepare_lifecycle_session(
+                    if prepare_reused_lifecycle_session(
                         client.client_mut(),
                         self.operation_timeout,
                         &self.application_name,
-                        true,
                     )
                     .is_err()
                     {
@@ -310,11 +285,10 @@ impl AdminSessionPool {
                         AdminClient::connect(&self.admin_url, CONNECT_TIMEOUT, connect_operation)
                             .map(PersistentClient::new)
                             .and_then(|mut client| {
-                                prepare_lifecycle_session(
+                                prepare_new_lifecycle_session(
                                     client.client_mut(),
                                     self.operation_timeout,
                                     &self.application_name,
-                                    false,
                                 )?;
                                 Ok(client)
                             });
@@ -333,6 +307,30 @@ impl AdminSessionPool {
                     }
                 }
             }
+        }
+    }
+
+    fn acquire_checkout(&self) -> Result<Option<PersistentClient>> {
+        let mut state = self.state.lock().map_err(|_| Error::StatePoisoned {
+            operation: "lock disposable admin-session pool",
+        })?;
+        loop {
+            if state.closed {
+                return Err(Error::AdminSessionPoolClosed);
+            }
+            if let Some(client) = state.idle.pop() {
+                return Ok(Some(client));
+            }
+            if state.total < self.max_size {
+                state.total += 1;
+                return Ok(None);
+            }
+            state = self
+                .available
+                .wait(state)
+                .map_err(|_| Error::StatePoisoned {
+                    operation: "wait for disposable admin session",
+                })?;
         }
     }
 
@@ -413,17 +411,30 @@ fn configure_session_timeouts(client: &mut AdminClient, operation_timeout: Durat
         .map_err(|source| Error::postgres("configure admin session timeouts", source))
 }
 
-fn prepare_lifecycle_session(
+fn prepare_new_lifecycle_session(
     client: &mut AdminClient,
     operation_timeout: Duration,
     application_name: &str,
-    reused: bool,
 ) -> Result<()> {
-    if reused {
-        client
-            .batch_execute("DISCARD ALL")
-            .map_err(|source| Error::postgres("reset pooled admin session", source))?;
-    }
+    configure_lifecycle_session(client, operation_timeout, application_name)
+}
+
+fn prepare_reused_lifecycle_session(
+    client: &mut AdminClient,
+    operation_timeout: Duration,
+    application_name: &str,
+) -> Result<()> {
+    client
+        .batch_execute("DISCARD ALL")
+        .map_err(|source| Error::postgres("reset pooled admin session", source))?;
+    configure_lifecycle_session(client, operation_timeout, application_name)
+}
+
+fn configure_lifecycle_session(
+    client: &mut AdminClient,
+    operation_timeout: Duration,
+    application_name: &str,
+) -> Result<()> {
     let statement_timeout = duration_millis(operation_timeout)?;
     let lock_timeout = duration_millis(LOCK_TIMEOUT.min(operation_timeout))?;
     client

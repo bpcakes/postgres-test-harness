@@ -48,7 +48,7 @@ const DEFAULT_REPRESENTATIVE_ROWS: usize = 50_000;
 const DEFERRED_DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
 const EXTERNAL_CLEANUP_RETRY_WINDOW: Duration = Duration::from_secs(120);
 const EXTERNAL_CLEANUP_INITIAL_RETRY_INTERVAL: Duration = Duration::from_millis(25);
-const EXTERNAL_CLEANUP_MAX_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+const EXTERNAL_CLEANUP_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 type AnyError = Box<dyn StdError + Send + Sync>;
 type AnyResult<T> = std::result::Result<T, AnyError>;
@@ -1604,13 +1604,12 @@ mod tests {
     }
 
     #[test]
-    fn retry_backoff_can_preserve_a_fixed_interval_policy() {
-        let interval = Duration::from_millis(25);
-        let mut backoff = RetryBackoff::new(interval, interval);
+    fn retry_backoff_grows_exponentially_and_stays_capped() {
+        let mut backoff = RetryBackoff::new(Duration::from_millis(25), Duration::from_secs(1));
 
         assert_eq!(
-            (0..4).map(|_| backoff.next_delay()).collect::<Vec<_>>(),
-            vec![interval; 4]
+            (0..9).map(|_| backoff.next_delay()).collect::<Vec<_>>(),
+            [25, 50, 100, 200, 400, 800, 1_000, 1_000, 1_000].map(Duration::from_millis)
         );
     }
 

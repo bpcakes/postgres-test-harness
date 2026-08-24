@@ -112,6 +112,16 @@ sweep by default. Cleanup requires valid harness metadata and an available
 owner or template advisory lock, so active, fresh, untagged, and foreign
 databases are skipped.
 
+## Performance characterization
+
+The checked-in performance example measures owned or external server startup,
+template acquisition, disposable database throughput, cleanup drain time, and
+administrative connection churn. It emits versioned JSON observations and
+never applies machine-specific latency thresholds. See
+[the performance workflow](https://github.com/bpcakes/postgres-test-harness/blob/master/docs/performance.md)
+for local commands, CI usage,
+measurement boundaries, and the recorded baseline.
+
 ## License
 
 Licensed under MIT.

@@ -1,0 +1,94 @@
+name: Performance characterization
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: PostgreSQL server mode
+        required: true
+        default: owned
+        type: choice
+        options:
+          - owned
+          - external
+      samples:
+        description: Independent samples
+        required: true
+        default: "3"
+        type: string
+      representative_rows:
+        description: Representative fixture rows
+        required: true
+        default: "50000"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-${{ github.repository }}-${{ inputs.mode }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  POSTGRES_TEST_IMAGE: postgres:18
+  PTH_PERF_OUTPUT: target/performance.json
+  PTH_PERF_SAMPLES: ${{ inputs.samples }}
+  PTH_PERF_REPRESENTATIVE_ROWS: ${{ inputs.representative_rows }}
+
+jobs:
+  benchmark:
+    name: ${{ inputs.mode }} PostgreSQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cache owned image
+        if: inputs.mode == 'owned'
+        run: docker pull "$POSTGRES_TEST_IMAGE"
+
+      - name: Run owned characterization
+        if: inputs.mode == 'owned'
+        run: cargo run --locked --release --example performance
+
+      - name: Run external characterization
+        if: inputs.mode == 'external'
+        env:
+          POSTGRES_TEST_ADMIN_URL: ${{ secrets.POSTGRES_TEST_ADMIN_URL }}
+          PTH_PERF_EXTERNAL_IMAGE_DIGEST: ${{ vars.PTH_PERF_EXTERNAL_IMAGE_DIGEST }}
+          PTH_PERF_EXTERNAL_STORAGE_DRIVER: ${{ vars.PTH_PERF_EXTERNAL_STORAGE_DRIVER }}
+        run: |
+          if [[ -z "$POSTGRES_TEST_ADMIN_URL" ]]; then
+            echo "::error::The external benchmark requires the POSTGRES_TEST_ADMIN_URL repository secret."
+            exit 1
+          fi
+          cargo run --locked --release --example performance
+
+      - name: Publish run summary
+        if: ${{ hashFiles('target/performance.json') != '' }}
+        run: |
+          jq -r '
+            "## Performance characterization (`" + .environment.mode + "`)",
+            "",
+            "PostgreSQL: `" + .environment.postgres_version + "`  ",
+            "Image: `" + (.environment.image_digest.value // "not reported") + "`  ",
+            "Storage: `" + (.environment.storage_driver.value // "not reported") + "`  ",
+            "",
+            "| Metric | Fixture | Min ms | Median ms | Mean ms | Max ms |",
+            "| --- | --- | ---: | ---: | ---: | ---: |",
+            (.summary[] | "| " + .metric + " | " + (.fixture // "all") + " | "
+              + ((.min_ns / 1000000) | tostring) + " | "
+              + ((.median_ns / 1000000) | tostring) + " | "
+              + ((.mean_ns / 1000000) | tostring) + " | "
+              + ((.max_ns / 1000000) | tostring) + " |")
+          ' target/performance.json >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() && hashFiles('target/performance.json') != '' }}
+        with:
+          name: postgres-test-harness-performance-${{ inputs.mode }}
+          path: target/performance.json
+          if-no-files-found: error

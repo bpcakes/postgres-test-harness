@@ -24,4 +24,6 @@ uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
 postgres = "0.19"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }

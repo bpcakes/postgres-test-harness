@@ -1359,6 +1359,8 @@ version = "0.1.1"
 dependencies = [
  "libc",
  "postgres",
+ "serde",
+ "serde_json",
  "sha2",
  "testcontainers",
  "thiserror",

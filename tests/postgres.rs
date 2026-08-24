@@ -898,7 +898,8 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
             .defer_cleanup()
             .await
             .expect("admit cleanup before its injected PostgreSQL failure");
-        wait_until_database_statement(&admin_url, &database_name, "DROP DATABASE").await;
+        // The held catalog lock is the synchronization condition: the drain
+        // cannot complete successfully before PostgreSQL's statement timeout.
         let error = tokio::time::timeout(
             Duration::from_secs(2),
             failure_harness.drain_deferred_cleanup(),

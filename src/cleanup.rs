@@ -1018,6 +1018,29 @@ mod tests {
     }
 
     #[test]
+    fn rejected_awaited_submission_has_no_deferred_error_path() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = runtime.block_on(budget.clone().acquire_owned()).unwrap();
+        let queue = test_queue("rejected-awaited", 1, 1);
+        queue.close_and_drain().unwrap();
+
+        let error = match queue.submit_awaited("rejected".to_owned(), permit, || Ok(())) {
+            Ok(_) => panic!("a closed queue must reject awaited cleanup"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, Error::CleanupQueueClosed));
+        assert_eq!(budget.available_permits(), 1);
+        queue
+            .drain()
+            .expect("a rejected cleanup must not also enter deferred failure delivery");
+    }
+
+    #[test]
     fn permit_handoff_matches_awaited_and_deferred_contracts() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

@@ -548,7 +548,7 @@ fn queue_database_cleanup(inner: DatabaseLeaseInner) {
     if let Err(error) = worker.send(inner) {
         // The worker can only disappear during process teardown. Retain the
         // tagged database for the external server's next sweep while releasing
-        // the process-local permit and server ownership.
+        // the per-harness permit and server ownership.
         drop(error.0);
     }
 }

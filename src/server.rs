@@ -37,9 +37,9 @@ const CONTAINER_ENGINE_STARTUP_TIMEOUT_FLOOR: Duration = Duration::from_secs(60)
 const STARTUP_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const STARTUP_STATUS_INTERVAL: Duration = Duration::from_millis(25);
 const STARTUP_LOG_LIMIT_BYTES: u64 = 64 * 1024;
-// Lifecycle sessions may occupy at most one quarter of PostgreSQL's regular
-// connection slots. The remainder is headroom for test clients, retained
-// owner/template locks, and unrelated users of an external server.
+// One harness's lifecycle pool may occupy at most one quarter of PostgreSQL's
+// regular connection slots. Separate harnesses and processes do not coordinate
+// this local bound.
 const LIFECYCLE_ADMIN_CONNECTION_SHARE_DIVISOR: usize = 4;
 const MANAGED_LABEL: &str = "org.postgres-test-harness.managed";
 const PROJECT_LABEL: &str = "org.postgres-test-harness.project";
@@ -164,7 +164,7 @@ impl ServerInner {
         mut owner_lock: AdminClient,
     ) -> Result<Arc<Self>> {
         validate_postgres_18(&mut owner_lock)?;
-        let admin_pool_size = admin_session_pool_size(
+        let admin_pool_size = per_harness_admin_session_pool_size(
             connection_limits,
             regular_connection_slots(&mut owner_lock)?,
         );
@@ -228,7 +228,7 @@ impl ServerInner {
     }
 }
 
-fn admin_session_pool_size(
+fn per_harness_admin_session_pool_size(
     connection_limits: ResolvedConnectionLimits,
     regular_connection_slots: usize,
 ) -> usize {
@@ -733,9 +733,9 @@ mod tests {
 
     use super::{
         ContainerCommand, ContainerOwner, ContainerWorker, POSTGRES_INITDB_NO_SYNC,
-        POSTGRES_STORAGE_PATH, ServerInner, admin_session_pool_size,
-        begin_owned_container_shutdown, container_request, ipv4_mapped_container_host,
-        map_container_start_error, memory_exhaustion_evidence, storage_exhaustion_evidence,
+        POSTGRES_STORAGE_PATH, ServerInner, begin_owned_container_shutdown, container_request,
+        ipv4_mapped_container_host, map_container_start_error, memory_exhaustion_evidence,
+        per_harness_admin_session_pool_size, storage_exhaustion_evidence,
     };
     use crate::{
         Error, HarnessConfig, OwnedContainerProfile,
@@ -794,20 +794,23 @@ mod tests {
     }
 
     #[test]
-    fn admin_pool_policy_obeys_lifecycle_concurrency_and_server_headroom() {
+    fn per_harness_admin_pool_policy_obeys_lifecycle_concurrency_and_server_headroom() {
         let limits = ResolvedConnectionLimits {
             budget: 120,
             per_database: 11,
         };
-        assert_eq!(admin_session_pool_size(limits, 297), 10);
-        assert_eq!(admin_session_pool_size(limits, 20), 5);
-        assert_eq!(admin_session_pool_size(limits, 3), 1);
+        assert_eq!(per_harness_admin_session_pool_size(limits, 297), 10);
+        assert_eq!(per_harness_admin_session_pool_size(limits, 20), 5);
+        assert_eq!(per_harness_admin_session_pool_size(limits, 3), 1);
 
         let single_lifecycle = ResolvedConnectionLimits {
             budget: 2,
             per_database: 2,
         };
-        assert_eq!(admin_session_pool_size(single_lifecycle, 297), 1);
+        assert_eq!(
+            per_harness_admin_session_pool_size(single_lifecycle, 297),
+            1
+        );
     }
 
     #[test]

@@ -224,7 +224,7 @@ impl HarnessConfig {
         self
     }
 
-    /// Overrides the process-wide connection budget. Repeated calls replace
+    /// Overrides this harness's connection budget. Repeated calls replace
     /// the previous override. If no per-database override is set, its default
     /// is clamped to this budget when the harness starts.
     pub fn with_connection_budget(mut self, permits: usize) -> Result<Self> {

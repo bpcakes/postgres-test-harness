@@ -61,9 +61,9 @@ names, connection permits, container ownership, and stale cleanup belong in
 this crate. Consumer adapters should not enable Testcontainers reuse, issue
 Docker CLI cleanup commands, or delete databases by a name prefix.
 
-The default connection budget is 120 permits and each live database lease
-holds 11. Projects with different pool geometry can override both values on
-`HarnessConfig`; the per-database value must cover every connection pool a
+Each harness's default connection budget is 120 permits and each live database
+lease holds 11. Projects with different pool geometry can override both values
+on `HarnessConfig`; the per-database value must cover every connection pool a
 single test may open. Connection-limit setters are order-independent and the
 last override for each value wins. With no explicit per-database override, its
 default is clamped to a smaller budget and returns to 11 if that budget is
@@ -71,18 +71,19 @@ raised again. Zero and out-of-range values fail at their setter; an explicit
 per-database value larger than the final budget is rejected when
 `PostgresHarness::start` resolves the complete configuration.
 
-Disposable `CREATE`/metadata and `DROP` work reuses a lazy per-server pool of
-administrative sessions. Its limit is the smaller of the effective lease
-concurrency (`connection_budget / connections_per_database`) and one quarter
-of PostgreSQL's non-reserved connection slots, with a minimum of one. The
-quarter-share cap deliberately leaves most server capacity for test clients,
-retained owner and template-lock sessions, and other users of an external
-server. Sessions are checked out exclusively; independent lifecycle operations
-can progress concurrently without holding the pool lock during SQL. A reused
+Disposable `CREATE`/metadata and `DROP` work reuses a lazy pool of administrative
+sessions owned by each harness. Each pool's limit is the smaller of the
+effective lease concurrency (`connection_budget / connections_per_database`)
+and one quarter of PostgreSQL's non-reserved connection slots, with a minimum
+of one. The quarter-share cap preserves headroom when one harness targets a
+server. Separate harnesses and processes do not coordinate this limit, so users
+of a shared external server must budget their aggregate connection capacity.
+Sessions are checked out exclusively; independent lifecycle operations can
+progress concurrently without holding the pool lock during SQL. A reused
 session is reset and has the configured operation and lock timeouts restored
 before work. Waiting for a session is also bounded by the configured operation
-timeout. Failed or uncertain sessions are evicted and reconnected lazily.
-Owned shutdown closes this pool along with database admission, while external
+timeout. Failed or uncertain sessions are evicted and reconnected lazily. Owned
+shutdown closes this pool along with database admission, while external
 shutdown remains a no-op.
 
 Template coordination has a separate 15-minute wait timeout so a short

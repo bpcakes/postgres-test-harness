@@ -115,6 +115,9 @@ the single-purpose owned server. On a shared external server it is intentionally
 labeled server-wide and can include ambient clients, so run under controlled
 load or interpret it as an upper bound. A server-side statistics reset during a
 phase can also invalidate a delta; retain the raw before/after counters.
+Observer connection, query, and shutdown awaits use the same 90-second
+operation timeout recorded for the harness, so a silent external server cannot
+leave a local characterization waiting indefinitely.
 
 The top-level report also records the source commit and worktree state,
 PostgreSQL version, postmaster start, logical CPU count, OS, architecture,

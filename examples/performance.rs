@@ -439,14 +439,21 @@ struct PreparedReportFile {
 struct Observer {
     client: Option<Client>,
     connection: tokio::task::JoinHandle<std::result::Result<(), tokio_postgres::Error>>,
+    operation_timeout: Duration,
 }
 
 impl Observer {
-    async fn connect(database_url: &str) -> AnyResult<Self> {
-        let (client, connection) = tokio_postgres::connect(database_url, NoTls).await?;
+    async fn connect(database_url: &str, operation_timeout: Duration) -> AnyResult<Self> {
+        let (client, connection) = run_observer_operation(
+            "connect",
+            operation_timeout,
+            tokio_postgres::connect(database_url, NoTls),
+        )
+        .await?;
         Ok(Self {
             client: Some(client),
             connection: tokio::spawn(connection),
+            operation_timeout,
         })
     }
 
@@ -457,15 +464,17 @@ impl Observer {
     }
 
     async fn server_metadata(&self) -> AnyResult<ServerMetadata> {
-        let row = self
-            .client()
-            .query_one(
+        let row = run_observer_operation(
+            "read server metadata",
+            self.operation_timeout,
+            self.client().query_one(
                 "SELECT current_setting('server_version'),
                         current_setting('server_version_num')::integer,
                         pg_postmaster_start_time()::text",
                 &[],
-            )
-            .await?;
+            ),
+        )
+        .await?;
         Ok(ServerMetadata {
             version: row.get(0),
             version_num: row.get(1),
@@ -474,17 +483,19 @@ impl Observer {
     }
 
     async fn session_snapshot(&self) -> AnyResult<SessionSnapshot> {
-        let row = self
-            .client()
-            .query_one(
+        let row = run_observer_operation(
+            "read administrative session counters",
+            self.operation_timeout,
+            self.client().query_one(
                 "SELECT sessions,
                         (SELECT count(*) FROM pg_stat_activity
                          WHERE datname = current_database())
                  FROM pg_stat_database
                  WHERE datname = current_database()",
                 &[],
-            )
-            .await?;
+            ),
+        )
+        .await?;
         Ok(SessionSnapshot {
             cumulative: row.get(0),
             active: row.get(1),
@@ -492,10 +503,13 @@ impl Observer {
     }
 
     async fn database_size(&self, database_name: &str) -> AnyResult<i64> {
-        let row = self
-            .client()
-            .query_one("SELECT pg_database_size($1)", &[&database_name])
-            .await?;
+        let row = run_observer_operation(
+            "read template database size",
+            self.operation_timeout,
+            self.client()
+                .query_one("SELECT pg_database_size($1)", &[&database_name]),
+        )
+        .await?;
         Ok(row.get(0))
     }
 
@@ -504,9 +518,13 @@ impl Observer {
         let mut remaining = names.len() as i64;
         loop {
             let row = deadline
-                .run(self.client().query_one(
-                    "SELECT count(*) FROM pg_database WHERE datname = ANY($1)",
-                    &[&names],
+                .run(run_observer_operation(
+                    "poll deferred cleanup",
+                    self.operation_timeout,
+                    self.client().query_one(
+                        "SELECT count(*) FROM pg_database WHERE datname = ANY($1)",
+                        &[&names],
+                    ),
                 ))
                 .await
                 .map_err(|_| {
@@ -528,8 +546,44 @@ impl Observer {
 
     async fn close(mut self) -> AnyResult<()> {
         drop(self.client.take());
-        self.connection.await??;
-        Ok(())
+        match run_observer_operation(
+            "close connection",
+            self.operation_timeout,
+            &mut self.connection,
+        )
+        .await
+        {
+            Ok(connection) => {
+                connection?;
+                Ok(())
+            }
+            Err(error) => {
+                self.connection.abort();
+                Err(error)
+            }
+        }
+    }
+}
+
+async fn run_observer_operation<T, E, F>(
+    operation: &str,
+    timeout: Duration,
+    future: F,
+) -> AnyResult<T>
+where
+    F: Future<Output = std::result::Result<T, E>>,
+    E: StdError + Send + Sync + 'static,
+{
+    match Deadline::after(timeout).run(future).await {
+        Ok(result) => result.map_err(|error| Box::new(error) as AnyError),
+        Err(_) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "benchmark observer did not {operation} within {} ms",
+                millis(timeout)
+            ),
+        )
+        .into()),
     }
 }
 
@@ -699,7 +753,7 @@ async fn measure_started_sample(
     let container_image_content_id =
         verify_started_image(harness, expected_owned_image_content_id)?;
     let admin_url = harness.admin_database_url().to_owned();
-    let observer = Observer::connect(&admin_url).await?;
+    let observer = Observer::connect(&admin_url, OPERATION_TIMEOUT).await?;
     let measurements = measure_with_observer(
         config,
         harness,
@@ -1470,10 +1524,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        CleanupAttemptReport, Deadline, ExternalCleanupReport, OperationAndCleanupError,
+        CleanupAttemptReport, ExternalCleanupReport, Observer, OperationAndCleanupError,
         ReportOutput, SCHEMA_VERSION, ServerMode, SummaryReport, benchmark_project,
-        combine_operation_and_cleanup, summary_report, validate_completed_external_cleanup,
-        validate_external_sweep,
+        combine_operation_and_cleanup, run_observer_operation, summary_report,
+        validate_completed_external_cleanup, validate_external_sweep,
     };
 
     #[test]
@@ -1600,15 +1654,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deadline_bounds_each_awaited_operation() {
+    async fn observer_operations_and_shutdown_are_bounded() {
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            Deadline::after(Duration::from_millis(5)).run(std::future::pending::<()>()),
+            run_observer_operation(
+                "finish a test operation",
+                Duration::from_millis(5),
+                std::future::pending::<std::result::Result<(), io::Error>>(),
+            ),
         )
         .await
         .expect("test guard elapsed before the benchmark deadline");
+        let error = result.expect_err("observer operation must time out");
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::TimedOut)
+        );
 
-        assert!(result.is_err());
+        let observer = Observer {
+            client: None,
+            connection: tokio::spawn(std::future::pending::<
+                std::result::Result<(), tokio_postgres::Error>,
+            >()),
+            operation_timeout: Duration::from_millis(5),
+        };
+        let close_error = tokio::time::timeout(Duration::from_secs(1), observer.close())
+            .await
+            .expect("test guard elapsed before observer shutdown timeout")
+            .expect_err("observer shutdown must time out");
+        assert_eq!(
+            close_error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::TimedOut)
+        );
     }
 
     #[test]

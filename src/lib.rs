@@ -10,7 +10,8 @@ mod name;
 mod server;
 
 pub use config::{
-    HarnessConfig, POSTGRES_TEST_ADMIN_URL_ENV, POSTGRES_TEST_IMAGE_ENV, ProjectName,
+    DEFAULT_OWNED_CONTAINER_TMPFS_SIZE_BYTES, HarnessConfig, OwnedContainerProfile,
+    POSTGRES_TEST_ADMIN_URL_ENV, POSTGRES_TEST_IMAGE_ENV, ProjectName,
 };
 pub use error::{BoxError, Error, Result};
 pub use fingerprint::{FingerprintBuilder, TemplateFingerprint, TemplateSpec};

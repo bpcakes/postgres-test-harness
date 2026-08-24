@@ -77,9 +77,21 @@ jobs:
             "PostgreSQL settings: `fsync=" + (.environment.postgres_settings.fsync | tostring)
               + ", synchronous_commit=" + .environment.postgres_settings.synchronous_commit
               + ", full_page_writes=" + (.environment.postgres_settings.full_page_writes | tostring)
+              + ", data_checksums=" + (.environment.postgres_settings.data_checksums | tostring)
+              + ", wal_level=" + .environment.postgres_settings.wal_level
               + ", max_connections=" + (.environment.postgres_settings.max_connections | tostring) + "`  ",
             "Image content ID: `" + (.environment.image_content_id.value // "not reported") + "`  ",
             "Storage: `" + (.environment.storage_driver.value // "not reported") + "`  ",
+            "Owned profile: `" + (
+              if .configuration.owned_container_profile == null then "not applied"
+              elif .configuration.owned_container_profile.storage.kind == "tmpfs" then
+                "initdb_no_sync=" + (.configuration.owned_container_profile.initdb_no_sync | tostring)
+                  + ", tmpfs_size_bytes=" + (.configuration.owned_container_profile.storage.size_bytes | tostring)
+              else
+                "initdb_no_sync=" + (.configuration.owned_container_profile.initdb_no_sync | tostring)
+                  + ", image_default_storage"
+              end
+            ) + "`  ",
             "Deferred completion observation: catalog polling every `"
               + (.configuration.deferred_drain_poll_interval_ms | tostring) + " ms`  ",
             "",

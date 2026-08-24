@@ -84,13 +84,65 @@ real migration suite is still running. Override it with
   client expects a local or CI endpoint that does not require TLS.
 - `POSTGRES_TEST_IMAGE` overrides the default `postgres:18` image.
 
+## Owned-container performance profile
+
+Owned containers use `OwnedContainerProfile::performance()` by default. The
+profile passes exactly `--no-sync` through `POSTGRES_INITDB_ARGS` and mounts
+`/var/lib/postgresql` on tmpfs with a 1 GiB size cap. `--no-sync` shortens
+disposable cluster initialization; tmpfs improves database clone and cleanup
+I/O. Neither setting makes test data persistent or crash-safe. The harness's
+existing `fsync=off`, `synchronous_commit=off`, and `full_page_writes=off`
+runtime settings have the same disposable-data premise.
+
+Increase the cap for larger templates, or opt out when the Docker daemon does
+not support tmpfs or memory-backed storage is inappropriate:
+
+```rust
+use postgres_test_harness::{HarnessConfig, OwnedContainerProfile};
+
+# fn config() -> postgres_test_harness::Result<HarnessConfig> {
+let larger = OwnedContainerProfile::performance()
+    .with_tmpfs_size_bytes(2 * 1024 * 1024 * 1024)?;
+let config = HarnessConfig::new("example")?.with_owned_container_profile(larger);
+
+let image_default_storage = OwnedContainerProfile::performance().without_tmpfs();
+let config = config.with_owned_container_profile(image_default_storage);
+# Ok(config)
+# }
+```
+
+A full compatibility opt-out for an official-compatible custom image is
+`OwnedContainerProfile::performance().with_initdb_no_sync(false).without_tmpfs()`.
+Custom images used with the optimizations must honor the Docker Official
+PostgreSQL 18 contracts: `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`,
+and `POSTGRES_INITDB_ARGS`; PostgreSQL data beneath `/var/lib/postgresql`; port
+5432; and the `postgres -c name=value` command shape. All images must still
+provide PostgreSQL 18 with `uuidv7()` and accept password authentication over
+the mapped TCP port. An unsupported tmpfs mount retains the Docker daemon's
+error and names the opt-out. If the cap is exhausted during startup, the error
+reports the cap and the recognized storage-exhaustion evidence. Recognized
+allocation failures and exit status 137 are reported separately as possible
+Docker/host memory exhaustion, with guidance to reduce pressure, increase the
+daemon allowance, or disable tmpfs.
+
+The profile deliberately does not add `--no-data-checksums`,
+`wal_level=minimal`, reusable containers, or host `trust` authentication.
+Settings that change database semantics belong in separate, explicit profiles
+backed by representative compatibility measurements.
+
 For an owned container, the harness requests Testcontainers' IPv4 port mapping
 and therefore uses an IPv4 loopback literal when Testcontainers reports
 `localhost`; this prevents the operating system from selecting an unrelated
-IPv6 listener for an IPv4-mapped port. Every administrative connection has a
-ten-second deadline covering TCP connection, PostgreSQL startup, and
-authentication. Query and lock deadlines remain governed separately by the
-configured administrative-operation and template-wait timeouts.
+IPv6 listener for an IPv4-mapped port. The Docker Official image's temporary
+initdb server listens only on a Unix socket, so log output is not treated as
+readiness. Owned startup instead retries authenticated connections through the
+mapped TCP port within `with_startup_timeout`; the successful connection is
+then used for PostgreSQL 18 validation and the owner lock. Cleanup after an
+expired startup deadline is awaited before the error returns, so the deadline
+does not abandon a partially created container. Other administrative
+connections have a ten-second connection deadline. Query and lock deadlines
+remain governed separately by the configured administrative-operation and
+template-wait timeouts.
 
 The harness never enables Testcontainers' reusable-container mode. Reuse is
 bounded by the owner process, and ordinary process exit removes an owned

@@ -14,6 +14,86 @@ const DEFAULT_CONNECTION_BUDGET: u32 = 120;
 const DEFAULT_CONNECTIONS_PER_DATABASE: u32 = 11;
 const MAX_PROJECT_NAME_LEN: usize = 16;
 
+/// Default upper bound for the owned container's tmpfs-backed PostgreSQL
+/// storage (1 GiB).
+pub const DEFAULT_OWNED_CONTAINER_TMPFS_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Performance and storage behavior applied only to harness-owned containers.
+///
+/// The default profile is intended for disposable test data: it passes
+/// `--no-sync` through the Docker Official PostgreSQL image's
+/// `POSTGRES_INITDB_ARGS` interface and mounts a size-bounded tmpfs at the
+/// image's PostgreSQL volume parent. External-server mode ignores this profile.
+///
+/// Custom images must implement the same environment-variable, filesystem,
+/// command, and mapped-TCP contracts as the Docker Official PostgreSQL 18
+/// image. Disable either optimization when a compatible custom image or Docker
+/// daemon cannot provide it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OwnedContainerProfile {
+    initdb_no_sync: bool,
+    tmpfs_size_bytes: Option<u64>,
+}
+
+impl OwnedContainerProfile {
+    /// Returns the default disposable-data performance profile.
+    pub const fn performance() -> Self {
+        Self {
+            initdb_no_sync: true,
+            tmpfs_size_bytes: Some(DEFAULT_OWNED_CONTAINER_TMPFS_SIZE_BYTES),
+        }
+    }
+
+    /// Enables or disables `initdb --no-sync` for an owned container.
+    ///
+    /// Disable this for custom images that do not honor
+    /// `POSTGRES_INITDB_ARGS`. This does not affect the runtime PostgreSQL
+    /// durability settings used by the harness.
+    pub const fn with_initdb_no_sync(mut self, enabled: bool) -> Self {
+        self.initdb_no_sync = enabled;
+        self
+    }
+
+    /// Sets the maximum number of bytes available to the owned container's
+    /// tmpfs-backed PostgreSQL storage.
+    pub fn with_tmpfs_size_bytes(mut self, size_bytes: u64) -> Result<Self> {
+        if size_bytes == 0 || size_bytes > i64::MAX as u64 {
+            return Err(Error::InvalidConfiguration {
+                reason: "owned-container tmpfs size must be between 1 and i64::MAX bytes",
+            });
+        }
+        self.tmpfs_size_bytes = Some(size_bytes);
+        Ok(self)
+    }
+
+    /// Uses the image's normal storage instead of adding a tmpfs mount.
+    ///
+    /// This is the compatibility opt-out for daemons that do not support
+    /// tmpfs mounts and for workloads that may exceed a safe memory-backed
+    /// storage limit.
+    pub const fn without_tmpfs(mut self) -> Self {
+        self.tmpfs_size_bytes = None;
+        self
+    }
+
+    /// Reports whether the profile requests `initdb --no-sync`.
+    pub const fn initdb_no_sync(&self) -> bool {
+        self.initdb_no_sync
+    }
+
+    /// Reports the tmpfs size cap, or `None` when image-default storage is
+    /// selected.
+    pub const fn tmpfs_size_bytes(&self) -> Option<u64> {
+        self.tmpfs_size_bytes
+    }
+}
+
+impl Default for OwnedContainerProfile {
+    fn default() -> Self {
+        Self::performance()
+    }
+}
+
 /// Validated namespace used for database names, metadata, and container labels.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectName(String);
@@ -66,6 +146,7 @@ pub struct HarnessConfig {
     pub(crate) project: ProjectName,
     pub(crate) admin_database_url: Option<String>,
     pub(crate) image: Option<String>,
+    pub(crate) owned_container_profile: OwnedContainerProfile,
     pub(crate) startup_timeout: Duration,
     pub(crate) operation_timeout: Duration,
     pub(crate) template_wait_timeout: Duration,
@@ -87,6 +168,7 @@ impl HarnessConfig {
             project: ProjectName::new(project)?,
             admin_database_url: None,
             image: None,
+            owned_container_profile: OwnedContainerProfile::default(),
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
             operation_timeout: DEFAULT_OPERATION_TIMEOUT,
             template_wait_timeout: DEFAULT_TEMPLATE_WAIT_TIMEOUT,
@@ -107,6 +189,13 @@ impl HarnessConfig {
         ImageReference::parse(&image)?;
         self.image = Some(image);
         Ok(self)
+    }
+
+    /// Replaces the profile applied when this configuration starts an owned
+    /// container. External-server mode ignores the profile.
+    pub fn with_owned_container_profile(mut self, profile: OwnedContainerProfile) -> Self {
+        self.owned_container_profile = profile;
+        self
     }
 
     pub fn with_startup_timeout(mut self, timeout: Duration) -> Result<Self> {
@@ -170,6 +259,11 @@ impl HarnessConfig {
         &self.project
     }
 
+    /// Returns the configured owned-container profile.
+    pub fn owned_container_profile(&self) -> &OwnedContainerProfile {
+        &self.owned_container_profile
+    }
+
     pub(crate) fn resolved_admin_database_url(&self) -> Option<String> {
         self.admin_database_url
             .clone()
@@ -215,6 +309,7 @@ impl fmt::Debug for HarnessConfig {
                 &self.admin_database_url.as_ref().map(|_| "[REDACTED]"),
             )
             .field("image", &self.image)
+            .field("owned_container_profile", &self.owned_container_profile)
             .field("startup_timeout", &self.startup_timeout)
             .field("operation_timeout", &self.operation_timeout)
             .field("template_wait_timeout", &self.template_wait_timeout)
@@ -298,7 +393,10 @@ fn validate_postgres_timeout(timeout: Duration) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{HarnessConfig, ImageReference, ProjectName, ResolvedConnectionLimits};
+    use super::{
+        DEFAULT_OWNED_CONTAINER_TMPFS_SIZE_BYTES, HarnessConfig, ImageReference,
+        OwnedContainerProfile, ProjectName, ResolvedConnectionLimits,
+    };
 
     #[test]
     fn project_names_are_deliberately_narrow() {
@@ -337,6 +435,41 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("secret"));
+    }
+
+    #[test]
+    fn owned_container_profile_defaults_are_explicit_and_replaceable() {
+        let profile = OwnedContainerProfile::default();
+        assert!(profile.initdb_no_sync());
+        assert_eq!(
+            profile.tmpfs_size_bytes(),
+            Some(DEFAULT_OWNED_CONTAINER_TMPFS_SIZE_BYTES)
+        );
+
+        let compatible = profile.with_initdb_no_sync(false).without_tmpfs();
+        let config = HarnessConfig::new("creditkit")
+            .unwrap()
+            .with_owned_container_profile(compatible);
+        assert_eq!(config.owned_container_profile(), &compatible);
+        assert!(format!("{config:?}").contains("tmpfs_size_bytes: None"));
+    }
+
+    #[test]
+    fn owned_container_tmpfs_cap_is_positive_and_fits_the_engine_api() {
+        assert!(
+            OwnedContainerProfile::default()
+                .with_tmpfs_size_bytes(0)
+                .is_err()
+        );
+        assert!(
+            OwnedContainerProfile::default()
+                .with_tmpfs_size_bytes(i64::MAX as u64 + 1)
+                .is_err()
+        );
+        let profile = OwnedContainerProfile::default()
+            .with_tmpfs_size_bytes(2 * 1024 * 1024 * 1024)
+            .unwrap();
+        assert_eq!(profile.tmpfs_size_bytes(), Some(2 * 1024 * 1024 * 1024));
     }
 
     #[test]

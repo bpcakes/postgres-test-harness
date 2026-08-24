@@ -1,4 +1,5 @@
 use std::{
+    process::Command,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -10,9 +11,10 @@ use std::{
 
 use postgres::{Client, NoTls};
 use postgres_test_harness::{
-    BoxError, Error, FingerprintBuilder, HarnessConfig, PostgresHarness, TemplateSpec,
-    cleanup_stale_databases,
+    BoxError, DEFAULT_OWNED_CONTAINER_TMPFS_SIZE_BYTES, Error, FingerprintBuilder, HarnessConfig,
+    OwnedContainerProfile, PostgresHarness, TemplateSpec, cleanup_stale_databases,
 };
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 #[tokio::test(flavor = "multi_thread")]
@@ -26,8 +28,36 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
     .await
     .expect("start owned PostgreSQL 18 harness");
     assert!(!harness.is_external());
-    assert!(harness.container_id().is_some());
+    let container_id = harness
+        .container_id()
+        .expect("owned harness exposes its container ID")
+        .to_owned();
     let admin_url = harness.admin_database_url().to_owned();
+    assert_default_owned_profile(&container_id);
+    assert_eq!(
+        scalar_string(admin_url.clone(), "SHOW data_checksums")
+            .await
+            .expect("read data-checksum setting"),
+        "on"
+    );
+    assert_eq!(
+        scalar_string(admin_url.clone(), "SHOW wal_level")
+            .await
+            .expect("read WAL level"),
+        "replica"
+    );
+    let postmaster_started_at =
+        scalar_string(admin_url.clone(), "SELECT pg_postmaster_start_time()::text")
+            .await
+            .expect("read final postmaster start time");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        scalar_string(admin_url.clone(), "SELECT pg_postmaster_start_time()::text")
+            .await
+            .expect("re-read final postmaster start time"),
+        postmaster_started_at,
+        "owned startup must retain the same final TCP postmaster"
+    );
 
     {
         let cleanup_spec = TemplateSpec::new(FingerprintBuilder::new("cleanup-schema").finish());
@@ -634,6 +664,13 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
             HarnessConfig::new("external_it")
                 .unwrap()
                 .with_admin_database_url(admin_url.clone())
+                .with_image("does-not-exist.invalid/postgres:18")
+                .unwrap()
+                .with_owned_container_profile(
+                    OwnedContainerProfile::default()
+                        .with_tmpfs_size_bytes(1)
+                        .unwrap(),
+                )
                 .with_cleanup_on_start(false),
         )
         .await
@@ -701,6 +738,250 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         .shutdown()
         .await
         .expect("remove owned PostgreSQL container");
+    wait_until_container_is_absent(&container_id).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon and cached postgres:18 image"]
+async fn official_compatible_custom_image_supports_default_and_compatibility_profiles() {
+    let custom_image = format!("pth-perf06-custom:{}", uuid::Uuid::new_v4().simple());
+    docker_command(&["image", "tag", "postgres:18", &custom_image]);
+    let _image = TemporaryImageTag(custom_image.clone());
+
+    let fast_harness = PostgresHarness::start(
+        HarnessConfig::new("custom_fast_it")
+            .unwrap()
+            .with_image(custom_image.clone())
+            .unwrap()
+            .with_cleanup_on_start(false),
+    )
+    .await
+    .expect("start an official-compatible custom image with the default profile");
+    let fast_container_id = fast_harness.container_id().unwrap().to_owned();
+    assert_default_owned_profile(&fast_container_id);
+    fast_harness
+        .shutdown()
+        .await
+        .expect("remove default-profile custom-image container");
+    wait_until_container_is_absent(&fast_container_id).await;
+
+    let profile = OwnedContainerProfile::default()
+        .with_initdb_no_sync(false)
+        .without_tmpfs();
+
+    let harness = PostgresHarness::start(
+        HarnessConfig::new("custom_it")
+            .unwrap()
+            .with_image(custom_image)
+            .unwrap()
+            .with_owned_container_profile(profile)
+            .with_cleanup_on_start(false),
+    )
+    .await
+    .expect("start an official-compatible custom image without storage extensions");
+    let container_id = harness.container_id().unwrap().to_owned();
+    let environment = docker_inspect_json(&container_id, "{{json .Config.Env}}");
+    assert!(
+        environment
+            .as_array()
+            .expect("container environment array")
+            .iter()
+            .all(|entry| !entry
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("POSTGRES_INITDB_ARGS="))
+    );
+    let mounts = docker_inspect_json(&container_id, "{{json .Mounts}}");
+    assert!(
+        mounts
+            .as_array()
+            .expect("container mounts array")
+            .iter()
+            .all(|mount| mount["Type"] != "tmpfs")
+    );
+    assert_eq!(
+        scalar_i64(harness.admin_database_url().to_owned(), "SELECT 18::bigint")
+            .await
+            .expect("query compatible custom image"),
+        18
+    );
+
+    harness
+        .shutdown()
+        .await
+        .expect("remove custom-image container");
+    wait_until_container_is_absent(&container_id).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon and cached postgres:18 image"]
+async fn too_small_tmpfs_reports_storage_exhaustion_and_removes_container() {
+    const PROJECT: &str = "tinyfs_it";
+    let profile = OwnedContainerProfile::default()
+        .with_tmpfs_size_bytes(1024 * 1024)
+        .unwrap();
+    let error = match PostgresHarness::start(
+        HarnessConfig::new(PROJECT)
+            .unwrap()
+            .with_owned_container_profile(profile)
+            .with_startup_timeout(Duration::from_secs(10))
+            .unwrap()
+            .with_cleanup_on_start(false),
+    )
+    .await
+    {
+        Ok(_) => panic!("a one-MiB PostgreSQL tmpfs must fail initialization"),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(error, Error::ContainerStorageExhausted { .. }),
+        "unexpected tiny-tmpfs startup error: {error:?}"
+    );
+    assert!(error.to_string().contains("no space left on device"));
+    wait_until_project_containers_are_absent(PROJECT).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon and cached postgres:18 image"]
+async fn startup_timeout_eventually_removes_a_partially_started_container() {
+    const PROJECT: &str = "timeout_it";
+    let error = match PostgresHarness::start(
+        HarnessConfig::new(PROJECT)
+            .unwrap()
+            .with_startup_timeout(Duration::from_millis(1))
+            .unwrap()
+            .with_cleanup_on_start(false),
+    )
+    .await
+    {
+        Ok(_) => panic!("one millisecond must not be enough for owned startup"),
+        Err(error) => error,
+    };
+
+    assert!(
+        matches!(
+            error,
+            Error::ContainerStartupTimeout { .. }
+                | Error::ContainerReadinessTimeout { .. }
+                | Error::ContainerExitedBeforeReady { .. }
+        ),
+        "unexpected startup-timeout error: {error:?}"
+    );
+    wait_until_project_containers_are_absent(PROJECT).await;
+}
+
+struct TemporaryImageTag(String);
+
+impl Drop for TemporaryImageTag {
+    fn drop(&mut self) {
+        let _ = Command::new("docker")
+            .args(["image", "rm", &self.0])
+            .output();
+    }
+}
+
+fn assert_default_owned_profile(container_id: &str) {
+    let environment = docker_inspect_json(container_id, "{{json .Config.Env}}");
+    let environment = environment.as_array().expect("container environment array");
+    assert!(
+        environment
+            .iter()
+            .any(|entry| entry == "POSTGRES_INITDB_ARGS=--no-sync")
+    );
+    assert!(
+        environment.iter().all(|entry| {
+            !entry
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("POSTGRES_HOST_AUTH_METHOD=")
+        }),
+        "owned containers must not enable trust authentication"
+    );
+
+    let mounts = docker_inspect_json(container_id, "{{json .HostConfig.Mounts}}");
+    let mount = mounts
+        .as_array()
+        .expect("container host mounts array")
+        .iter()
+        .find(|mount| mount["Target"] == "/var/lib/postgresql")
+        .expect("PostgreSQL storage tmpfs mount");
+    assert_eq!(mount["Type"], "tmpfs");
+    assert_eq!(
+        mount["TmpfsOptions"]["SizeBytes"],
+        DEFAULT_OWNED_CONTAINER_TMPFS_SIZE_BYTES
+    );
+    assert_eq!(mount["TmpfsOptions"]["Mode"], 0o1777);
+}
+
+fn docker_inspect_json(container_id: &str, format: &str) -> Value {
+    serde_json::from_str(&docker_command(&[
+        "container",
+        "inspect",
+        "--format",
+        format,
+        container_id,
+    ]))
+    .expect("parse Docker inspection JSON")
+}
+
+fn docker_command(arguments: &[&str]) -> String {
+    let output = Command::new("docker")
+        .args(arguments)
+        .output()
+        .unwrap_or_else(|error| panic!("run `docker {}`: {error}", arguments.join(" ")));
+    assert!(
+        output.status.success(),
+        "`docker {}` failed: {}",
+        arguments.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("Docker output is UTF-8")
+        .trim()
+        .to_owned()
+}
+
+async fn wait_until_container_is_absent(container_id: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let exists = Command::new("docker")
+            .args(["container", "inspect", container_id])
+            .output()
+            .expect("inspect Docker container")
+            .status
+            .success();
+        if !exists {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "owned container '{container_id}' was not removed"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn wait_until_project_containers_are_absent(project: &str) {
+    let label = format!("org.postgres-test-harness.project={project}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut absent_since = None;
+    loop {
+        let containers = docker_command(&["ps", "-aq", "--filter", &format!("label={label}")]);
+        if containers.is_empty() {
+            let first_absent = absent_since.get_or_insert_with(Instant::now);
+            if first_absent.elapsed() >= Duration::from_millis(250) {
+                return;
+            }
+        } else {
+            absent_since = None;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "owned containers for project '{project}' were not removed: {containers}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 async fn execute(database_url: String, sql: impl Into<String>) -> Result<(), BoxError> {
@@ -915,6 +1196,13 @@ impl Drop for TemporaryDatabase {
 }
 
 async fn scalar_i64(database_url: String, sql: &'static str) -> Result<i64, BoxError> {
+    with_client(database_url, move |client| {
+        Ok(client.query_one(sql, &[])?.get(0))
+    })
+    .await
+}
+
+async fn scalar_string(database_url: String, sql: &'static str) -> Result<String, BoxError> {
     with_client(database_url, move |client| {
         Ok(client.query_one(sql, &[])?.get(0))
     })

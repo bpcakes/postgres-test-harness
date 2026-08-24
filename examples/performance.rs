@@ -23,17 +23,20 @@ use std::{
 };
 
 use postgres_test_harness::{
-    BoxError, CleanupReport, FingerprintBuilder, HarnessConfig, POSTGRES_TEST_ADMIN_URL_ENV,
-    POSTGRES_TEST_IMAGE_ENV, PostgresHarness, TemplateSpec, cleanup_stale_databases,
+    BoxError, CleanupReport, FingerprintBuilder, HarnessConfig, OwnedContainerProfile,
+    POSTGRES_TEST_ADMIN_URL_ENV, POSTGRES_TEST_IMAGE_ENV, PostgresHarness, TemplateSpec,
+    cleanup_stale_databases,
 };
 use serde::Serialize;
 use tokio::{sync::Semaphore, task::JoinSet};
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 const DEFAULT_IMAGE: &str = "postgres:18";
 const OUTPUT_ENV: &str = "PTH_PERF_OUTPUT";
+const OWNED_INITDB_NO_SYNC_ENV: &str = "PTH_PERF_OWNED_INITDB_NO_SYNC";
+const OWNED_TMPFS_SIZE_BYTES_ENV: &str = "PTH_PERF_OWNED_TMPFS_SIZE_BYTES";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(90);
 const TEMPLATE_WAIT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -186,6 +189,7 @@ struct BenchmarkConfig {
     project: String,
     mode: ServerMode,
     image: String,
+    owned_container_profile: OwnedContainerProfile,
     output: Option<PathBuf>,
     samples: usize,
     sequential_operations: usize,
@@ -197,10 +201,15 @@ struct BenchmarkConfig {
 
 impl BenchmarkConfig {
     fn from_environment(project: String) -> AnyResult<Self> {
+        let mode = ServerMode::detect()?;
         let config = Self {
             project,
-            mode: ServerMode::detect()?,
+            mode,
             image: env::var(POSTGRES_TEST_IMAGE_ENV).unwrap_or_else(|_| DEFAULT_IMAGE.to_owned()),
+            owned_container_profile: match mode {
+                ServerMode::Owned => owned_container_profile_from_environment()?,
+                ServerMode::External => OwnedContainerProfile::default(),
+            },
             output: env::var_os(OUTPUT_ENV).map(PathBuf::from),
             samples: positive_env("PTH_PERF_SAMPLES", DEFAULT_SAMPLES)?,
             sequential_operations: positive_env(
@@ -250,7 +259,9 @@ impl BenchmarkConfig {
             .with_connections_per_database(CONNECTIONS_PER_DATABASE)?
             .with_cleanup_on_start(false);
         match self.mode {
-            ServerMode::Owned => Ok(config.with_image(self.image.clone())?),
+            ServerMode::Owned => Ok(config
+                .with_image(self.image.clone())?
+                .with_owned_container_profile(self.owned_container_profile)),
             ServerMode::External => Ok(config),
         }
     }
@@ -277,6 +288,8 @@ impl BenchmarkConfig {
             connection_budget: CONNECTION_BUDGET,
             connections_per_database: CONNECTIONS_PER_DATABASE,
             cleanup_on_start: false,
+            owned_container_profile: matches!(self.mode, ServerMode::Owned)
+                .then(|| OwnedContainerProfileReport::from(self.owned_container_profile)),
         }
     }
 }
@@ -341,6 +354,33 @@ struct ConfigurationReport {
     connection_budget: usize,
     connections_per_database: u32,
     cleanup_on_start: bool,
+    owned_container_profile: Option<OwnedContainerProfileReport>,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+struct OwnedContainerProfileReport {
+    initdb_no_sync: bool,
+    storage: OwnedContainerStorageReport,
+}
+
+#[derive(Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum OwnedContainerStorageReport {
+    Tmpfs { size_bytes: u64 },
+    ImageDefault,
+}
+
+impl From<OwnedContainerProfile> for OwnedContainerProfileReport {
+    fn from(profile: OwnedContainerProfile) -> Self {
+        Self {
+            initdb_no_sync: profile.initdb_no_sync(),
+            storage: profile
+                .tmpfs_size_bytes()
+                .map_or(OwnedContainerStorageReport::ImageDefault, |size_bytes| {
+                    OwnedContainerStorageReport::Tmpfs { size_bytes }
+                }),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -421,6 +461,8 @@ struct PostgresSettingsReport {
     fsync: bool,
     synchronous_commit: String,
     full_page_writes: bool,
+    data_checksums: bool,
+    wal_level: String,
     max_connections: i32,
 }
 
@@ -590,6 +632,8 @@ impl Observer {
                         current_setting('fsync')::boolean,
                         current_setting('synchronous_commit'),
                         current_setting('full_page_writes')::boolean,
+                        current_setting('data_checksums')::boolean,
+                        current_setting('wal_level'),
                         current_setting('max_connections')::integer",
                 &[],
             ),
@@ -603,7 +647,9 @@ impl Observer {
                 fsync: row.get(3),
                 synchronous_commit: row.get(4),
                 full_page_writes: row.get(5),
-                max_connections: row.get(6),
+                data_checksums: row.get(6),
+                wal_level: row.get(7),
+                max_connections: row.get(8),
             },
         })
     }
@@ -817,7 +863,7 @@ async fn main() -> AnyResult<()> {
             cpu_count: std::thread::available_parallelism()?.get(),
             operating_system: env::consts::OS,
             architecture: env::consts::ARCH,
-            readiness_contract: "PostgresHarness::start returned after a mapped TCP admin connection and PostgreSQL 18 validation; the observer then retained that final-server TCP session across a follow-up probe",
+            readiness_contract: "PostgresHarness::start authenticated through the mapped TCP port within the owned startup deadline and validated PostgreSQL 18; the image's socket-only temporary initdb server cannot satisfy this probe, and the observer then retained the final-server TCP session across a follow-up probe",
             admin_session_counter_scope: "pg_stat_database.sessions for the administrative database; the startup snapshot is taken after the persistent observer connects, phase deltas retain that same observer at both endpoints, and shared external servers may include ambient traffic",
         },
         configuration: config.report(),
@@ -826,6 +872,8 @@ async fn main() -> AnyResult<()> {
         notes: vec![
             "Durations are observations, never pass/fail thresholds.",
             "Owned startup requires a cached image and excludes image-pull time.",
+            "Owned profile settings record initdb synchronization and the effective harness storage mount; image-default storage adds no harness tmpfs mount.",
+            "The owned profile does not disable data checksums or lower wal_level; reports record both server settings.",
             "Deferred cleanup drain ends only after every dropped lease name is absent from pg_database.",
             "Deferred cleanup completion is observed by catalog polling; the recorded interval describes detection granularity, not a latency threshold.",
             "Run both modes under comparable load and compare the versioned JSON output; URLs and credentials are never recorded.",
@@ -1536,6 +1584,44 @@ fn positive_env(name: &str, default: usize) -> AnyResult<usize> {
     Ok(parsed)
 }
 
+fn owned_container_profile_from_environment() -> AnyResult<OwnedContainerProfile> {
+    let profile = OwnedContainerProfile::default()
+        .with_initdb_no_sync(boolean_env(OWNED_INITDB_NO_SYNC_ENV, true)?);
+    let Some(value) = env::var_os(OWNED_TMPFS_SIZE_BYTES_ENV) else {
+        return Ok(profile);
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| invalid_input(format!("{OWNED_TMPFS_SIZE_BYTES_ENV} must be valid UTF-8")))?;
+    if value.eq_ignore_ascii_case("off") {
+        return Ok(profile.without_tmpfs());
+    }
+    let size_bytes = value.parse::<u64>().map_err(|_| {
+        invalid_input(format!(
+            "{OWNED_TMPFS_SIZE_BYTES_ENV} must be 'off' or a positive byte count, got {value:?}"
+        ))
+    })?;
+    profile
+        .with_tmpfs_size_bytes(size_bytes)
+        .map_err(Into::into)
+}
+
+fn boolean_env(name: &str, default: bool) -> AnyResult<bool> {
+    let Some(value) = env::var_os(name) else {
+        return Ok(default);
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| invalid_input(format!("{name} must be valid UTF-8")))?;
+    match value.as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(invalid_input(format!(
+            "{name} must be 'true' or 'false', got {value:?}"
+        ))),
+    }
+}
+
 fn invalid_input(message: impl Into<String>) -> AnyError {
     io::Error::new(io::ErrorKind::InvalidInput, message.into()).into()
 }
@@ -1655,15 +1741,15 @@ fn ns_to_ms(nanoseconds: u128) -> f64 {
 mod tests {
     use std::{collections::HashSet, ffi::OsString, fs, io, time::Duration};
 
-    use postgres_test_harness::ProjectName;
+    use postgres_test_harness::{OwnedContainerProfile, ProjectName};
     use uuid::Uuid;
 
     use super::{
         BatchMethodReport, CleanupAttemptReport, ExternalCleanupReport, Observer,
-        OperationAndCleanupError, PostgresSettingsReport, ReportOutput, RetryBackoff,
-        SCHEMA_VERSION, ServerMode, SessionSnapshotReport, SummaryReport, benchmark_project,
-        combine_operation_and_cleanup, run_observer_operation, summary_report,
-        validate_completed_external_cleanup, validate_external_sweep,
+        OperationAndCleanupError, OwnedContainerProfileReport, PostgresSettingsReport,
+        ReportOutput, RetryBackoff, SCHEMA_VERSION, ServerMode, SessionSnapshotReport,
+        SummaryReport, benchmark_project, combine_operation_and_cleanup, run_observer_operation,
+        summary_report, validate_completed_external_cleanup, validate_external_sweep,
     };
 
     #[test]
@@ -1848,8 +1934,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_v4_encodes_measurement_method_and_provenance() {
-        assert_eq!(SCHEMA_VERSION, 4);
+    fn schema_v5_encodes_measurement_method_storage_and_provenance() {
+        assert_eq!(SCHEMA_VERSION, 5);
         assert_eq!(
             serde_json::to_value(BatchMethodReport::caller_bounded(4))
                 .expect("serialize caller-bounded method"),
@@ -1873,6 +1959,8 @@ mod tests {
                 fsync: true,
                 synchronous_commit: "on".to_owned(),
                 full_page_writes: true,
+                data_checksums: true,
+                wal_level: "replica".to_owned(),
                 max_connections: 100,
             })
             .expect("serialize PostgreSQL settings"),
@@ -1880,7 +1968,34 @@ mod tests {
                 "fsync": true,
                 "synchronous_commit": "on",
                 "full_page_writes": true,
+                "data_checksums": true,
+                "wal_level": "replica",
                 "max_connections": 100
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(OwnedContainerProfileReport::from(
+                OwnedContainerProfile::default()
+            ))
+            .expect("serialize owned-container profile"),
+            serde_json::json!({
+                "initdb_no_sync": true,
+                "storage": {
+                    "kind": "tmpfs",
+                    "size_bytes": 1_073_741_824_u64
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(OwnedContainerProfileReport::from(
+                OwnedContainerProfile::default()
+                    .with_initdb_no_sync(false)
+                    .without_tmpfs()
+            ))
+            .expect("serialize compatibility owned-container profile"),
+            serde_json::json!({
+                "initdb_no_sync": false,
+                "storage": { "kind": "image_default" }
             })
         );
         assert_eq!(

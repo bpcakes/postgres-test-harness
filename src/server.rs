@@ -1,15 +1,16 @@
 use std::{
+    io::Read,
     sync::{
         Arc, Mutex, OnceLock, Weak,
-        mpsc::{self, Sender},
+        mpsc::{self, RecvTimeoutError, Sender},
     },
     thread::JoinHandle,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use testcontainers::{
-    Container, GenericImage, ImageExt,
-    core::{IntoContainerPort, WaitFor},
+    Container, ContainerRequest, GenericImage, ImageExt,
+    core::{IntoContainerPort, Mount, WaitFor},
     runners::SyncRunner,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -19,15 +20,22 @@ use crate::{
     Error, HarnessConfig, ProjectName, Result,
     admin::{
         AdminClient, AdminDatabaseUrl, PersistentClient, acquire_advisory_lock, advisory_key,
-        connect_admin, validate_postgres_18,
+        connect_admin, connect_admin_with_timeout, validate_postgres_18,
     },
-    config::{ImageReference, ResolvedConnectionLimits},
+    config::{ImageReference, OwnedContainerProfile, ResolvedConnectionLimits},
 };
 
 const POSTGRES_PORT: u16 = 5432;
 const POSTGRES_USER: &str = "postgres";
 const POSTGRES_PASSWORD: &str = "postgres";
 const POSTGRES_DATABASE: &str = "postgres";
+const POSTGRES_STORAGE_PATH: &str = "/var/lib/postgresql";
+const POSTGRES_INITDB_NO_SYNC: &str = "--no-sync";
+const STARTUP_CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
+const CONTAINER_ENGINE_STARTUP_TIMEOUT_FLOOR: Duration = Duration::from_secs(60);
+const STARTUP_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+const STARTUP_STATUS_INTERVAL: Duration = Duration::from_millis(25);
+const STARTUP_LOG_LIMIT_BYTES: u64 = 64 * 1024;
 const MANAGED_LABEL: &str = "org.postgres-test-harness.managed";
 const PROJECT_LABEL: &str = "org.postgres-test-harness.project";
 const RUN_LABEL: &str = "org.postgres-test-harness.run";
@@ -59,16 +67,43 @@ impl ServerInner {
         let connection_limits = config.resolved_connection_limits()?;
         let run_id = Uuid::now_v7().simple().to_string();
         let owner_key = advisory_key("run", &run_id);
-        let (admin_url, container) = if let Some(admin_url) = config.resolved_admin_database_url() {
-            (AdminDatabaseUrl::parse(&admin_url)?, None)
-        } else {
-            let image = config.resolved_image()?;
-            let (container, admin_url) =
-                ContainerOwner::start(image, &config.project, &run_id, config.startup_timeout)?;
-            (admin_url, Some(container))
-        };
+        if let Some(admin_url) = config.resolved_admin_database_url() {
+            return Self::finish_start(
+                config,
+                connection_limits,
+                AdminDatabaseUrl::parse(&admin_url)?,
+                None,
+                owner_key,
+            );
+        }
 
-        Self::finish_start(config, connection_limits, admin_url, container, owner_key)
+        let startup_started = Instant::now();
+        let image = config.resolved_image()?;
+        let profile = config.owned_container_profile;
+        let (container, admin_url) = ContainerOwner::start(
+            image,
+            profile,
+            &config.project,
+            &run_id,
+            config.startup_timeout,
+        )?;
+        let owner_lock = wait_for_owned_server(
+            &admin_url,
+            config.operation_timeout,
+            startup_started,
+            config.startup_timeout,
+            profile,
+            &container,
+        )?;
+        container.mark_ready()?;
+        Self::finish_start_with_client(
+            config,
+            connection_limits,
+            admin_url,
+            Some(container),
+            owner_key,
+            owner_lock,
+        )
     }
 
     fn finish_start(
@@ -99,11 +134,29 @@ impl ServerInner {
     where
         F: FnOnce(&AdminDatabaseUrl, Duration, &'static str) -> Result<AdminClient>,
     {
-        let mut owner_lock = connector(
+        let owner_lock = connector(
             &admin_url,
             config.operation_timeout,
             "connect to PostgreSQL test server",
         )?;
+        Self::finish_start_with_client(
+            config,
+            connection_limits,
+            admin_url,
+            container,
+            owner_key,
+            owner_lock,
+        )
+    }
+
+    fn finish_start_with_client(
+        config: HarnessConfig,
+        connection_limits: ResolvedConnectionLimits,
+        admin_url: AdminDatabaseUrl,
+        container: Option<Arc<ContainerOwner>>,
+        owner_key: i64,
+        mut owner_lock: AdminClient,
+    ) -> Result<Arc<Self>> {
         validate_postgres_18(&mut owner_lock)?;
         acquire_advisory_lock(&mut owner_lock, owner_key)?;
 
@@ -170,9 +223,21 @@ where
 
 type RemovalResult = std::result::Result<(), testcontainers::TestcontainersError>;
 
+#[derive(Clone, Copy)]
+enum ContainerCommand {
+    Ready,
+    Shutdown,
+}
+
 struct ContainerWorker {
-    shutdown: Sender<()>,
+    shutdown: Sender<ContainerCommand>,
     handle: JoinHandle<RemovalResult>,
+}
+
+#[derive(Clone)]
+struct ContainerExit {
+    exit_code: Option<i64>,
+    output: Vec<u8>,
 }
 
 struct StartedContainer {
@@ -184,11 +249,13 @@ struct StartedContainer {
 pub(crate) struct ContainerOwner {
     id: String,
     worker: Mutex<Option<ContainerWorker>>,
+    startup_exit: Arc<Mutex<Option<ContainerExit>>>,
 }
 
 impl ContainerOwner {
     fn start(
         image: ImageReference,
+        profile: OwnedContainerProfile,
         project: &ProjectName,
         run_id: &str,
         startup_timeout: Duration,
@@ -198,33 +265,19 @@ impl ContainerOwner {
         let project_label = project.as_str().to_owned();
         let run_label = run_id.to_owned();
         let created_label = unix_now().to_string();
+        let startup_exit = Arc::new(Mutex::new(None));
+        let worker_startup_exit = startup_exit.clone();
         let worker = std::thread::Builder::new()
             .name("postgres-test-harness-container".to_owned())
             .spawn(move || {
-                let request = GenericImage::new(image.repository, image.tag)
-                    .with_wait_for(WaitFor::message_on_stderr(
-                        "database system is ready to accept connections",
-                    ))
-                    .with_exposed_port(POSTGRES_PORT.tcp())
-                    .with_env_var("POSTGRES_USER", POSTGRES_USER)
-                    .with_env_var("POSTGRES_PASSWORD", POSTGRES_PASSWORD)
-                    .with_env_var("POSTGRES_DB", POSTGRES_DATABASE)
-                    .with_cmd([
-                        "postgres",
-                        "-c",
-                        "fsync=off",
-                        "-c",
-                        "synchronous_commit=off",
-                        "-c",
-                        "full_page_writes=off",
-                        "-c",
-                        "max_connections=300",
-                    ])
-                    .with_startup_timeout(startup_timeout)
-                    .with_label(MANAGED_LABEL, "true")
-                    .with_label(PROJECT_LABEL, project_label)
-                    .with_label(RUN_LABEL, run_label)
-                    .with_label(CREATED_LABEL, created_label);
+                let request = container_request(
+                    image,
+                    profile,
+                    startup_timeout,
+                    project_label,
+                    run_label,
+                    created_label,
+                );
                 let container = match request.start() {
                     Ok(container) => container,
                     Err(source) => {
@@ -232,12 +285,16 @@ impl ContainerOwner {
                         return Ok(());
                     }
                 };
-                let started = resolve_started_container(&container);
+                let started = resolve_started_container_with_retry(&container, startup_timeout);
                 if started_sender.send(started).is_err() {
                     return container.rm();
                 }
 
-                let _ = shutdown_receiver.recv();
+                monitor_container_startup(
+                    &container,
+                    &shutdown_receiver,
+                    &worker_startup_exit,
+                );
                 let removal_result = container.rm();
                 if let Err(error) = &removal_result {
                     eprintln!(
@@ -248,10 +305,29 @@ impl ContainerOwner {
             })
             .map_err(|source| Error::ContainerWorkerStart { source })?;
 
-        let started = started_receiver
-            .recv()
-            .map_err(|_| Error::ContainerWorkerStopped)?
-            .map_err(|source| Error::ContainerStart { source })?;
+        let started = match started_receiver.recv_timeout(startup_timeout) {
+            Ok(Ok(started)) => started,
+            Ok(Err(source)) => {
+                drop(started_receiver);
+                drop(shutdown_sender);
+                join_failed_startup_worker(worker)?;
+                return Err(map_container_start_error(profile, source));
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                drop(started_receiver);
+                drop(shutdown_sender);
+                join_failed_startup_worker(worker)?;
+                return Err(Error::ContainerStartupTimeout {
+                    timeout: startup_timeout,
+                });
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                drop(started_receiver);
+                drop(shutdown_sender);
+                join_failed_startup_worker(worker)?;
+                return Err(Error::ContainerWorkerStopped);
+            }
+        };
         let admin_url = AdminDatabaseUrl::parse(&format!(
             "postgres://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{}:{}/{POSTGRES_DATABASE}?sslmode=disable",
             started.host, started.port
@@ -262,9 +338,27 @@ impl ContainerOwner {
                 shutdown: shutdown_sender,
                 handle: worker,
             })),
+            startup_exit,
         });
         register_container(&owner)?;
         Ok((owner, admin_url))
+    }
+
+    fn mark_ready(&self) -> Result<()> {
+        let worker = self.worker.lock().map_err(|_| Error::StatePoisoned {
+            operation: "lock PostgreSQL container worker",
+        })?;
+        let Some(worker) = worker.as_ref() else {
+            return Err(Error::ContainerWorkerStopped);
+        };
+        worker
+            .shutdown
+            .send(ContainerCommand::Ready)
+            .map_err(|_| Error::ContainerWorkerStopped)
+    }
+
+    fn startup_exit(&self) -> Option<ContainerExit> {
+        self.startup_exit.lock().ok().and_then(|exit| exit.clone())
     }
 
     fn shutdown(&self) -> Result<()> {
@@ -275,13 +369,20 @@ impl ContainerOwner {
             return Ok(());
         };
 
-        let _ = shutdown.send(());
+        let _ = shutdown.send(ContainerCommand::Shutdown);
         drop(shutdown);
         handle
             .join()
             .map_err(|_| Error::ContainerWorkerPanicked)?
             .map_err(|source| Error::ContainerRemove { source })
     }
+}
+
+fn join_failed_startup_worker(worker: JoinHandle<RemovalResult>) -> Result<()> {
+    worker
+        .join()
+        .map_err(|_| Error::ContainerWorkerPanicked)?
+        .map_err(|source| Error::ContainerRemove { source })
 }
 
 impl Drop for ContainerOwner {
@@ -295,6 +396,205 @@ impl Drop for ContainerOwner {
     }
 }
 
+fn container_request(
+    image: ImageReference,
+    profile: OwnedContainerProfile,
+    startup_timeout: Duration,
+    project_label: String,
+    run_label: String,
+    created_label: String,
+) -> ContainerRequest<GenericImage> {
+    // Docker Official postgres starts a temporary socket-only server during
+    // initialization and logs the normal readiness message for it. Let Docker
+    // report that the process started, then prove final readiness with an
+    // authenticated connection through the mapped TCP port below.
+    let mut request = GenericImage::new(image.repository, image.tag)
+        .with_wait_for(WaitFor::Nothing)
+        .with_exposed_port(POSTGRES_PORT.tcp())
+        .with_env_var("POSTGRES_USER", POSTGRES_USER)
+        .with_env_var("POSTGRES_PASSWORD", POSTGRES_PASSWORD)
+        .with_env_var("POSTGRES_DB", POSTGRES_DATABASE)
+        .with_cmd([
+            "postgres",
+            "-c",
+            "fsync=off",
+            "-c",
+            "synchronous_commit=off",
+            "-c",
+            "full_page_writes=off",
+            "-c",
+            "max_connections=300",
+        ])
+        // The harness enforces the caller's deadline outside Testcontainers.
+        // A very short Testcontainers timeout can be cancelled after Docker
+        // creates a container but before a removable handle is returned.
+        .with_startup_timeout(startup_timeout.max(CONTAINER_ENGINE_STARTUP_TIMEOUT_FLOOR))
+        .with_label(MANAGED_LABEL, "true")
+        .with_label(PROJECT_LABEL, project_label)
+        .with_label(RUN_LABEL, run_label)
+        .with_label(CREATED_LABEL, created_label);
+
+    if profile.initdb_no_sync() {
+        request = request.with_env_var("POSTGRES_INITDB_ARGS", POSTGRES_INITDB_NO_SYNC);
+    }
+    if let Some(size_bytes) = profile.tmpfs_size_bytes() {
+        request = request.with_mount(
+            Mount::tmpfs_mount(POSTGRES_STORAGE_PATH)
+                .with_size_bytes(size_bytes as i64)
+                // Match the Docker Official image's volume-parent mode so its
+                // root entrypoint can create and chown the versioned PGDATA.
+                .with_mode(0o1777),
+        );
+    }
+    request
+}
+
+fn wait_for_owned_server(
+    admin_url: &AdminDatabaseUrl,
+    operation_timeout: Duration,
+    startup_started: Instant,
+    startup_timeout: Duration,
+    profile: OwnedContainerProfile,
+    container: &ContainerOwner,
+) -> Result<AdminClient> {
+    let mut last_error = None;
+    loop {
+        if let Some(exit) = container.startup_exit() {
+            return Err(container_exit_error(profile, exit));
+        }
+
+        let remaining = startup_timeout.saturating_sub(startup_started.elapsed());
+        if remaining.as_millis() == 0 {
+            if let Some(exit) = container.startup_exit() {
+                return Err(container_exit_error(profile, exit));
+            }
+            return Err(last_error.map_or(
+                Error::ContainerStartupTimeout {
+                    timeout: startup_timeout,
+                },
+                |source| Error::ContainerReadinessTimeout {
+                    timeout: startup_timeout,
+                    source: Box::new(source),
+                },
+            ));
+        }
+
+        let attempt_timeout = STARTUP_CONNECT_ATTEMPT_TIMEOUT.min(remaining);
+        match connect_admin_with_timeout(
+            admin_url,
+            operation_timeout,
+            "wait for final owned PostgreSQL TCP server",
+            attempt_timeout,
+        ) {
+            Ok(client) => return Ok(client),
+            Err(error) => last_error = Some(error),
+        }
+
+        let remaining = startup_timeout.saturating_sub(startup_started.elapsed());
+        if remaining.as_millis() > 0 {
+            std::thread::sleep(STARTUP_RETRY_INTERVAL.min(remaining));
+        }
+    }
+}
+
+fn monitor_container_startup(
+    container: &Container<GenericImage>,
+    commands: &mpsc::Receiver<ContainerCommand>,
+    startup_exit: &Mutex<Option<ContainerExit>>,
+) {
+    loop {
+        match commands.recv_timeout(STARTUP_STATUS_INTERVAL) {
+            Ok(ContainerCommand::Ready) => {
+                let _ = commands.recv();
+                return;
+            }
+            Ok(ContainerCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+
+        if matches!(container.is_running(), Ok(false)) {
+            let exit = ContainerExit {
+                exit_code: container.exit_code().unwrap_or(None),
+                output: bounded_container_output(container),
+            };
+            if let Ok(mut state) = startup_exit.lock() {
+                *state = Some(exit);
+            }
+            let _ = commands.recv();
+            return;
+        }
+    }
+}
+
+fn bounded_container_output(container: &Container<GenericImage>) -> Vec<u8> {
+    let mut output = Vec::new();
+    let _ = container
+        .stderr(false)
+        .take(STARTUP_LOG_LIMIT_BYTES)
+        .read_to_end(&mut output);
+    let remaining = STARTUP_LOG_LIMIT_BYTES.saturating_sub(output.len() as u64);
+    if remaining > 0 {
+        let _ = container
+            .stdout(false)
+            .take(remaining)
+            .read_to_end(&mut output);
+    }
+    output
+}
+
+fn container_exit_error(profile: OwnedContainerProfile, exit: ContainerExit) -> Error {
+    if let Some(tmpfs_size_bytes) = profile.tmpfs_size_bytes() {
+        if let Some(evidence) = storage_exhaustion_evidence(&exit.output) {
+            return Error::ContainerStorageExhausted {
+                tmpfs_size_bytes,
+                evidence,
+            };
+        }
+        if let Some(evidence) = memory_exhaustion_evidence(&exit.output, exit.exit_code) {
+            return Error::ContainerMemoryExhausted {
+                tmpfs_size_bytes,
+                evidence,
+            };
+        }
+    }
+    Error::ContainerExitedBeforeReady {
+        exit_code: exit.exit_code,
+    }
+}
+
+fn storage_exhaustion_evidence(output: &[u8]) -> Option<&'static str> {
+    let output = String::from_utf8_lossy(output).to_ascii_lowercase();
+    if output.contains("no space left on device") {
+        Some("container log reported no space left on device")
+    } else {
+        None
+    }
+}
+
+fn memory_exhaustion_evidence(output: &[u8], exit_code: Option<i64>) -> Option<&'static str> {
+    let output = String::from_utf8_lossy(output).to_ascii_lowercase();
+    if output.contains("cannot allocate memory") || output.contains("out of memory") {
+        Some("container log reported memory exhaustion")
+    } else if exit_code == Some(137) {
+        Some("container exited with status 137, consistent with an engine OOM kill")
+    } else {
+        None
+    }
+}
+
+fn map_container_start_error(
+    profile: OwnedContainerProfile,
+    source: testcontainers::TestcontainersError,
+) -> Error {
+    match profile.tmpfs_size_bytes() {
+        Some(tmpfs_size_bytes) => Error::ContainerStorageStart {
+            tmpfs_size_bytes,
+            source,
+        },
+        None => Error::ContainerStart { source },
+    }
+}
+
 fn resolve_started_container(
     container: &Container<GenericImage>,
 ) -> std::result::Result<StartedContainer, testcontainers::TestcontainersError> {
@@ -303,6 +603,27 @@ fn resolve_started_container(
         host: ipv4_mapped_container_host(container.get_host()?.to_string()),
         port: container.get_host_port_ipv4(POSTGRES_PORT.tcp())?,
     })
+}
+
+fn resolve_started_container_with_retry(
+    container: &Container<GenericImage>,
+    startup_timeout: Duration,
+) -> std::result::Result<StartedContainer, testcontainers::TestcontainersError> {
+    let started = Instant::now();
+    loop {
+        match resolve_started_container(container) {
+            Ok(container) => return Ok(container),
+            Err(error) if started.elapsed() >= startup_timeout => return Err(error),
+            Err(error) => {
+                if matches!(container.is_running(), Ok(false)) {
+                    return Err(error);
+                }
+                std::thread::sleep(
+                    STARTUP_RETRY_INTERVAL.min(startup_timeout.saturating_sub(started.elapsed())),
+                );
+            }
+        }
+    }
 }
 
 fn ipv4_mapped_container_host(host: String) -> String {
@@ -373,13 +694,18 @@ mod tests {
     };
 
     use super::{
-        ContainerOwner, ContainerWorker, ServerInner, begin_owned_container_shutdown,
-        ipv4_mapped_container_host,
+        ContainerCommand, ContainerOwner, ContainerWorker, POSTGRES_INITDB_NO_SYNC,
+        POSTGRES_STORAGE_PATH, ServerInner, begin_owned_container_shutdown, container_request,
+        ipv4_mapped_container_host, map_container_start_error, memory_exhaustion_evidence,
+        storage_exhaustion_evidence,
     };
-    use crate::{Error, HarnessConfig, admin::AdminDatabaseUrl};
+    use crate::{
+        Error, HarnessConfig, OwnedContainerProfile, admin::AdminDatabaseUrl,
+        config::ImageReference,
+    };
 
     fn test_container_owner(
-        work: impl FnOnce(mpsc::Receiver<()>) -> super::RemovalResult + Send + 'static,
+        work: impl FnOnce(mpsc::Receiver<ContainerCommand>) -> super::RemovalResult + Send + 'static,
     ) -> Arc<ContainerOwner> {
         let (shutdown, shutdown_receiver) = mpsc::channel();
         Arc::new(ContainerOwner {
@@ -388,6 +714,7 @@ mod tests {
                 shutdown,
                 handle: thread::spawn(move || work(shutdown_receiver)),
             })),
+            startup_exit: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -425,6 +752,116 @@ mod tests {
         };
 
         assert!(matches!(error, Error::InvalidConfiguration { .. }));
+    }
+
+    #[test]
+    fn default_container_request_uses_bounded_tmpfs_and_only_no_sync_initdb() {
+        let request = container_request(
+            ImageReference::parse("postgres:18").unwrap(),
+            OwnedContainerProfile::default(),
+            Duration::from_secs(60),
+            "project".to_owned(),
+            "run".to_owned(),
+            "1".to_owned(),
+        );
+        let environment = request
+            .env_vars()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            environment
+                .get("POSTGRES_INITDB_ARGS")
+                .map(|value| value.as_ref()),
+            Some(POSTGRES_INITDB_NO_SYNC)
+        );
+        assert!(!environment.contains_key("POSTGRES_HOST_AUTH_METHOD"));
+
+        let mounts = request.mounts().collect::<Vec<_>>();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].target(), Some(POSTGRES_STORAGE_PATH));
+        assert_eq!(
+            mounts[0].mount_type(),
+            testcontainers::core::MountType::Tmpfs
+        );
+        let options = mounts[0].tmpfs_options().expect("bounded tmpfs options");
+        assert_eq!(
+            options.size_bytes,
+            OwnedContainerProfile::default()
+                .tmpfs_size_bytes()
+                .map(|size| size as i64)
+        );
+        assert_eq!(options.mode, Some(0o1777));
+
+        let command = request
+            .cmd()
+            .map(|value| value.into_owned())
+            .collect::<Vec<_>>();
+        assert!(!command.iter().any(|value| value.contains("wal_level")));
+        assert!(
+            !environment
+                .values()
+                .any(|value| value.contains("--no-data-checksums"))
+        );
+    }
+
+    #[test]
+    fn compatibility_profile_omits_official_image_storage_extensions() {
+        let profile = OwnedContainerProfile::default()
+            .with_initdb_no_sync(false)
+            .without_tmpfs();
+        let request = container_request(
+            ImageReference::parse("registry.example/custom-postgres:18").unwrap(),
+            profile,
+            Duration::from_secs(60),
+            "project".to_owned(),
+            "run".to_owned(),
+            "1".to_owned(),
+        );
+
+        assert!(
+            !request
+                .env_vars()
+                .any(|(name, _)| name == "POSTGRES_INITDB_ARGS")
+        );
+        assert_eq!(request.mounts().count(), 0);
+    }
+
+    #[test]
+    fn tmpfs_start_failures_retain_daemon_details_and_an_opt_out() {
+        let error = map_container_start_error(
+            OwnedContainerProfile::default(),
+            testcontainers::TestcontainersError::other("operation not permitted"),
+        );
+
+        assert!(matches!(error, Error::ContainerStorageStart { .. }));
+        assert!(error.to_string().contains("operation not permitted"));
+        assert!(error.to_string().contains("without_tmpfs"));
+
+        let error = map_container_start_error(
+            OwnedContainerProfile::default().without_tmpfs(),
+            testcontainers::TestcontainersError::other("daemon unavailable"),
+        );
+        assert!(matches!(error, Error::ContainerStart { .. }));
+    }
+
+    #[test]
+    fn storage_exhaustion_detection_is_specific_and_case_insensitive() {
+        assert_eq!(
+            storage_exhaustion_evidence(b"initdb: NO SPACE LEFT ON DEVICE"),
+            Some("container log reported no space left on device")
+        );
+        assert_eq!(
+            memory_exhaustion_evidence(b"fatal: cannot allocate memory", Some(1)),
+            Some("container log reported memory exhaustion")
+        );
+        assert_eq!(
+            memory_exhaustion_evidence(b"", Some(137)),
+            Some("container exited with status 137, consistent with an engine OOM kill")
+        );
+        assert_eq!(storage_exhaustion_evidence(b"authentication failed"), None);
+        assert_eq!(
+            memory_exhaustion_evidence(b"authentication failed", Some(1)),
+            None
+        );
     }
 
     #[tokio::test]
@@ -492,6 +929,7 @@ mod tests {
                 shutdown: shutdown_request_sender,
                 handle: worker,
             })),
+            startup_exit: Arc::new(Mutex::new(None)),
         });
         let config = HarnessConfig::new("cleanup").unwrap();
         let connection_limits = config.resolved_connection_limits().unwrap();

@@ -117,3 +117,57 @@ instrumenting the production code: a complete clone plus explicit cleanup uses
 two administrative connections, while template acquisition retains one new
 shared-lock session per call. Future performance changes should compare these
 deltas alongside latency and throughput rather than optimizing only one axis.
+
+## PERF06 owned-container profile follow-up
+
+On 2026-08-24, the schema-v5 workload was rerun three times with the PERF06
+implementation at source commit
+`845925b0f5247fcc0eb831837f48dda9e91b3467`. The reports correctly record a
+dirty worktree because the profile implementation and this documentation were
+not yet committed. All three owned comparisons used the same cached image,
+host, workload, PostgreSQL settings, and template sizes as the baseline above:
+7,894,719 bytes for `small` and 29,095,615 bytes for `representative`.
+
+Median elapsed milliseconds across three samples per profile:
+
+| Metric | Fixture | Compatibility: synced initdb, image storage | `--no-sync`, image storage | Default: `--no-sync`, 1 GiB tmpfs |
+| --- | --- | ---: | ---: | ---: |
+| Server startup | all | 1710.431 | 1309.803 | 1236.474 |
+| Cold template acquisition/migration | small | 75.563 | 77.490 | 61.983 |
+| Cold template acquisition/migration | representative | 443.346 | 464.827 | 425.552 |
+| Sequential clone-cleanup (4) | small | 200.445 | 205.435 | 154.001 |
+| Sequential clone-cleanup (4) | representative | 322.970 | 323.550 | 257.206 |
+| Bounded concurrent clone-cleanup (8 at 4) | small | 143.175 | 142.797 | 99.835 |
+| Bounded concurrent clone-cleanup (8 at 4) | representative | 413.168 | 432.675 | 263.934 |
+| Explicit cleanup drain (4-way) | small | 29.886 | 29.476 | 12.669 |
+| Explicit cleanup drain (4-way) | representative | 70.577 | 29.610 | 15.476 |
+| Deferred cleanup drain (4 queued) | small | 83.193 | 83.400 | 70.354 |
+| Deferred cleanup drain (4 queued) | representative | 164.039 | 163.593 | 129.677 |
+
+On this run, `--no-sync` reduced median final-TCP-ready startup by 23.4%
+relative to the compatibility profile. Adding tmpfs reduced representative
+sequential clone-cleanup by 20.5% and bounded-concurrent clone-cleanup by 39.0%
+relative to `--no-sync` on image-default storage. The explicit representative
+cleanup measurement was noisy in the compatibility run, so it should not be
+used as a standalone effect estimate. These remain machine-specific
+observations, not thresholds.
+
+The default-profile report recorded `data_checksums=on`, `wal_level=replica`,
+`fsync=off`, `synchronous_commit=off`, and `full_page_writes=off`. This proves
+the profile did not obtain speed by disabling checksums or reducing WAL level.
+Each sample retained the same mapped-TCP postmaster across its readiness probe,
+and explicit shutdown left no managed container.
+
+An external-mode schema-v5 run against the same image and runtime PostgreSQL
+settings also completed three samples. Its configuration recorded
+`owned_container_profile: null`, median attach time was 6.501 ms, and every
+sample's metadata-aware cleanup dropped exactly its two templates with no test
+database left. This is evidence that owned storage configuration is not
+applied to external servers.
+
+The raw local reports are:
+
+- `target/performance-owned-perf06-compatibility.json`
+- `target/performance-owned-perf06-image-storage.json`
+- `target/performance-owned-perf06.json`
+- `target/performance-external-perf06.json`

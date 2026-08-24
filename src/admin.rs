@@ -181,7 +181,7 @@ pub(crate) fn connect_admin(
     connect_admin_with_timeout(admin_url, operation_timeout, operation, CONNECT_TIMEOUT)
 }
 
-fn connect_admin_with_timeout(
+pub(crate) fn connect_admin_with_timeout(
     admin_url: &AdminDatabaseUrl,
     operation_timeout: Duration,
     operation: &'static str,

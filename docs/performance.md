@@ -31,6 +31,15 @@ content ID. It also records the Docker daemon storage driver.
 image configuration/content ID (`docker image inspect .Id`), not a registry
 manifest from `RepoDigests`.
 
+The default run records and uses the library's owned performance profile:
+`initdb --no-sync` plus a 1 GiB tmpfs cap. To isolate either contribution on
+the same host, set `PTH_PERF_OWNED_INITDB_NO_SYNC=false` and/or
+`PTH_PERF_OWNED_TMPFS_SIZE_BYTES=off`. A positive byte count selects a
+different explicit tmpfs cap. Keep these values identical across samples in a
+single report; compare separate JSON reports rather than changing storage
+mid-run. Docker's storage-driver field remains daemon provenance when tmpfs is
+active—it is not a claim that PostgreSQL data used that driver.
+
 ## External-server run
 
 Set the same administrative URL accepted by the library:
@@ -49,10 +58,10 @@ metadata variables are optional provenance supplied by the operator. Supply
 the same Docker content-ID kind used by owned mode, rather than a registry
 manifest digest. Their fields remain present with a
 `not_reported_for_external_server` source when the values are unavailable.
-The benchmark discovers `fsync`, `synchronous_commit`, `full_page_writes`, and
-`max_connections` from PostgreSQL itself. Treat reports with different values
-as different environments rather than attributing the difference to harness
-mode.
+The benchmark discovers `fsync`, `synchronous_commit`, `full_page_writes`,
+`data_checksums`, `wal_level`, and `max_connections` from PostgreSQL itself.
+Treat reports with different values as different environments rather than
+attributing the difference to harness mode.
 
 An external run disables the startup stale sweep so that unrelated cleanup is
 not folded into startup. Each invocation uses a random, valid project namespace
@@ -86,10 +95,12 @@ The JSON records these boundaries for every sample and fixture:
 
 - `server_startup`: immediately around `PostgresHarness::start`. In owned mode
   the image-cache check happens before the timer. The timed call cannot finish
-  on the Docker entrypoint's temporary initdb server: harness startup must open
-  the mapped TCP admin connection and validate PostgreSQL 18. The example then
-  retains an observer TCP session across a second postmaster-start probe and
-  fails if the postmaster changes.
+  on the Docker entrypoint's temporary initdb server: harness startup must
+  authenticate through the mapped TCP port within its startup deadline and
+  validate PostgreSQL 18. Timeout cleanup is included because startup does not
+  return while a partially created owned container still needs removal. The
+  example then retains an observer TCP session across a second postmaster-start
+  probe and fails if the postmaster changes.
 - `cold_template_acquisition`: a run-unique fingerprint whose initializer must
   execute. This includes the fixture migration and template finalization.
 - `warm_template_acquisition`: the same fingerprint while the cold handle is
@@ -132,11 +143,12 @@ leave a local characterization waiting indefinitely.
 
 The top-level report also records the source commit and worktree state,
 PostgreSQL version and critical settings, postmaster start, logical CPU count,
-OS, architecture, server mode, image metadata, storage driver, fixture rows,
-execution and completion methods, concurrency where caller-controlled, sample
-counts, connection budget, per-database permits, timeouts, polling interval,
-and cleanup retry policy. These provenance additions are report schema version
-4; consumers should branch on `schema_version`.
+OS, architecture, server mode, image metadata, storage driver, the effective
+owned initdb/storage profile, fixture rows, execution and completion methods,
+concurrency where caller-controlled, sample counts, connection budget,
+per-database permits, timeouts, polling interval, and cleanup retry policy.
+Owned-profile and checksum/WAL provenance are report schema version 5;
+consumers should branch on `schema_version`.
 
 ## Configuration
 
@@ -153,6 +165,8 @@ connection policy.
 | `PTH_PERF_DRAIN_DATABASES` | 4 | Pre-created leases in each cleanup-drain measurement |
 | `PTH_PERF_REPRESENTATIVE_ROWS` | 50000 | Rows migrated into the representative fixture |
 | `PTH_PERF_OUTPUT` | stdout | JSON output path; use ignored `target/` for clean provenance |
+| `PTH_PERF_OWNED_INITDB_NO_SYNC` | `true` | Whether owned initdb uses `--no-sync` |
+| `PTH_PERF_OWNED_TMPFS_SIZE_BYTES` | `1073741824` | Owned tmpfs byte cap, or `off` for image-default storage |
 | `PTH_PERF_EXTERNAL_IMAGE_CONTENT_ID` | unset | External-server Docker image content ID |
 | `PTH_PERF_EXTERNAL_STORAGE_DRIVER` | unset | External-server storage provenance |
 

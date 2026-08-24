@@ -47,7 +47,8 @@ const DEFAULT_DRAIN_DATABASES: usize = 4;
 const DEFAULT_REPRESENTATIVE_ROWS: usize = 50_000;
 const DEFERRED_DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
 const EXTERNAL_CLEANUP_RETRY_WINDOW: Duration = Duration::from_secs(120);
-const EXTERNAL_CLEANUP_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+const EXTERNAL_CLEANUP_INITIAL_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+const EXTERNAL_CLEANUP_MAX_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 
 type AnyError = Box<dyn StdError + Send + Sync>;
 type AnyResult<T> = std::result::Result<T, AnyError>;
@@ -60,6 +61,11 @@ struct OperationAndCleanupError {
 
 #[derive(Clone, Copy)]
 struct Deadline(tokio::time::Instant);
+
+struct RetryBackoff {
+    next: Duration,
+    maximum: Duration,
+}
 
 impl Deadline {
     fn after(duration: Duration) -> Self {
@@ -80,6 +86,23 @@ impl Deadline {
     async fn sleep_up_to(self, duration: Duration) {
         let wake_at = (tokio::time::Instant::now() + duration).min(self.0);
         tokio::time::sleep_until(wake_at).await;
+    }
+}
+
+impl RetryBackoff {
+    fn new(initial: Duration, maximum: Duration) -> Self {
+        debug_assert!(!initial.is_zero());
+        debug_assert!(initial <= maximum);
+        Self {
+            next: initial,
+            maximum,
+        }
+    }
+
+    fn next_delay(&mut self) -> Duration {
+        let delay = self.next;
+        self.next = self.next.saturating_mul(2).min(self.maximum);
+        delay
     }
 }
 
@@ -1088,6 +1111,10 @@ async fn cleanup_external_resources(
 ) -> AnyResult<ExternalCleanupReport> {
     let started = Instant::now();
     let retry_deadline = Deadline::after(EXTERNAL_CLEANUP_RETRY_WINDOW);
+    let mut retry_backoff = RetryBackoff::new(
+        EXTERNAL_CLEANUP_INITIAL_RETRY_INTERVAL,
+        EXTERNAL_CLEANUP_MAX_RETRY_INTERVAL,
+    );
     let mut attempts = Vec::new();
     loop {
         let cleanup = cleanup_stale_databases(admin_url, project, Duration::ZERO).await?;
@@ -1109,9 +1136,7 @@ async fn cleanup_external_resources(
             )
             .into());
         }
-        retry_deadline
-            .sleep_up_to(EXTERNAL_CLEANUP_RETRY_INTERVAL)
-            .await;
+        retry_deadline.sleep_up_to(retry_backoff.next_delay()).await;
     }
 }
 
@@ -1525,7 +1550,7 @@ mod tests {
 
     use super::{
         CleanupAttemptReport, ExternalCleanupReport, Observer, OperationAndCleanupError,
-        ReportOutput, SCHEMA_VERSION, ServerMode, SummaryReport, benchmark_project,
+        ReportOutput, RetryBackoff, SCHEMA_VERSION, ServerMode, SummaryReport, benchmark_project,
         combine_operation_and_cleanup, run_observer_operation, summary_report,
         validate_completed_external_cleanup, validate_external_sweep,
     };
@@ -1576,6 +1601,17 @@ mod tests {
         assert_eq!(report.attempts[1].skipped_active, 0);
         assert!(validate_external_sweep(&report, "project").is_ok());
         assert!(validate_completed_external_cleanup(&report, "project", 2).is_ok());
+    }
+
+    #[test]
+    fn retry_backoff_can_preserve_a_fixed_interval_policy() {
+        let interval = Duration::from_millis(25);
+        let mut backoff = RetryBackoff::new(interval, interval);
+
+        assert_eq!(
+            (0..4).map(|_| backoff.next_delay()).collect::<Vec<_>>(),
+            vec![interval; 4]
+        );
     }
 
     #[test]

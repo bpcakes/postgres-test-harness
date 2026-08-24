@@ -17,7 +17,7 @@ impl TemplateFingerprint {
             return Err(Error::InvalidTemplateFingerprint);
         }
         let mut bytes = [0_u8; FINGERPRINT_BYTES];
-        for (index, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        for (index, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             let encoded =
                 std::str::from_utf8(chunk).map_err(|_| Error::InvalidTemplateFingerprint)?;
             bytes[index] =

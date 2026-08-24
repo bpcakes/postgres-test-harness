@@ -55,11 +55,13 @@ metadata- and lock-aware sweep. Ordinary measurement errors still close the
 observer and run this sweep; if both operations fail, the primary and cleanup
 errors are reported together. Successful samples additionally require the exact
 expected cleanup counts. If asynchronous connection shutdown leaves a lock
-briefly active, the benchmark retries behind a bounded deadline. The JSON
-preserves every cleanup attempt and all dropped and skipped counters;
-unexpected leftovers fail the run. A forced process termination cannot run
-asynchronous cleanup, so use the logged project with `cleanup_stale_databases`
-to recover that exceptional case.
+briefly active, the benchmark starts more sweeps only within a 120-second retry
+window. Each mutating sweep is allowed to finish under the library's own
+operation timeout rather than being canceled mid-drop, so the retry window is
+not an end-to-end cleanup deadline. The JSON preserves every cleanup attempt
+and all dropped and skipped counters; unexpected leftovers fail the run. A
+forced process termination cannot run asynchronous cleanup, so use the logged
+project with `cleanup_stale_databases` to recover that exceptional case.
 
 ## Workload and timing boundaries
 

@@ -11,6 +11,7 @@ use std::{
     error::Error as StdError,
     fmt,
     fs::{self, File, OpenOptions},
+    future::Future,
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
     process::Command,
@@ -44,7 +45,8 @@ const DEFAULT_CONCURRENCY: usize = 4;
 const DEFAULT_CONCURRENT_OPERATIONS: usize = 8;
 const DEFAULT_DRAIN_DATABASES: usize = 4;
 const DEFAULT_REPRESENTATIVE_ROWS: usize = 50_000;
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFERRED_DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
+const EXTERNAL_CLEANUP_RETRY_WINDOW: Duration = Duration::from_secs(120);
 const EXTERNAL_CLEANUP_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 
 type AnyError = Box<dyn StdError + Send + Sync>;
@@ -54,6 +56,31 @@ type AnyResult<T> = std::result::Result<T, AnyError>;
 struct OperationAndCleanupError {
     operation: AnyError,
     cleanup: AnyError,
+}
+
+#[derive(Clone, Copy)]
+struct Deadline(tokio::time::Instant);
+
+impl Deadline {
+    fn after(duration: Duration) -> Self {
+        Self(tokio::time::Instant::now() + duration)
+    }
+
+    fn reached(self) -> bool {
+        tokio::time::Instant::now() >= self.0
+    }
+
+    async fn run<F>(self, future: F) -> std::result::Result<F::Output, tokio::time::error::Elapsed>
+    where
+        F: Future,
+    {
+        tokio::time::timeout_at(self.0, future).await
+    }
+
+    async fn sleep_up_to(self, duration: Duration) {
+        let wake_at = (tokio::time::Instant::now() + duration).min(self.0);
+        tokio::time::sleep_until(wake_at).await;
+    }
 }
 
 impl fmt::Display for OperationAndCleanupError {
@@ -188,7 +215,7 @@ impl BenchmarkConfig {
             startup_timeout_ms: millis(STARTUP_TIMEOUT),
             operation_timeout_ms: millis(OPERATION_TIMEOUT),
             template_wait_timeout_ms: millis(TEMPLATE_WAIT_TIMEOUT),
-            deferred_drain_timeout_ms: millis(DRAIN_TIMEOUT),
+            deferred_drain_timeout_ms: millis(DEFERRED_DRAIN_TIMEOUT),
             connection_budget: CONNECTION_BUDGET,
             connections_per_database: CONNECTIONS_PER_DATABASE,
             cleanup_on_start: false,
@@ -445,30 +472,29 @@ impl Observer {
     }
 
     async fn wait_until_databases_are_absent(&self, names: &[String]) -> AnyResult<()> {
-        let deadline = Instant::now() + DRAIN_TIMEOUT;
+        let deadline = Deadline::after(DEFERRED_DRAIN_TIMEOUT);
+        let mut remaining = names.len() as i64;
         loop {
-            let row = self
-                .client()
-                .query_one(
+            let row = deadline
+                .run(self.client().query_one(
                     "SELECT count(*) FROM pg_database WHERE datname = ANY($1)",
                     &[&names],
-                )
-                .await?;
-            let remaining: i64 = row.get(0);
+                ))
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!(
+                            "deferred cleanup did not drain {remaining} database(s) within {} ms",
+                            millis(DEFERRED_DRAIN_TIMEOUT)
+                        ),
+                    )
+                })??;
+            remaining = row.get(0);
             if remaining == 0 {
                 return Ok(());
             }
-            if Instant::now() >= deadline {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    format!(
-                        "deferred cleanup did not drain {remaining} database(s) within {} ms",
-                        millis(DRAIN_TIMEOUT)
-                    ),
-                )
-                .into());
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            deadline.sleep_up_to(Duration::from_millis(10)).await;
         }
     }
 
@@ -967,7 +993,7 @@ async fn cleanup_external_resources(
     project: &str,
 ) -> AnyResult<ExternalCleanupReport> {
     let started = Instant::now();
-    let deadline = started + DRAIN_TIMEOUT;
+    let retry_deadline = Deadline::after(EXTERNAL_CLEANUP_RETRY_WINDOW);
     let mut attempts = Vec::new();
     loop {
         let cleanup = cleanup_stale_databases(admin_url, project, Duration::ZERO).await?;
@@ -978,18 +1004,20 @@ async fn cleanup_external_resources(
             validate_external_sweep(&report, project)?;
             return Ok(report);
         }
-        if Instant::now() >= deadline {
+        if retry_deadline.reached() {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!(
-                    "external cleanup for project {project:?} still had {skipped_active} active resource(s) after {} attempt(s) and {} ms",
+                    "external cleanup for project {project:?} still had {skipped_active} active resource(s) after {} attempt(s) within a {} ms retry window",
                     attempts.len(),
-                    millis(DRAIN_TIMEOUT),
+                    millis(EXTERNAL_CLEANUP_RETRY_WINDOW),
                 ),
             )
             .into());
         }
-        tokio::time::sleep(EXTERNAL_CLEANUP_RETRY_INTERVAL).await;
+        retry_deadline
+            .sleep_up_to(EXTERNAL_CLEANUP_RETRY_INTERVAL)
+            .await;
     }
 }
 
@@ -1403,9 +1431,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        CleanupAttemptReport, ExternalCleanupReport, OperationAndCleanupError, ReportOutput,
-        SCHEMA_VERSION, SummaryReport, benchmark_project, combine_operation_and_cleanup,
-        summary_report, validate_completed_external_cleanup, validate_external_sweep,
+        CleanupAttemptReport, Deadline, ExternalCleanupReport, OperationAndCleanupError,
+        ReportOutput, SCHEMA_VERSION, SummaryReport, benchmark_project,
+        combine_operation_and_cleanup, summary_report, validate_completed_external_cleanup,
+        validate_external_sweep,
     };
 
     #[test]
@@ -1504,6 +1533,18 @@ mod tests {
         assert!(ReportOutput::prepare(Some(&non_directory.join("report.json"))).is_err());
 
         fs::remove_dir_all(root).expect("remove report test directory");
+    }
+
+    #[tokio::test]
+    async fn deadline_bounds_each_awaited_operation() {
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            Deadline::after(Duration::from_millis(5)).run(std::future::pending::<()>()),
+        )
+        .await
+        .expect("test guard elapsed before the benchmark deadline");
+
+        assert!(result.is_err());
     }
 
     #[test]

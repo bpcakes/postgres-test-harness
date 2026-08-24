@@ -31,7 +31,7 @@ use tokio::{sync::Semaphore, task::JoinSet};
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 const DEFAULT_IMAGE: &str = "postgres:18";
 const OUTPUT_ENV: &str = "PTH_PERF_OUTPUT";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -46,6 +46,7 @@ const DEFAULT_CONCURRENT_OPERATIONS: usize = 8;
 const DEFAULT_DRAIN_DATABASES: usize = 4;
 const DEFAULT_REPRESENTATIVE_ROWS: usize = 50_000;
 const DEFERRED_DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFERRED_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const EXTERNAL_CLEANUP_RETRY_WINDOW: Duration = Duration::from_secs(120);
 const EXTERNAL_CLEANUP_INITIAL_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const EXTERNAL_CLEANUP_MAX_RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -267,6 +268,12 @@ impl BenchmarkConfig {
             operation_timeout_ms: millis(OPERATION_TIMEOUT),
             template_wait_timeout_ms: millis(TEMPLATE_WAIT_TIMEOUT),
             deferred_drain_timeout_ms: millis(DEFERRED_DRAIN_TIMEOUT),
+            deferred_drain_poll_interval_ms: millis(DEFERRED_DRAIN_POLL_INTERVAL),
+            external_cleanup_retry_window_ms: millis(EXTERNAL_CLEANUP_RETRY_WINDOW),
+            external_cleanup_initial_retry_interval_ms: millis(
+                EXTERNAL_CLEANUP_INITIAL_RETRY_INTERVAL,
+            ),
+            external_cleanup_max_retry_interval_ms: millis(EXTERNAL_CLEANUP_MAX_RETRY_INTERVAL),
             connection_budget: CONNECTION_BUDGET,
             connections_per_database: CONNECTIONS_PER_DATABASE,
             cleanup_on_start: false,
@@ -300,6 +307,7 @@ struct EnvironmentReport {
     storage_driver: MetadataValue,
     postgres_version: String,
     postgres_version_num: i32,
+    postgres_settings: PostgresSettingsReport,
     cpu_count: usize,
     operating_system: &'static str,
     architecture: &'static str,
@@ -326,6 +334,10 @@ struct ConfigurationReport {
     operation_timeout_ms: u128,
     template_wait_timeout_ms: u128,
     deferred_drain_timeout_ms: u128,
+    deferred_drain_poll_interval_ms: u128,
+    external_cleanup_retry_window_ms: u128,
+    external_cleanup_initial_retry_interval_ms: u128,
+    external_cleanup_max_retry_interval_ms: u128,
     connection_budget: usize,
     connections_per_database: u32,
     cleanup_on_start: bool,
@@ -343,8 +355,7 @@ struct SampleReport {
 #[derive(Serialize)]
 struct StartupReport {
     elapsed_ns: u128,
-    active_admin_sessions_after_start: i64,
-    cumulative_admin_sessions_after_start: i64,
+    admin_sessions_after_observer_connect: SessionSnapshotReport,
 }
 
 #[derive(Serialize)]
@@ -353,6 +364,7 @@ struct ReadinessReport {
     container_image_content_id: Option<String>,
     postgres_version: String,
     postgres_version_num: i32,
+    postgres_settings: PostgresSettingsReport,
 }
 
 #[derive(Serialize)]
@@ -377,11 +389,63 @@ struct TimedOperation {
 #[derive(Serialize)]
 struct BatchOperation {
     operations: usize,
-    concurrency: usize,
+    method: BatchMethodReport,
     elapsed_ns: u128,
     operations_per_second: f64,
     individual_elapsed_ns: Vec<u128>,
     admin_sessions: SessionDelta,
+}
+
+#[derive(Serialize)]
+struct BatchMethodReport {
+    execution: BatchExecutionReport,
+    completion: CompletionObservationReport,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum BatchExecutionReport {
+    CallerBounded { concurrency: usize },
+    ImplementationManaged,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum CompletionObservationReport {
+    OperationReturn,
+    CatalogPolling { interval_ns: u128 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct PostgresSettingsReport {
+    fsync: bool,
+    synchronous_commit: String,
+    full_page_writes: bool,
+    max_connections: i32,
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct SessionSnapshotReport {
+    cumulative: i64,
+    active: i64,
+}
+
+impl BatchMethodReport {
+    fn caller_bounded(concurrency: usize) -> Self {
+        Self {
+            execution: BatchExecutionReport::CallerBounded { concurrency },
+            completion: CompletionObservationReport::OperationReturn,
+        }
+    }
+
+    fn implementation_managed_polling(interval: Duration) -> Self {
+        Self {
+            execution: BatchExecutionReport::ImplementationManaged,
+            completion: CompletionObservationReport::CatalogPolling {
+                interval_ns: interval.as_nanos(),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -435,12 +499,41 @@ impl SessionSnapshot {
             active_after: after.active,
         }
     }
+
+    fn report(self) -> SessionSnapshotReport {
+        SessionSnapshotReport {
+            cumulative: self.cumulative,
+            active: self.active,
+        }
+    }
 }
 
 struct ServerMetadata {
     version: String,
     version_num: i32,
     postmaster_started_at: String,
+    settings: PostgresSettingsReport,
+}
+
+impl ServerMetadata {
+    fn ensure_comparable_environment(&self, other: &Self) -> AnyResult<()> {
+        if self.version == other.version
+            && self.version_num == other.version_num
+            && self.settings == other.settings
+        {
+            return Ok(());
+        }
+        Err(io::Error::other(format!(
+            "PostgreSQL environment changed between observations: version {:?} ({}) with settings {:?} became {:?} ({}) with settings {:?}",
+            self.version,
+            self.version_num,
+            self.settings,
+            other.version,
+            other.version_num,
+            other.settings,
+        ))
+        .into())
+    }
 }
 
 struct SampleMeasurements {
@@ -493,7 +586,11 @@ impl Observer {
             self.client().query_one(
                 "SELECT current_setting('server_version'),
                         current_setting('server_version_num')::integer,
-                        pg_postmaster_start_time()::text",
+                        pg_postmaster_start_time()::text,
+                        current_setting('fsync')::boolean,
+                        current_setting('synchronous_commit'),
+                        current_setting('full_page_writes')::boolean,
+                        current_setting('max_connections')::integer",
                 &[],
             ),
         )
@@ -502,6 +599,12 @@ impl Observer {
             version: row.get(0),
             version_num: row.get(1),
             postmaster_started_at: row.get(2),
+            settings: PostgresSettingsReport {
+                fsync: row.get(3),
+                synchronous_commit: row.get(4),
+                full_page_writes: row.get(5),
+                max_connections: row.get(6),
+            },
         })
     }
 
@@ -563,7 +666,7 @@ impl Observer {
             if remaining == 0 {
                 return Ok(());
             }
-            deadline.sleep_up_to(Duration::from_millis(10)).await;
+            deadline.sleep_up_to(DEFERRED_DRAIN_POLL_INTERVAL).await;
         }
     }
 
@@ -677,7 +780,7 @@ async fn main() -> AnyResult<()> {
     );
 
     let mut samples = Vec::with_capacity(config.samples);
-    let mut first_server_metadata = None;
+    let mut first_server_metadata: Option<ServerMetadata> = None;
     for sample in 1..=config.samples {
         eprintln!("sample {sample}/{}", config.samples);
         let (report, metadata) = run_sample(
@@ -687,7 +790,11 @@ async fn main() -> AnyResult<()> {
             expected_owned_image_content_id,
         )
         .await?;
-        first_server_metadata.get_or_insert(metadata);
+        if let Some(first) = &first_server_metadata {
+            first.ensure_comparable_environment(&metadata)?;
+        } else {
+            first_server_metadata = Some(metadata);
+        }
         samples.push(report);
     }
 
@@ -706,11 +813,12 @@ async fn main() -> AnyResult<()> {
             storage_driver,
             postgres_version: metadata.version,
             postgres_version_num: metadata.version_num,
+            postgres_settings: metadata.settings,
             cpu_count: std::thread::available_parallelism()?.get(),
             operating_system: env::consts::OS,
             architecture: env::consts::ARCH,
             readiness_contract: "PostgresHarness::start returned after a mapped TCP admin connection and PostgreSQL 18 validation; the observer then retained that final-server TCP session across a follow-up probe",
-            admin_session_counter_scope: "pg_stat_database.sessions for the administrative database; exact for an owned server and potentially affected by ambient traffic on a shared external server",
+            admin_session_counter_scope: "pg_stat_database.sessions for the administrative database; the startup snapshot is taken after the persistent observer connects, phase deltas retain that same observer at both endpoints, and shared external servers may include ambient traffic",
         },
         configuration: config.report(),
         samples,
@@ -719,6 +827,7 @@ async fn main() -> AnyResult<()> {
             "Durations are observations, never pass/fail thresholds.",
             "Owned startup requires a cached image and excludes image-pull time.",
             "Deferred cleanup drain ends only after every dropped lease name is absent from pg_database.",
+            "Deferred cleanup completion is observed by catalog polling; the recorded interval describes detection granularity, not a latency threshold.",
             "Run both modes under comparable load and compare the versioned JSON output; URLs and credentials are never recorded.",
         ],
     };
@@ -811,6 +920,7 @@ async fn measure_with_observer(
         )
         .into());
     }
+    server_metadata.ensure_comparable_environment(&stable_metadata)?;
     let startup_sessions = observer.session_snapshot().await?;
 
     let fixtures = vec![
@@ -829,14 +939,14 @@ async fn measure_with_observer(
             sample,
             server_startup: StartupReport {
                 elapsed_ns: startup_elapsed.as_nanos(),
-                active_admin_sessions_after_start: startup_sessions.active,
-                cumulative_admin_sessions_after_start: startup_sessions.cumulative,
+                admin_sessions_after_observer_connect: startup_sessions.report(),
             },
             readiness: ReadinessReport {
                 postmaster_started_at: server_metadata.postmaster_started_at.clone(),
                 container_image_content_id,
                 postgres_version: server_metadata.version.clone(),
                 postgres_version_num: server_metadata.version_num,
+                postgres_settings: server_metadata.settings.clone(),
             },
             fixtures: fixture_reports,
             external_stale_cleanup: None,
@@ -984,7 +1094,7 @@ async fn run_sequential(
     let after = observer.session_snapshot().await?;
     Ok(batch_operation(
         operations,
-        1,
+        BatchMethodReport::caller_bounded(1),
         elapsed,
         individual,
         before.delta(after),
@@ -1020,7 +1130,7 @@ async fn run_bounded_concurrent(
     let after = observer.session_snapshot().await?;
     Ok(batch_operation(
         operations,
-        concurrency,
+        BatchMethodReport::caller_bounded(concurrency),
         elapsed,
         individual,
         before.delta(after),
@@ -1054,7 +1164,7 @@ async fn run_explicit_drain(
     let after = observer.session_snapshot().await?;
     Ok(batch_operation(
         databases,
-        databases,
+        BatchMethodReport::caller_bounded(databases),
         elapsed,
         individual,
         before.delta(after),
@@ -1081,7 +1191,7 @@ async fn run_deferred_drain(
     let after = observer.session_snapshot().await?;
     Ok(batch_operation(
         databases,
-        1,
+        BatchMethodReport::implementation_managed_polling(DEFERRED_DRAIN_POLL_INTERVAL),
         elapsed,
         Vec::new(),
         before.delta(after),
@@ -1090,14 +1200,14 @@ async fn run_deferred_drain(
 
 fn batch_operation(
     operations: usize,
-    concurrency: usize,
+    method: BatchMethodReport,
     elapsed: Duration,
     individual_elapsed_ns: Vec<u128>,
     admin_sessions: SessionDelta,
 ) -> BatchOperation {
     BatchOperation {
         operations,
-        concurrency,
+        method,
         elapsed_ns: elapsed.as_nanos(),
         operations_per_second: operations as f64 / elapsed.as_secs_f64(),
         individual_elapsed_ns,
@@ -1549,8 +1659,9 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        CleanupAttemptReport, ExternalCleanupReport, Observer, OperationAndCleanupError,
-        ReportOutput, RetryBackoff, SCHEMA_VERSION, ServerMode, SummaryReport, benchmark_project,
+        BatchMethodReport, CleanupAttemptReport, ExternalCleanupReport, Observer,
+        OperationAndCleanupError, PostgresSettingsReport, ReportOutput, RetryBackoff,
+        SCHEMA_VERSION, ServerMode, SessionSnapshotReport, SummaryReport, benchmark_project,
         combine_operation_and_cleanup, run_observer_operation, summary_report,
         validate_completed_external_cleanup, validate_external_sweep,
     };
@@ -1724,7 +1835,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_projects_are_random_valid_names_and_schema_change_is_explicit() {
+    fn generated_projects_are_random_valid_names() {
         let projects = (0..64).map(|_| benchmark_project()).collect::<HashSet<_>>();
         assert_eq!(projects.len(), 64);
         assert!(
@@ -1734,6 +1845,51 @@ mod tests {
         );
         assert!(projects.iter().all(|project| project.starts_with("pghp_")));
         assert!(projects.iter().all(|project| project.len() == 16));
-        assert_eq!(SCHEMA_VERSION, 3);
+    }
+
+    #[test]
+    fn schema_v4_encodes_measurement_method_and_provenance() {
+        assert_eq!(SCHEMA_VERSION, 4);
+        assert_eq!(
+            serde_json::to_value(BatchMethodReport::caller_bounded(4))
+                .expect("serialize caller-bounded method"),
+            serde_json::json!({
+                "execution": { "kind": "caller_bounded", "concurrency": 4 },
+                "completion": { "kind": "operation_return" }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(BatchMethodReport::implementation_managed_polling(
+                Duration::from_millis(10),
+            ))
+            .expect("serialize implementation-managed method"),
+            serde_json::json!({
+                "execution": { "kind": "implementation_managed" },
+                "completion": { "kind": "catalog_polling", "interval_ns": 10_000_000 }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(PostgresSettingsReport {
+                fsync: true,
+                synchronous_commit: "on".to_owned(),
+                full_page_writes: true,
+                max_connections: 100,
+            })
+            .expect("serialize PostgreSQL settings"),
+            serde_json::json!({
+                "fsync": true,
+                "synchronous_commit": "on",
+                "full_page_writes": true,
+                "max_connections": 100
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(SessionSnapshotReport {
+                cumulative: 7,
+                active: 1,
+            })
+            .expect("serialize startup session snapshot"),
+            serde_json::json!({ "cumulative": 7, "active": 1 })
+        );
     }
 }

@@ -74,8 +74,14 @@ jobs:
             "## Performance characterization (`" + .environment.mode + "`)",
             "",
             "PostgreSQL: `" + .environment.postgres_version + "`  ",
+            "PostgreSQL settings: `fsync=" + (.environment.postgres_settings.fsync | tostring)
+              + ", synchronous_commit=" + .environment.postgres_settings.synchronous_commit
+              + ", full_page_writes=" + (.environment.postgres_settings.full_page_writes | tostring)
+              + ", max_connections=" + (.environment.postgres_settings.max_connections | tostring) + "`  ",
             "Image content ID: `" + (.environment.image_content_id.value // "not reported") + "`  ",
             "Storage: `" + (.environment.storage_driver.value // "not reported") + "`  ",
+            "Deferred completion observation: catalog polling every `"
+              + (.configuration.deferred_drain_poll_interval_ms | tostring) + " ms`  ",
             "",
             "| Metric | Fixture | Min ms | Median ms | Mean ms | Max ms |",
             "| --- | --- | ---: | ---: | ---: | ---: |",

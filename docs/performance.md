@@ -49,6 +49,10 @@ metadata variables are optional provenance supplied by the operator. Supply
 the same Docker content-ID kind used by owned mode, rather than a registry
 manifest digest. Their fields remain present with a
 `not_reported_for_external_server` source when the values are unavailable.
+The benchmark discovers `fsync`, `synchronous_commit`, `full_page_writes`, and
+`max_connections` from PostgreSQL itself. Treat reports with different values
+as different environments rather than attributing the difference to harness
+mode.
 
 An external run disables the startup stale sweep so that unrelated cleanup is
 not folded into startup. Each invocation uses a random, valid project namespace
@@ -97,16 +101,18 @@ The JSON records these boundaries for every sample and fixture:
   caller-side semaphore. Total elapsed time, throughput, and each operation's
   elapsed time are recorded.
 - `explicit_cleanup_drain`: creates the configured leases before timing, then
-  awaits their explicit cleanups concurrently. Its `concurrency` field equals
-  the configured drain count.
+  awaits their explicit cleanups concurrently. Its `method.execution` is
+  `caller_bounded` and records the configured drain count as its concurrency.
 - `deferred_cleanup_drain`: creates the configured leases before timing, drops
   all of them, and ends only after a persistent observer confirms every exact
   database name is absent from `pg_database`. The 120-second guard prevents a
-  broken run from hanging; it is not a benchmark threshold. On the characterized
-  implementation this path uses one serial fallback worker and 10 ms polling,
-  so it is not an apples-to-apples latency comparison with the concurrent
-  explicit drain. Its purpose is to record caller-to-final-drain behavior for
-  PERF04.
+  broken run from hanging; it is not a benchmark threshold. Its execution is
+  reported as `implementation_managed`, because the public API does not promise
+  worker concurrency. Completion is reported separately as `catalog_polling`
+  with a 10 ms interval; that interval is observation granularity, not measured
+  work or a latency threshold. This is therefore not an apples-to-apples latency
+  comparison with the concurrent explicit drain. Its purpose is to record
+  caller-to-observed-final-drain behavior for PERF04.
 
 One persistent observer connection reads `pg_stat_database.sessions` before
 and after every phase. The report includes the cumulative values, delta, and
@@ -116,14 +122,21 @@ the single-purpose owned server. On a shared external server it is intentionally
 labeled server-wide and can include ambient clients, so run under controlled
 load or interpret it as an upper bound. A server-side statistics reset during a
 phase can also invalidate a delta; retain the raw before/after counters.
+The startup field is explicitly named
+`admin_sessions_after_observer_connect`: it is an untimed post-start snapshot
+and includes the observer itself, while each phase delta keeps the same
+observer at both endpoints.
 Observer connection, query, and shutdown awaits use the same 90-second
 operation timeout recorded for the harness, so a silent external server cannot
 leave a local characterization waiting indefinitely.
 
 The top-level report also records the source commit and worktree state,
-PostgreSQL version, postmaster start, logical CPU count, OS, architecture,
-server mode, image metadata, storage driver, fixture rows, concurrency, sample
-counts, connection budget, per-database permits, timeouts, and cleanup policy.
+PostgreSQL version and critical settings, postmaster start, logical CPU count,
+OS, architecture, server mode, image metadata, storage driver, fixture rows,
+execution and completion methods, concurrency where caller-controlled, sample
+counts, connection budget, per-database permits, timeouts, polling interval,
+and cleanup retry policy. These provenance additions are report schema version
+4; consumers should branch on `schema_version`.
 
 ## Configuration
 

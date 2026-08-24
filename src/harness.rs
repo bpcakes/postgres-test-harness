@@ -66,7 +66,14 @@ impl PostgresHarness {
         self.server.container_id()
     }
 
-    /// Removes an owned container immediately. External servers are untouched.
+    /// Closes database admission and removes an owned container immediately.
+    ///
+    /// Admission remains closed after the first owned shutdown attempt, even
+    /// if container removal fails. External servers and their admission remain
+    /// untouched. Repeated and concurrent calls do not retry removal; the call
+    /// that completes the terminal worker reports any removal error, while
+    /// later calls observe completed shutdown. Active leases remain owned but
+    /// can no longer contact a successfully removed server.
     pub async fn shutdown(&self) -> Result<()> {
         self.server.shutdown_container().await
     }

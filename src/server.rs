@@ -141,11 +141,21 @@ impl ServerInner {
     }
 
     pub(crate) async fn shutdown_container(&self) -> Result<()> {
-        let Some(container) = self.container.clone() else {
+        let Some(container) = begin_owned_container_shutdown(self.container.as_ref(), &self.budget)
+        else {
             return Ok(());
         };
         run_blocking(move || container.shutdown()).await
     }
+}
+
+fn begin_owned_container_shutdown(
+    container: Option<&Arc<ContainerOwner>>,
+    budget: &Semaphore,
+) -> Option<Arc<ContainerOwner>> {
+    let container = container?.clone();
+    budget.close();
+    Some(container)
 }
 
 pub(crate) async fn run_blocking<T, F>(operation: F) -> Result<T>
@@ -362,7 +372,10 @@ mod tests {
         time::Duration,
     };
 
-    use super::{ContainerOwner, ContainerWorker, ServerInner, ipv4_mapped_container_host};
+    use super::{
+        ContainerOwner, ContainerWorker, ServerInner, begin_owned_container_shutdown,
+        ipv4_mapped_container_host,
+    };
     use crate::{Error, HarnessConfig, admin::AdminDatabaseUrl};
 
     fn test_container_owner(
@@ -412,6 +425,56 @@ mod tests {
         };
 
         assert!(matches!(error, Error::InvalidConfiguration { .. }));
+    }
+
+    #[tokio::test]
+    async fn owned_shutdown_closes_admission_and_wakes_waiters() {
+        let container = test_container_owner(|shutdown| {
+            shutdown.recv().unwrap();
+            Ok(())
+        });
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let active_permit = budget.clone().acquire_owned().await.unwrap();
+        let waiting_budget = budget.clone();
+        let waiter = tokio::spawn(async move { waiting_budget.acquire_owned().await });
+        tokio::task::yield_now().await;
+
+        let owned = begin_owned_container_shutdown(Some(&container), &budget)
+            .expect("owned container should begin shutdown");
+
+        assert!(budget.is_closed());
+        assert!(waiter.await.unwrap().is_err());
+        assert!(owned.shutdown().is_ok());
+        drop(active_permit);
+        assert!(budget.clone().acquire_owned().await.is_err());
+    }
+
+    #[test]
+    fn external_shutdown_keeps_admission_open() {
+        let budget = tokio::sync::Semaphore::new(1);
+
+        assert!(begin_owned_container_shutdown(None, &budget).is_none());
+        assert!(!budget.is_closed());
+        assert_eq!(budget.available_permits(), 1);
+    }
+
+    #[test]
+    fn failed_owned_shutdown_keeps_admission_terminal() {
+        let container = test_container_owner(|shutdown| {
+            shutdown.recv().unwrap();
+            Err(testcontainers::TestcontainersError::other(
+                "forced removal failure",
+            ))
+        });
+        let budget = tokio::sync::Semaphore::new(1);
+
+        let owned = begin_owned_container_shutdown(Some(&container), &budget).unwrap();
+        assert!(matches!(
+            owned.shutdown().unwrap_err(),
+            Error::ContainerRemove { .. }
+        ));
+        assert!(budget.is_closed());
+        assert!(container.shutdown().is_ok());
     }
 
     #[test]

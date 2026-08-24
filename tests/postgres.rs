@@ -639,14 +639,62 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         .await
         .expect("start external-server harness");
         assert!(external.is_external());
+        external
+            .shutdown()
+            .await
+            .expect("external shutdown should be a no-op");
         let external_database = external
             .empty_database()
             .await
-            .expect("create external-mode database");
+            .expect("create external-mode database after no-op shutdown");
         external_database
             .cleanup()
             .await
             .expect("clean external-mode database");
+    }
+
+    {
+        let shutdown_harness = PostgresHarness::start(
+            HarnessConfig::new("shutdown_it")
+                .unwrap()
+                .with_connection_budget(1)
+                .unwrap()
+                .with_connections_per_database(1)
+                .unwrap()
+                .with_cleanup_on_start(false),
+        )
+        .await
+        .expect("start owned-shutdown harness");
+        let active_database = shutdown_harness
+            .empty_database()
+            .await
+            .expect("saturate owned-shutdown admission");
+        let waiting_harness = shutdown_harness.clone();
+        let waiter = tokio::spawn(async move { waiting_harness.empty_database().await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let concurrent_harness = shutdown_harness.clone();
+        let (first_shutdown, second_shutdown) =
+            tokio::join!(shutdown_harness.shutdown(), concurrent_harness.shutdown());
+        first_shutdown.expect("first owned shutdown");
+        second_shutdown.expect("concurrent owned shutdown");
+        let waiter_error = match tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("owned shutdown should wake queued admission")
+            .expect("queued database task should not panic")
+        {
+            Ok(_) => panic!("queued database admission must not outlive owned shutdown"),
+            Err(error) => error,
+        };
+        assert!(matches!(waiter_error, Error::ConnectionBudgetClosed));
+        shutdown_harness
+            .shutdown()
+            .await
+            .expect("repeated owned shutdown");
+        assert!(
+            active_database.cleanup().await.is_err(),
+            "an active lease remains owned but cannot contact a removed server"
+        );
     }
 
     harness

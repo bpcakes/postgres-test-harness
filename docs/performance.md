@@ -46,11 +46,17 @@ values are unavailable.
 
 An external run disables the startup stale sweep so that unrelated cleanup is
 not folded into startup. Each invocation uses a random, valid project namespace
-to isolate concurrent local runs. After each sample releases its owner and
-template locks, it runs a zero-age, metadata- and lock-aware sweep. If
-asynchronous connection shutdown leaves a lock briefly active, the benchmark
-retries behind a bounded deadline. The JSON preserves every cleanup attempt and
-all dropped and skipped counters; unexpected leftovers fail the run.
+to isolate concurrent local runs and prints it before starting database work.
+After each sample releases its owner and template locks, it runs a zero-age,
+metadata- and lock-aware sweep. Ordinary measurement errors still close the
+observer and run this sweep; if both operations fail, the primary and cleanup
+errors are reported together. Successful samples additionally require the exact
+expected cleanup counts. If asynchronous connection shutdown leaves a lock
+briefly active, the benchmark retries behind a bounded deadline. The JSON
+preserves every cleanup attempt and all dropped and skipped counters;
+unexpected leftovers fail the run. A forced process termination cannot run
+asynchronous cleanup, so use the logged project with `cleanup_stale_databases`
+to recover that exceptional case.
 
 ## Workload and timing boundaries
 

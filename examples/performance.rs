@@ -9,6 +9,7 @@ use std::{
     collections::BTreeMap,
     env,
     error::Error as StdError,
+    fmt,
     fs::{self, File},
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
@@ -49,11 +50,39 @@ const EXTERNAL_CLEANUP_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 type AnyError = Box<dyn StdError + Send + Sync>;
 type AnyResult<T> = std::result::Result<T, AnyError>;
 
+#[derive(Debug)]
+struct OperationAndCleanupError {
+    operation: AnyError,
+    cleanup: AnyError,
+}
+
+impl fmt::Display for OperationAndCleanupError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}; cleanup also failed: {}",
+            self.operation, self.cleanup
+        )
+    }
+}
+
+impl StdError for OperationAndCleanupError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(self.operation.as_ref())
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ServerMode {
     Owned,
     External,
+}
+
+#[derive(Clone, Copy)]
+enum ExternalCleanupValidation {
+    CompletedSample { expected_templates: usize },
+    FailedSample,
 }
 
 impl ServerMode {
@@ -494,7 +523,8 @@ async fn main() -> AnyResult<()> {
     let expected_owned_image_digest = image_digest.value.as_deref();
 
     eprintln!(
-        "postgres-test-harness performance: mode={}, samples={}, sequential={}, concurrent={} at {}, drains={}",
+        "postgres-test-harness performance: project={}, mode={}, samples={}, sequential={}, concurrent={} at {}, drains={}",
+        config.project,
         config.mode.as_str(),
         config.samples,
         config.sequential_operations,
@@ -559,7 +589,7 @@ async fn run_sample(
     let harness = PostgresHarness::start(config.harness_config()?).await?;
     let startup_elapsed = startup_started.elapsed();
     let admin_url = harness.admin_database_url().to_owned();
-    let mut measurements = measure_started_sample(
+    let measurements = measure_started_sample(
         config,
         &harness,
         invocation,
@@ -567,10 +597,16 @@ async fn run_sample(
         startup_elapsed,
         expected_owned_image_digest,
     )
-    .await?;
-    let expected_templates = measurements.report.fixtures.len();
-    measurements.report.external_stale_cleanup =
-        finalize_successful_sample(config, harness, &admin_url, expected_templates).await?;
+    .await;
+    let validation = match &measurements {
+        Ok(measurements) => ExternalCleanupValidation::CompletedSample {
+            expected_templates: measurements.report.fixtures.len(),
+        },
+        Err(_) => ExternalCleanupValidation::FailedSample,
+    };
+    let cleanup = finalize_sample(config, harness, &admin_url, validation).await;
+    let (mut measurements, cleanup) = combine_operation_and_cleanup(measurements, cleanup)?;
+    measurements.report.external_stale_cleanup = cleanup;
 
     Ok((measurements.report, measurements.server_metadata))
 }
@@ -587,6 +623,30 @@ async fn measure_started_sample(
         verify_started_image(&config.mode, harness, expected_owned_image_digest)?;
     let admin_url = harness.admin_database_url().to_owned();
     let observer = Observer::connect(&admin_url).await?;
+    let measurements = measure_with_observer(
+        config,
+        harness,
+        &observer,
+        invocation,
+        sample,
+        startup_elapsed,
+        container_image_digest,
+    )
+    .await;
+    let closed = observer.close().await;
+    let (measurements, ()) = combine_operation_and_cleanup(measurements, closed)?;
+    Ok(measurements)
+}
+
+async fn measure_with_observer(
+    config: &BenchmarkConfig,
+    harness: &PostgresHarness,
+    observer: &Observer,
+    invocation: &str,
+    sample: usize,
+    startup_elapsed: Duration,
+    container_image_digest: Option<String>,
+) -> AnyResult<SampleMeasurements> {
     let server_metadata = observer.server_metadata().await?;
     let first_postmaster_start = server_metadata.postmaster_started_at.clone();
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -607,10 +667,9 @@ async fn measure_started_sample(
     for fixture in &fixtures {
         eprintln!("  fixture {}", fixture.name);
         fixture_reports
-            .push(run_fixture(config, harness, &observer, fixture, invocation, sample).await?);
+            .push(run_fixture(config, harness, observer, fixture, invocation, sample).await?);
     }
 
-    observer.close().await?;
     Ok(SampleMeasurements {
         report: SampleReport {
             sample,
@@ -632,11 +691,11 @@ async fn measure_started_sample(
     })
 }
 
-async fn finalize_successful_sample(
+async fn finalize_sample(
     config: &BenchmarkConfig,
     harness: PostgresHarness,
     admin_url: &str,
-    expected_templates: usize,
+    validation: ExternalCleanupValidation,
 ) -> AnyResult<Option<ExternalCleanupReport>> {
     let cleanup = match config.mode {
         ServerMode::Owned => {
@@ -646,7 +705,11 @@ async fn finalize_successful_sample(
         }
         ServerMode::External => {
             drop(harness);
-            Some(cleanup_external_resources(admin_url, &config.project, expected_templates).await?)
+            let cleanup = cleanup_external_resources(admin_url, &config.project).await?;
+            if let ExternalCleanupValidation::CompletedSample { expected_templates } = validation {
+                validate_completed_external_cleanup(&cleanup, &config.project, expected_templates)?;
+            }
+            Some(cleanup)
         }
     };
     Ok(cleanup)
@@ -890,7 +953,6 @@ fn batch_operation(
 async fn cleanup_external_resources(
     admin_url: &str,
     project: &str,
-    expected_templates: usize,
 ) -> AnyResult<ExternalCleanupReport> {
     let started = Instant::now();
     let deadline = started + DRAIN_TIMEOUT;
@@ -901,25 +963,7 @@ async fn cleanup_external_resources(
         attempts.push(CleanupAttemptReport::from_cleanup(cleanup));
         if skipped_active == 0 {
             let report = ExternalCleanupReport::from_attempts(started.elapsed(), attempts);
-            let final_attempt = report
-                .attempts
-                .last()
-                .expect("external cleanup always records at least one attempt");
-            if report.dropped_test_databases != 0
-                || report.dropped_templates != expected_templates
-                || final_attempt.skipped_fresh != 0
-                || final_attempt.skipped_unrecognized != 0
-            {
-                return Err(io::Error::other(format!(
-                    "external cleanup for project {project:?} was incomplete: dropped {} test database(s) and {} of {expected_templates} template(s); final skips: active={}, fresh={}, unrecognized={}",
-                    report.dropped_test_databases,
-                    report.dropped_templates,
-                    final_attempt.skipped_active,
-                    final_attempt.skipped_fresh,
-                    final_attempt.skipped_unrecognized,
-                ))
-                .into());
-            }
+            validate_external_sweep(&report, project)?;
             return Ok(report);
         }
         if Instant::now() >= deadline {
@@ -935,6 +979,38 @@ async fn cleanup_external_resources(
         }
         tokio::time::sleep(EXTERNAL_CLEANUP_RETRY_INTERVAL).await;
     }
+}
+
+fn validate_external_sweep(report: &ExternalCleanupReport, project: &str) -> AnyResult<()> {
+    let final_attempt = report
+        .attempts
+        .last()
+        .expect("external cleanup always records at least one attempt");
+    if final_attempt.skipped_fresh == 0 && final_attempt.skipped_unrecognized == 0 {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "external cleanup for project {project:?} left unexpected resources; final skips: active={}, fresh={}, unrecognized={}",
+        final_attempt.skipped_active,
+        final_attempt.skipped_fresh,
+        final_attempt.skipped_unrecognized,
+    ))
+    .into())
+}
+
+fn validate_completed_external_cleanup(
+    report: &ExternalCleanupReport,
+    project: &str,
+    expected_templates: usize,
+) -> AnyResult<()> {
+    if report.dropped_test_databases == 0 && report.dropped_templates == expected_templates {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "external cleanup for completed project {project:?} dropped {} unexpected test database(s) and {} of {expected_templates} template(s)",
+        report.dropped_test_databases, report.dropped_templates,
+    ))
+    .into())
 }
 
 impl CleanupAttemptReport {
@@ -1116,6 +1192,20 @@ fn invalid_input(message: impl Into<String>) -> AnyError {
     io::Error::new(io::ErrorKind::InvalidInput, message.into()).into()
 }
 
+fn combine_operation_and_cleanup<T, C>(
+    operation: AnyResult<T>,
+    cleanup: AnyResult<C>,
+) -> AnyResult<(T, C)> {
+    match (operation, cleanup) {
+        (Ok(value), Ok(cleanup)) => Ok((value, cleanup)),
+        (Err(operation), Ok(_)) => Err(operation),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(operation), Err(cleanup)) => {
+            Err(Box::new(OperationAndCleanupError { operation, cleanup }))
+        }
+    }
+}
+
 fn summarize(samples: &[SampleReport]) -> Vec<SummaryReport> {
     let mut observations: BTreeMap<(String, Option<&'static str>), Vec<u128>> = BTreeMap::new();
     for sample in samples {
@@ -1215,13 +1305,14 @@ fn ns_to_ms(nanoseconds: u128) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, time::Duration};
+    use std::{collections::HashSet, io, time::Duration};
 
     use postgres_test_harness::ProjectName;
 
     use super::{
-        CleanupAttemptReport, ExternalCleanupReport, SCHEMA_VERSION, SummaryReport,
-        benchmark_project, summary_report,
+        CleanupAttemptReport, ExternalCleanupReport, OperationAndCleanupError, SCHEMA_VERSION,
+        SummaryReport, benchmark_project, combine_operation_and_cleanup, summary_report,
+        validate_completed_external_cleanup, validate_external_sweep,
     };
 
     #[test]
@@ -1268,6 +1359,27 @@ mod tests {
         assert_eq!(report.attempts.len(), 2);
         assert_eq!(report.attempts[0].skipped_active, 1);
         assert_eq!(report.attempts[1].skipped_active, 0);
+        assert!(validate_external_sweep(&report, "project").is_ok());
+        assert!(validate_completed_external_cleanup(&report, "project", 2).is_ok());
+    }
+
+    #[test]
+    fn cleanup_failure_preserves_the_operation_error() {
+        let error = combine_operation_and_cleanup::<(), ()>(
+            Err(io::Error::other("measurement failed").into()),
+            Err(io::Error::other("cleanup failed").into()),
+        )
+        .expect_err("both failures must be reported");
+        let combined = error
+            .downcast_ref::<OperationAndCleanupError>()
+            .expect("combined error retains both failures");
+
+        assert_eq!(combined.operation.to_string(), "measurement failed");
+        assert_eq!(combined.cleanup.to_string(), "cleanup failed");
+        assert_eq!(
+            error.to_string(),
+            "measurement failed; cleanup also failed: cleanup failed"
+        );
     }
 
     #[test]

@@ -99,7 +99,7 @@ impl StdError for OperationAndCleanupError {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ServerMode {
     Owned,
@@ -113,12 +113,40 @@ enum ExternalCleanupValidation {
 }
 
 impl ServerMode {
-    fn detect() -> Self {
-        if env::var_os(POSTGRES_TEST_ADMIN_URL_ENV).is_some() {
+    fn detect() -> AnyResult<Self> {
+        Self::from_admin_url_environment(env::var(POSTGRES_TEST_ADMIN_URL_ENV))
+    }
+
+    fn from_admin_url_environment(
+        admin_url: std::result::Result<String, env::VarError>,
+    ) -> AnyResult<Self> {
+        match admin_url {
+            Ok(_) => Ok(Self::External),
+            Err(env::VarError::NotPresent) => Ok(Self::Owned),
+            Err(env::VarError::NotUnicode(_)) => Err(invalid_input(format!(
+                "{POSTGRES_TEST_ADMIN_URL_ENV} must be valid UTF-8"
+            ))),
+        }
+    }
+
+    fn from_harness(harness: &PostgresHarness) -> Self {
+        if harness.is_external() {
             Self::External
         } else {
             Self::Owned
         }
+    }
+
+    fn ensure_matches(self, actual: Self) -> AnyResult<()> {
+        if self == actual {
+            return Ok(());
+        }
+        Err(io::Error::other(format!(
+            "requested {} benchmark mode, but the started harness is {}",
+            self.as_str(),
+            actual.as_str()
+        ))
+        .into())
     }
 
     fn as_str(&self) -> &'static str {
@@ -147,7 +175,7 @@ impl BenchmarkConfig {
     fn from_environment(project: String) -> AnyResult<Self> {
         let config = Self {
             project,
-            mode: ServerMode::detect(),
+            mode: ServerMode::detect()?,
             image: env::var(POSTGRES_TEST_IMAGE_ENV).unwrap_or_else(|_| DEFAULT_IMAGE.to_owned()),
             output: env::var_os(OUTPUT_ENV).map(PathBuf::from),
             samples: positive_env("PTH_PERF_SAMPLES", DEFAULT_SAMPLES)?,
@@ -595,7 +623,7 @@ async fn main() -> AnyResult<()> {
         generated_at_unix_ms,
         source,
         environment: EnvironmentReport {
-            mode: config.mode.clone(),
+            mode: config.mode,
             image_reference: matches!(config.mode, ServerMode::Owned).then(|| config.image.clone()),
             image_content_id,
             storage_driver,
@@ -632,22 +660,28 @@ async fn run_sample(
     let harness = PostgresHarness::start(config.harness_config()?).await?;
     let startup_elapsed = startup_started.elapsed();
     let admin_url = harness.admin_database_url().to_owned();
-    let measurements = measure_started_sample(
-        config,
-        &harness,
-        invocation,
-        sample,
-        startup_elapsed,
-        expected_owned_image_content_id,
-    )
-    .await;
+    let actual_mode = ServerMode::from_harness(&harness);
+    let measurements = match config.mode.ensure_matches(actual_mode) {
+        Ok(()) => {
+            measure_started_sample(
+                config,
+                &harness,
+                invocation,
+                sample,
+                startup_elapsed,
+                expected_owned_image_content_id,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    };
     let validation = match &measurements {
         Ok(measurements) => ExternalCleanupValidation::CompletedSample {
             expected_templates: measurements.report.fixtures.len(),
         },
         Err(_) => ExternalCleanupValidation::FailedSample,
     };
-    let cleanup = finalize_sample(config, harness, &admin_url, validation).await;
+    let cleanup = finalize_sample(config, actual_mode, harness, &admin_url, validation).await;
     let (mut measurements, cleanup) = combine_operation_and_cleanup(measurements, cleanup)?;
     measurements.report.external_stale_cleanup = cleanup;
 
@@ -663,7 +697,7 @@ async fn measure_started_sample(
     expected_owned_image_content_id: Option<&str>,
 ) -> AnyResult<SampleMeasurements> {
     let container_image_content_id =
-        verify_started_image(&config.mode, harness, expected_owned_image_content_id)?;
+        verify_started_image(harness, expected_owned_image_content_id)?;
     let admin_url = harness.admin_database_url().to_owned();
     let observer = Observer::connect(&admin_url).await?;
     let measurements = measure_with_observer(
@@ -736,11 +770,12 @@ async fn measure_with_observer(
 
 async fn finalize_sample(
     config: &BenchmarkConfig,
+    actual_mode: ServerMode,
     harness: PostgresHarness,
     admin_url: &str,
     validation: ExternalCleanupValidation,
 ) -> AnyResult<Option<ExternalCleanupReport>> {
-    let cleanup = match config.mode {
+    let cleanup = match actual_mode {
         ServerMode::Owned => {
             harness.shutdown().await?;
             drop(harness);
@@ -1093,13 +1128,12 @@ fn benchmark_project() -> String {
 }
 
 fn verify_started_image(
-    mode: &ServerMode,
     harness: &PostgresHarness,
     expected_content_id: Option<&str>,
 ) -> AnyResult<Option<String>> {
-    let ServerMode::Owned = mode else {
+    if harness.is_external() {
         return Ok(None);
-    };
+    }
     let expected_content_id = expected_content_id.ok_or_else(|| {
         invalid_input("owned benchmark did not resolve a cached image content ID before startup")
     })?;
@@ -1430,14 +1464,14 @@ fn ns_to_ms(nanoseconds: u128) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, fs, io, time::Duration};
+    use std::{collections::HashSet, ffi::OsString, fs, io, time::Duration};
 
     use postgres_test_harness::ProjectName;
     use uuid::Uuid;
 
     use super::{
         CleanupAttemptReport, Deadline, ExternalCleanupReport, OperationAndCleanupError,
-        ReportOutput, SCHEMA_VERSION, SummaryReport, benchmark_project,
+        ReportOutput, SCHEMA_VERSION, ServerMode, SummaryReport, benchmark_project,
         combine_operation_and_cleanup, summary_report, validate_completed_external_cleanup,
         validate_external_sweep,
     };
@@ -1506,6 +1540,31 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "measurement failed; cleanup also failed: cleanup failed"
+        );
+    }
+
+    #[test]
+    fn requested_mode_rejects_invalid_environment_and_detects_mismatches() {
+        assert_eq!(
+            ServerMode::from_admin_url_environment(Err(std::env::VarError::NotPresent))
+                .expect("missing admin URL selects owned mode"),
+            ServerMode::Owned
+        );
+        assert_eq!(
+            ServerMode::from_admin_url_environment(Ok(String::new()))
+                .expect("a present admin URL selects external mode"),
+            ServerMode::External
+        );
+
+        let invalid = ServerMode::from_admin_url_environment(Err(std::env::VarError::NotUnicode(
+            OsString::from("invalid"),
+        )))
+        .expect_err("non-UTF-8 configuration must fail before startup");
+        assert!(invalid.to_string().contains("must be valid UTF-8"));
+        assert!(
+            ServerMode::Owned
+                .ensure_matches(ServerMode::External)
+                .is_err()
         );
     }
 

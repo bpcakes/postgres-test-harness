@@ -121,7 +121,7 @@ impl PostgresHarness {
                 server: self.server.clone(),
                 name: DatabaseName::template(&self.server.project, fingerprint),
                 fingerprint,
-                _shared_lock: Mutex::new(Some(template_lock)),
+                _shared_lock: Mutex::new(template_lock),
             }),
         })
     }
@@ -151,7 +151,7 @@ struct TemplateInner {
     server: Arc<ServerInner>,
     name: DatabaseName,
     fingerprint: TemplateFingerprint,
-    _shared_lock: Mutex<Option<PersistentClient>>,
+    _shared_lock: Mutex<PersistentClient>,
 }
 
 /// Exclusive ownership of one disposable test database.
@@ -230,45 +230,64 @@ struct TemplateInitialization {
     name: DatabaseName,
     fingerprint: TemplateFingerprint,
     lock_key: i64,
-    exclusive_lock: Option<PersistentClient>,
+    coordination_key: i64,
+    exclusive_lock: PersistentClient,
 }
 
 impl TemplateInitialization {
-    fn finish(mut self) -> Result<PersistentClient> {
-        let mut persistent_client = self
-            .exclusive_lock
-            .take()
-            .expect("template initialization owns its exclusive lock");
-        let client = persistent_client.client_mut();
-        disable_database_connections(client, &self.name)?;
-        terminate_database_connections(client, &self.name, self.server.operation_timeout)?;
+    fn finish(self) -> Result<PersistentClient> {
+        let Self {
+            server,
+            name,
+            fingerprint,
+            lock_key,
+            coordination_key,
+            mut exclusive_lock,
+        } = self;
+        let client = exclusive_lock.client_mut();
+        disable_database_connections(client, &name)?;
+        terminate_database_connections(client, &name, server.operation_timeout)?;
         set_database_metadata(
             client,
-            &self.name,
+            &name,
             &ResourceMetadata::template(
-                self.server.project.clone(),
-                self.lock_key,
-                self.fingerprint,
+                server.project.clone(),
+                lock_key,
+                fingerprint,
                 TemplateState::Ready,
             ),
         )?;
-        release_advisory_lock(client, self.lock_key)?;
-        drop(persistent_client);
-        acquire_ready_template_lock(&self.server, &self.name, self.fingerprint, self.lock_key)?
-            .ok_or_else(|| Error::InconsistentMetadata {
-                database_name: self.name.as_str().to_owned(),
+        release_advisory_lock(client, lock_key)?;
+        let ready = acquire_and_inspect_shared_template_lock(
+            client,
+            &server,
+            &name,
+            fingerprint,
+            lock_key,
+        )?;
+        release_advisory_lock(client, coordination_key)?;
+        if ready {
+            Ok(exclusive_lock)
+        } else {
+            Err(Error::InconsistentMetadata {
+                database_name: name.as_str().to_owned(),
             })
+        }
     }
 
-    fn abort(mut self) -> Result<()> {
-        let mut persistent_client = self
-            .exclusive_lock
-            .take()
-            .expect("template initialization owns its exclusive lock");
-        let client = persistent_client.client_mut();
-        let cleanup = drop_database(client, &self.name);
-        let unlock = release_advisory_lock(client, self.lock_key);
-        cleanup.and(unlock)
+    fn abort(self) -> Result<()> {
+        let Self {
+            name,
+            lock_key,
+            coordination_key,
+            mut exclusive_lock,
+            ..
+        } = self;
+        let client = exclusive_lock.client_mut();
+        let cleanup = drop_database(client, &name);
+        let unlock_template = release_advisory_lock(client, lock_key);
+        let unlock_coordination = release_advisory_lock(client, coordination_key);
+        cleanup.and(unlock_template).and(unlock_coordination)
     }
 }
 
@@ -278,29 +297,55 @@ fn begin_template(
     fingerprint: TemplateFingerprint,
 ) -> Result<TemplatePreparation> {
     let lock_key = template_lock_key(&server.project, fingerprint);
+    let coordination_key = template_coordination_key(&server.project, fingerprint);
+    let mut persistent_client = PersistentClient::new(connect_admin(
+        &server.admin_url,
+        server.operation_timeout,
+        "connect for PostgreSQL template coordination",
+    )?);
     loop {
-        if let Some(template_lock) =
-            acquire_ready_template_lock(&server, &name, fingerprint, lock_key)?
+        let client = persistent_client.client_mut();
+        if acquire_and_inspect_shared_template_lock(client, &server, &name, fingerprint, lock_key)?
         {
-            return Ok(TemplatePreparation::Ready(template_lock));
+            return Ok(TemplatePreparation::Ready(persistent_client));
         }
 
-        let mut client = connect_admin(
-            &server.admin_url,
-            server.operation_timeout,
-            "connect for PostgreSQL template initialization",
-        )?;
+        // Serialize upgrades so a retained ready shared lock cannot strand an
+        // earlier coordination attempt waiting for the exclusive lock.
         acquire_template_advisory_lock(
-            &mut client,
+            client,
+            coordination_key,
+            server.template_wait_timeout,
+            server.operation_timeout,
+        )?;
+        if acquire_and_inspect_shared_template_lock(client, &server, &name, fingerprint, lock_key)?
+        {
+            release_advisory_lock(client, coordination_key)?;
+            return Ok(TemplatePreparation::Ready(persistent_client));
+        }
+
+        acquire_template_advisory_lock(
+            client,
             lock_key,
             server.template_wait_timeout,
             server.operation_timeout,
         )?;
-        if template_is_ready(&mut client, &server, &name, fingerprint, lock_key)? {
-            release_advisory_lock(&mut client, lock_key)?;
+        if template_is_ready(client, &server, &name, fingerprint, lock_key)? {
+            release_advisory_lock(client, lock_key)?;
+            let ready = acquire_and_inspect_shared_template_lock(
+                client,
+                &server,
+                &name,
+                fingerprint,
+                lock_key,
+            )?;
+            release_advisory_lock(client, coordination_key)?;
+            if ready {
+                return Ok(TemplatePreparation::Ready(persistent_client));
+            }
             continue;
         }
-        if let Some(record) = find_database(&mut client, &name)? {
+        if let Some(record) = find_database(client, &name)? {
             let recoverable = record
                 .comment
                 .as_deref()
@@ -318,10 +363,10 @@ fn begin_template(
                     database_name: name.as_str().to_owned(),
                 });
             }
-            drop_database(&mut client, &name)?;
+            drop_database(client, &name)?;
         }
         create_managed_database(
-            &mut client,
+            client,
             &name,
             "template0",
             &ResourceMetadata::template(
@@ -336,7 +381,8 @@ fn begin_template(
             name,
             fingerprint,
             lock_key,
-            exclusive_lock: Some(PersistentClient::new(client)),
+            coordination_key,
+            exclusive_lock: persistent_client,
         }));
     }
 }
@@ -346,6 +392,34 @@ fn template_lock_key(project: &ProjectName, fingerprint: TemplateFingerprint) ->
         "template",
         &format!("{}:{}", project.as_str(), fingerprint.to_hex()),
     )
+}
+
+fn template_coordination_key(project: &ProjectName, fingerprint: TemplateFingerprint) -> i64 {
+    advisory_key(
+        "template-coordination",
+        &format!("{}:{}", project.as_str(), fingerprint.to_hex()),
+    )
+}
+
+fn acquire_and_inspect_shared_template_lock(
+    client: &mut AdminClient,
+    server: &ServerInner,
+    name: &DatabaseName,
+    fingerprint: TemplateFingerprint,
+    lock_key: i64,
+) -> Result<bool> {
+    acquire_shared_template_advisory_lock(
+        client,
+        lock_key,
+        server.template_wait_timeout,
+        server.operation_timeout,
+    )?;
+    if template_is_ready(client, server, name, fingerprint, lock_key)? {
+        Ok(true)
+    } else {
+        release_shared_advisory_lock(client, lock_key)?;
+        Ok(false)
+    }
 }
 
 fn recoverable_template_initialization(
@@ -366,34 +440,6 @@ fn recoverable_template_initialization(
             && *metadata_lock_key == lock_key
             && *metadata_fingerprint == fingerprint
     )
-}
-
-fn acquire_ready_template_lock(
-    server: &ServerInner,
-    name: &DatabaseName,
-    fingerprint: TemplateFingerprint,
-    lock_key: i64,
-) -> Result<Option<PersistentClient>> {
-    let mut client = connect_admin(
-        &server.admin_url,
-        server.operation_timeout,
-        "connect for shared PostgreSQL template lease",
-    )?;
-    if !template_is_ready(&mut client, server, name, fingerprint, lock_key)? {
-        return Ok(None);
-    }
-    acquire_shared_template_advisory_lock(
-        &mut client,
-        lock_key,
-        server.template_wait_timeout,
-        server.operation_timeout,
-    )?;
-    if template_is_ready(&mut client, server, name, fingerprint, lock_key)? {
-        Ok(Some(PersistentClient::new(client)))
-    } else {
-        release_shared_advisory_lock(&mut client, lock_key)?;
-        Ok(None)
-    }
 }
 
 fn template_is_ready(
@@ -742,7 +788,7 @@ mod tests {
     use super::{
         CleanupClassification, CleanupReport, classify_cleanup_record, finish_locked_cleanup,
         recoverable_template_initialization, revalidate_cleanup_candidate, run_blocking,
-        template_lock_key, template_record_is_ready,
+        template_coordination_key, template_lock_key, template_record_is_ready,
     };
     use crate::{
         Error, FingerprintBuilder, ProjectName,
@@ -836,11 +882,14 @@ mod tests {
     }
 
     #[test]
-    fn template_locks_are_namespaced_by_project() {
+    fn template_lock_domains_are_distinct_and_namespaced_by_project() {
         let fingerprint = FingerprintBuilder::new("schema").finish();
         let left = template_lock_key(&ProjectName::new("left").unwrap(), fingerprint);
         let right = template_lock_key(&ProjectName::new("right").unwrap(), fingerprint);
+        let coordination =
+            template_coordination_key(&ProjectName::new("left").unwrap(), fingerprint);
         assert_ne!(left, right);
+        assert_ne!(left, coordination);
     }
 
     #[test]

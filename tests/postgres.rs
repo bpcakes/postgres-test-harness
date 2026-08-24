@@ -249,42 +249,186 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
                 )
                 .finish(),
         );
+        const CONCURRENT_CALLERS: usize = 8;
+        let shared_locks_before = advisory_lock_count(admin_url.clone(), "ShareLock")
+            .await
+            .expect("count shared advisory locks before cold start");
         let initialization_count = Arc::new(AtomicUsize::new(0));
-        let first_harness = harness.clone();
-        let first_count = initialization_count.clone();
-        let second_harness = harness.clone();
-        let second_count = initialization_count.clone();
-        let (first_template, second_template) = tokio::join!(
-            first_harness.template(concurrent_spec, move |database_url| {
-                let initialization_count = first_count.clone();
-                async move {
-                    initialization_count.fetch_add(1, Ordering::SeqCst);
-                    execute(
-                        database_url,
-                        "CREATE TABLE concurrent_marker (value text NOT NULL)",
-                    )
+        let mut calls = tokio::task::JoinSet::new();
+        for _ in 0..CONCURRENT_CALLERS {
+            let concurrent_harness = harness.clone();
+            let initialization_count = initialization_count.clone();
+            calls.spawn(async move {
+                concurrent_harness
+                    .template(concurrent_spec, move |database_url| async move {
+                        initialization_count.fetch_add(1, Ordering::SeqCst);
+                        execute(
+                            database_url,
+                            "CREATE TABLE concurrent_marker (value text NOT NULL)",
+                        )
+                        .await
+                    })
                     .await
-                }
-            }),
-            second_harness.template(concurrent_spec, move |database_url| {
-                let initialization_count = second_count.clone();
-                async move {
-                    initialization_count.fetch_add(1, Ordering::SeqCst);
-                    execute(
-                        database_url,
-                        "CREATE TABLE concurrent_marker (value text NOT NULL)",
-                    )
-                    .await
-                }
-            })
-        );
-        let first_template = first_template.expect("initialize concurrent template");
-        let second_template = second_template.expect("reuse concurrent template");
-        assert_eq!(
-            first_template.database_name(),
-            second_template.database_name()
+            });
+        }
+        let mut templates = Vec::with_capacity(CONCURRENT_CALLERS);
+        let cold_start = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(result) = calls.join_next().await {
+                templates.push(
+                    result
+                        .expect("concurrent template task should not panic")
+                        .expect("initialize or reuse concurrent template"),
+                );
+            }
+        })
+        .await;
+        if cold_start.is_err() {
+            let activity = postgres_activity(admin_url.clone())
+                .await
+                .expect("inspect stalled cold-start coordination");
+            panic!("N-way cold-start coordination stalled:\n{activity:#?}");
+        }
+        assert!(
+            templates
+                .iter()
+                .all(|template| template.database_name() == templates[0].database_name())
         );
         assert_eq!(initialization_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            advisory_lock_count(admin_url.clone(), "ShareLock")
+                .await
+                .expect("count shared advisory locks after cold start"),
+            shared_locks_before + CONCURRENT_CALLERS as i64
+        );
+
+        drop(templates);
+        wait_until_advisory_lock_count(&admin_url, "ShareLock", shared_locks_before).await;
+    }
+
+    {
+        let clone_fingerprint = FingerprintBuilder::new("template-clone-lock").finish();
+        let clone_lock_key = advisory_key(
+            "template",
+            &format!("harness_it:{}", clone_fingerprint.to_hex()),
+        );
+        let template = harness
+            .template(TemplateSpec::new(clone_fingerprint), |_| async { Ok(()) })
+            .await
+            .expect("initialize clone-held-lock template");
+        let template_clone = template.clone();
+
+        drop(template);
+        assert!(
+            !advisory_lock_is_acquirable(admin_url.clone(), clone_lock_key)
+                .await
+                .expect("check lock retained by template clone")
+        );
+        drop(template_clone);
+        wait_until_advisory_lock_is_acquirable(&admin_url, clone_lock_key).await;
+    }
+
+    {
+        let queued_fingerprint = FingerprintBuilder::new("queued-exclusive").finish();
+        let queued_spec = TemplateSpec::new(queued_fingerprint);
+        let queued_lock_key = advisory_key(
+            "template",
+            &format!("harness_it:{}", queued_fingerprint.to_hex()),
+        );
+        let first_template = harness
+            .template(queued_spec, |_| async { Ok(()) })
+            .await
+            .expect("initialize queued-exclusive template");
+        let mut exclusive = QueuedAdvisoryLock::queue(admin_url.clone(), queued_lock_key).await;
+        let waiting_harness = harness.clone();
+        let waiting_template = tokio::spawn(async move {
+            waiting_harness
+                .template(queued_spec, |_| async {
+                    Err(std::io::Error::other(
+                        "ready template initializer must not run behind queued exclusive lock",
+                    )
+                    .into())
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiting_template.is_finished(),
+            "shared template acquisition must queue behind an exclusive waiter"
+        );
+
+        drop(first_template);
+        exclusive.wait_until_acquired().await;
+        assert!(
+            !waiting_template.is_finished(),
+            "shared template acquisition must wait while the exclusive lock is held"
+        );
+        exclusive.release();
+        let waiting_template = tokio::time::timeout(Duration::from_secs(5), waiting_template)
+            .await
+            .expect("shared template acquisition should resume after exclusive unlock")
+            .expect("queued shared template task should not panic")
+            .expect("reuse template after queued exclusive lock");
+        drop(waiting_template);
+    }
+
+    {
+        let error_fingerprint = FingerprintBuilder::new("initializer-error-recovery").finish();
+        let error_spec = TemplateSpec::new(error_fingerprint);
+        let error = match harness
+            .template(error_spec, |_| async {
+                Err(std::io::Error::other("forced initializer failure").into())
+            })
+            .await
+        {
+            Ok(_) => panic!("initializer failure should be reported"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, Error::TemplateInitializer { .. }));
+
+        let recovered = tokio::time::timeout(
+            Duration::from_secs(5),
+            harness.template(error_spec, |_| async { Ok(()) }),
+        )
+        .await
+        .expect("initializer error must not leak its exclusive lock")
+        .expect("recover after initializer failure");
+        drop(recovered);
+    }
+
+    {
+        let cancellation_fingerprint =
+            FingerprintBuilder::new("initializer-cancellation-recovery").finish();
+        let cancellation_spec = TemplateSpec::new(cancellation_fingerprint);
+        let cancellation_harness = harness.clone();
+        let (initializer_started_sender, initializer_started_receiver) =
+            tokio::sync::oneshot::channel();
+        let initialization = tokio::spawn(async move {
+            cancellation_harness
+                .template(cancellation_spec, move |_| async move {
+                    let _ = initializer_started_sender.send(());
+                    std::future::pending::<()>().await;
+                    Ok(())
+                })
+                .await
+        });
+        initializer_started_receiver
+            .await
+            .expect("initializer should start before cancellation");
+        initialization.abort();
+        let join_error = match initialization.await {
+            Ok(_) => panic!("cancelled initialization should not return"),
+            Err(error) => error,
+        };
+        assert!(join_error.is_cancelled());
+
+        let recovered = tokio::time::timeout(
+            Duration::from_secs(5),
+            harness.template(cancellation_spec, |_| async { Ok(()) }),
+        )
+        .await
+        .expect("cancelled initializer must release its exclusive lock")
+        .expect("recover initializing template after cancellation");
+        drop(recovered);
     }
 
     {
@@ -530,6 +674,95 @@ struct CatalogLock {
     worker: Option<JoinHandle<()>>,
 }
 
+struct QueuedAdvisoryLock {
+    acquired: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+    release: Option<Sender<()>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl QueuedAdvisoryLock {
+    async fn queue(admin_url: String, key: i64) -> Self {
+        let (pid_sender, pid_receiver) = tokio::sync::oneshot::channel();
+        let (acquired_sender, acquired_receiver) = tokio::sync::oneshot::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let query_url = admin_url.clone();
+        let worker = std::thread::spawn(move || {
+            let mut client = match Client::connect(&query_url, NoTls) {
+                Ok(client) => client,
+                Err(error) => {
+                    let message = error.to_string();
+                    let _ = pid_sender.send(Err(message.clone()));
+                    let _ = acquired_sender.send(Err(message));
+                    return;
+                }
+            };
+            let pid: i32 = match client.query_one("SELECT pg_backend_pid()", &[]) {
+                Ok(row) => row.get(0),
+                Err(error) => {
+                    let message = error.to_string();
+                    let _ = pid_sender.send(Err(message.clone()));
+                    let _ = acquired_sender.send(Err(message));
+                    return;
+                }
+            };
+            let _ = pid_sender.send(Ok(pid));
+            match client.query_one("SELECT pg_advisory_lock($1)", &[&key]) {
+                Ok(_) => {
+                    let _ = acquired_sender.send(Ok(()));
+                    let _ = release_receiver.recv();
+                    let _ = client.query_one("SELECT pg_advisory_unlock($1)", &[&key]);
+                }
+                Err(error) => {
+                    let _ = acquired_sender.send(Err(error.to_string()));
+                }
+            }
+        });
+        let pid = pid_receiver
+            .await
+            .expect("queued advisory-lock worker stopped before reporting its PID")
+            .expect("connect queued advisory-lock worker");
+        wait_until_advisory_waiter(&admin_url, pid).await;
+        Self {
+            acquired: Some(acquired_receiver),
+            release: Some(release_sender),
+            worker: Some(worker),
+        }
+    }
+
+    async fn wait_until_acquired(&mut self) {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            self.acquired
+                .take()
+                .expect("queued advisory lock is awaited once"),
+        )
+        .await
+        .expect("queued exclusive advisory lock should become available")
+        .expect("queued advisory-lock worker stopped before acquisition")
+        .expect("acquire queued exclusive advisory lock");
+    }
+
+    fn release(mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        if let Some(worker) = self.worker.take() {
+            worker.join().unwrap();
+        }
+    }
+}
+
+impl Drop for QueuedAdvisoryLock {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
 impl CatalogLock {
     async fn acquire(admin_url: String) -> Self {
         let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
@@ -662,6 +895,37 @@ async fn database_exists(database_url: String, database_name: String) -> Result<
     .await
 }
 
+async fn postgres_activity(database_url: String) -> Result<Vec<String>, BoxError> {
+    with_client(database_url, move |client| {
+        Ok(client
+            .query(
+                "SELECT a.pid, a.state, coalesce(a.wait_event_type, ''), \
+                        coalesce(a.wait_event, ''), a.query, \
+                        coalesce(string_agg(l.mode || ':' || l.granted::text, ','), '') \
+                 FROM pg_stat_activity a \
+                 LEFT JOIN pg_locks l ON l.pid = a.pid AND l.locktype = 'advisory' \
+                 WHERE a.datname = current_database() AND a.pid <> pg_backend_pid() \
+                 GROUP BY a.pid, a.state, a.wait_event_type, a.wait_event, a.query \
+                 ORDER BY a.pid",
+                &[],
+            )?
+            .into_iter()
+            .map(|row| {
+                format!(
+                    "pid={} state={} wait={}/{} locks={} query={}",
+                    row.get::<_, i32>(0),
+                    row.get::<_, String>(1),
+                    row.get::<_, String>(2),
+                    row.get::<_, String>(3),
+                    row.get::<_, String>(5),
+                    row.get::<_, String>(4),
+                )
+            })
+            .collect())
+    })
+    .await
+}
+
 fn advisory_key(domain: &str, identity: &str) -> i64 {
     let mut hasher = Sha256::new();
     hasher.update(b"postgres-test-harness-advisory-v1");
@@ -682,6 +946,19 @@ async fn advisory_lock_is_acquirable(database_url: String, key: i64) -> Result<b
             client.query_one("SELECT pg_advisory_unlock($1)", &[&key])?;
         }
         Ok(acquired)
+    })
+    .await
+}
+
+async fn advisory_lock_count(database_url: String, mode: &'static str) -> Result<i64, BoxError> {
+    with_client(database_url, move |client| {
+        Ok(client
+            .query_one(
+                "SELECT count(*) FROM pg_locks \
+                 WHERE locktype = 'advisory' AND mode = $1 AND granted",
+                &[&mode],
+            )?
+            .get(0))
     })
     .await
 }
@@ -729,6 +1006,48 @@ async fn wait_until_advisory_lock_is_acquirable(admin_url: &str, key: i64) {
         assert!(
             Instant::now() < deadline,
             "retained advisory lock was not released after client drop"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_until_advisory_lock_count(admin_url: &str, mode: &'static str, expected: i64) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let count = advisory_lock_count(admin_url.to_owned(), mode)
+            .await
+            .expect("poll advisory lock count");
+        if count == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected {expected} granted {mode} advisory locks, observed {count}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_until_advisory_waiter(admin_url: &str, pid: i32) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let waiting = with_client(admin_url.to_owned(), move |client| {
+            Ok(client
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM pg_locks \
+                     WHERE pid = $1 AND locktype = 'advisory' AND NOT granted)",
+                    &[&pid],
+                )?
+                .get::<_, bool>(0))
+        })
+        .await
+        .expect("poll queued advisory lock");
+        if waiting {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "backend {pid} did not queue for its advisory lock"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }

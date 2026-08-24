@@ -104,12 +104,15 @@ mod tests {
     }
 
     #[test]
-    fn fingerprint_hex_round_trips() {
+    fn fingerprint_matches_known_vector_and_hex_round_trips() {
         let fingerprint = FingerprintBuilder::new("schema")
             .add("migration", "select 1")
             .finish();
+        let expected = "fc8eb7daf3f83a0c92ccf0b5f4122bc72e6a84dba4eb38896c2c9d0ef95afe7f";
+
+        assert_eq!(fingerprint.to_hex(), expected);
         assert_eq!(
-            TemplateFingerprint::from_hex(&fingerprint.to_hex()).unwrap(),
+            TemplateFingerprint::from_hex(expected).unwrap(),
             fingerprint
         );
     }

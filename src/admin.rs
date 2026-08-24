@@ -627,6 +627,16 @@ mod tests {
     }
 
     #[test]
+    fn advisory_keys_match_known_vectors() {
+        assert_eq!(advisory_key("run", "same"), -8_116_341_416_320_315_028);
+        assert_eq!(advisory_key("template", "same"), -4_995_278_210_640_012_122);
+        assert_eq!(
+            advisory_key("template-coordination", "same"),
+            -2_684_819_783_531_546_151
+        );
+    }
+
+    #[test]
     fn advisory_keys_are_domain_separated() {
         assert_ne!(
             advisory_key("run", "same"),

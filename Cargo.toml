@@ -10,6 +10,7 @@ repository = "https://github.com/bpcakes/postgres-test-harness"
 documentation = "https://docs.rs/postgres-test-harness"
 keywords = ["postgres", "testing", "testcontainers", "database"]
 categories = ["development-tools::testing", "database"]
+exclude = ["/.beads/**", "/.github/**", "/AGENTS.md"]
 
 [dependencies]
 libc = "0.2"

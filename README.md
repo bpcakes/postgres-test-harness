@@ -80,7 +80,8 @@ retained owner and template-lock sessions, and other users of an external
 server. Sessions are checked out exclusively; independent lifecycle operations
 can progress concurrently without holding the pool lock during SQL. A reused
 session is reset and has the configured operation and lock timeouts restored
-before work. Failed or uncertain sessions are evicted and reconnected lazily.
+before work. Waiting for a session is also bounded by the configured operation
+timeout. Failed or uncertain sessions are evicted and reconnected lazily.
 Owned shutdown closes this pool along with database admission, while external
 shutdown remains a no-op.
 

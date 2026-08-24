@@ -2,7 +2,7 @@ use std::{
     fmt,
     str::FromStr,
     sync::{Condvar, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use sha2::{Digest, Sha256};
@@ -311,6 +311,7 @@ impl AdminSessionPool {
     }
 
     fn acquire_checkout(&self) -> Result<Option<PersistentClient>> {
+        let wait_started = Instant::now();
         let mut state = self.state.lock().map_err(|_| Error::StatePoisoned {
             operation: "lock disposable admin-session pool",
         })?;
@@ -325,12 +326,16 @@ impl AdminSessionPool {
                 state.total += 1;
                 return Ok(None);
             }
-            state = self
-                .available
-                .wait(state)
-                .map_err(|_| Error::StatePoisoned {
+            let Some(remaining) = self.operation_timeout.checked_sub(wait_started.elapsed()) else {
+                return Err(Error::AdminSessionCheckoutTimeout {
+                    timeout: self.operation_timeout,
+                });
+            };
+            (state, _) = self.available.wait_timeout(state, remaining).map_err(|_| {
+                Error::StatePoisoned {
                     operation: "wait for disposable admin session",
-                })?;
+                }
+            })?;
         }
     }
 
@@ -738,11 +743,11 @@ mod tests {
         net::TcpListener,
         sync::mpsc,
         thread,
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use super::{
-        AdminClient, AdminDatabaseUrl, PersistentClient, advisory_key,
+        AdminClient, AdminDatabaseUrl, AdminSessionPool, PersistentClient, advisory_key,
         compensate_failed_metadata_write, connect_admin_with_timeout, quote_identifier,
         quote_literal,
     };
@@ -770,6 +775,31 @@ mod tests {
         assert_eq!(quote_identifier("template0").unwrap(), "\"template0\"");
         assert!(quote_identifier("unsafe-name").is_err());
         assert_eq!(quote_literal("a'b"), "'a''b'");
+    }
+
+    #[test]
+    fn admin_pool_checkout_wait_is_bounded_by_the_operation_timeout() {
+        let timeout = Duration::from_millis(20);
+        let pool = AdminSessionPool::new(
+            AdminDatabaseUrl::parse("postgres://user@localhost/postgres").unwrap(),
+            timeout,
+            "checkout_timeout",
+            1,
+        );
+        pool.state.lock().unwrap().total = 1;
+
+        let started = Instant::now();
+        let error = match pool.acquire_checkout() {
+            Ok(_) => panic!("a saturated admin-session pool must not admit another checkout"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            Error::AdminSessionCheckoutTimeout { timeout: actual } if actual == timeout
+        ));
+        assert!(started.elapsed() >= timeout);
+        pool.release_slot();
     }
 
     #[test]

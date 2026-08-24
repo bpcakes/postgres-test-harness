@@ -142,6 +142,9 @@ pub enum Error {
     #[error("the disposable PostgreSQL admin-session pool is closed")]
     AdminSessionPoolClosed,
 
+    #[error("timed out waiting for a disposable PostgreSQL admin session after {timeout:?}")]
+    AdminSessionCheckoutTimeout { timeout: Duration },
+
     #[error("template initialization failed: {source}")]
     TemplateInitializer {
         #[source]

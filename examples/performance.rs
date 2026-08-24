@@ -336,6 +336,11 @@ struct ServerMetadata {
     postmaster_started_at: String,
 }
 
+struct SampleMeasurements {
+    report: SampleReport,
+    server_metadata: ServerMetadata,
+}
+
 struct Observer {
     client: Option<Client>,
     connection: tokio::task::JoinHandle<std::result::Result<(), tokio_postgres::Error>>,
@@ -553,8 +558,33 @@ async fn run_sample(
     let startup_started = Instant::now();
     let harness = PostgresHarness::start(config.harness_config()?).await?;
     let startup_elapsed = startup_started.elapsed();
+    let admin_url = harness.admin_database_url().to_owned();
+    let mut measurements = measure_started_sample(
+        config,
+        &harness,
+        invocation,
+        sample,
+        startup_elapsed,
+        expected_owned_image_digest,
+    )
+    .await?;
+    let expected_templates = measurements.report.fixtures.len();
+    measurements.report.external_stale_cleanup =
+        finalize_successful_sample(config, harness, &admin_url, expected_templates).await?;
+
+    Ok((measurements.report, measurements.server_metadata))
+}
+
+async fn measure_started_sample(
+    config: &BenchmarkConfig,
+    harness: &PostgresHarness,
+    invocation: &str,
+    sample: usize,
+    startup_elapsed: Duration,
+    expected_owned_image_digest: Option<&str>,
+) -> AnyResult<SampleMeasurements> {
     let container_image_digest =
-        verify_started_image(&config.mode, &harness, expected_owned_image_digest)?;
+        verify_started_image(&config.mode, harness, expected_owned_image_digest)?;
     let admin_url = harness.admin_database_url().to_owned();
     let observer = Observer::connect(&admin_url).await?;
     let server_metadata = observer.server_metadata().await?;
@@ -577,27 +607,12 @@ async fn run_sample(
     for fixture in &fixtures {
         eprintln!("  fixture {}", fixture.name);
         fixture_reports
-            .push(run_fixture(config, &harness, &observer, fixture, invocation, sample).await?);
+            .push(run_fixture(config, harness, &observer, fixture, invocation, sample).await?);
     }
 
     observer.close().await?;
-    let external_stale_cleanup = match config.mode {
-        ServerMode::Owned => {
-            harness.shutdown().await?;
-            drop(harness);
-            None
-        }
-        ServerMode::External => {
-            drop(harness);
-            Some(
-                cleanup_external_resources(&admin_url, &config.project, fixture_reports.len())
-                    .await?,
-            )
-        }
-    };
-
-    Ok((
-        SampleReport {
+    Ok(SampleMeasurements {
+        report: SampleReport {
             sample,
             server_startup: StartupReport {
                 elapsed_ns: startup_elapsed.as_nanos(),
@@ -611,10 +626,30 @@ async fn run_sample(
                 postgres_version_num: server_metadata.version_num,
             },
             fixtures: fixture_reports,
-            external_stale_cleanup,
+            external_stale_cleanup: None,
         },
         server_metadata,
-    ))
+    })
+}
+
+async fn finalize_successful_sample(
+    config: &BenchmarkConfig,
+    harness: PostgresHarness,
+    admin_url: &str,
+    expected_templates: usize,
+) -> AnyResult<Option<ExternalCleanupReport>> {
+    let cleanup = match config.mode {
+        ServerMode::Owned => {
+            harness.shutdown().await?;
+            drop(harness);
+            None
+        }
+        ServerMode::External => {
+            drop(harness);
+            Some(cleanup_external_resources(admin_url, &config.project, expected_templates).await?)
+        }
+    };
+    Ok(cleanup)
 }
 
 async fn run_fixture(

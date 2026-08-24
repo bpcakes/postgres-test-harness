@@ -108,6 +108,15 @@ pub enum Error {
         cleanup: Box<Error>,
     },
 
+    #[error(
+        "failed to tag a managed PostgreSQL database ({tagging}); compensating FORCE drop also failed ({cleanup})"
+    )]
+    ManagedDatabaseTagAndCleanup {
+        #[source]
+        tagging: Box<Error>,
+        cleanup: Box<Error>,
+    },
+
     #[error("managed PostgreSQL resource metadata is inconsistent for database '{database_name}'")]
     InconsistentMetadata { database_name: String },
 
@@ -145,5 +154,18 @@ mod tests {
             cleanup: Box::new(Error::InvalidConfiguration { reason: "cleanup" }),
         };
         assert_eq!(error.source().unwrap().to_string(), "initializer");
+    }
+
+    #[test]
+    fn combined_managed_database_error_preserves_the_tagging_source() {
+        let error = Error::ManagedDatabaseTagAndCleanup {
+            tagging: Box::new(Error::InvalidConfiguration { reason: "tagging" }),
+            cleanup: Box::new(Error::InvalidConfiguration { reason: "cleanup" }),
+        };
+        assert_eq!(
+            error.source().unwrap().to_string(),
+            "invalid PostgreSQL test-harness configuration: tagging"
+        );
+        assert!(error.to_string().contains("cleanup"));
     }
 }

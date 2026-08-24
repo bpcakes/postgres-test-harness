@@ -14,10 +14,10 @@ use crate::{
     admin::{
         AdminClient, AdminDatabaseUrl, DatabaseRecord, PersistentClient,
         acquire_shared_template_advisory_lock, acquire_template_advisory_lock, advisory_key,
-        connect_admin, create_database, database_comment, database_exists,
-        disable_database_connections, drop_database, list_databases, release_advisory_lock,
-        release_shared_advisory_lock, set_database_metadata, terminate_database_connections,
-        try_acquire_advisory_lock, validate_postgres_18,
+        connect_admin, create_managed_database, disable_database_connections, drop_database,
+        find_database, list_databases, release_advisory_lock, release_shared_advisory_lock,
+        set_database_metadata, terminate_database_connections, try_acquire_advisory_lock,
+        validate_postgres_18,
     },
     metadata::{ResourceMetadata, TemplateState},
     name::{DatabaseKind, DatabaseName},
@@ -328,8 +328,9 @@ fn begin_template(
             release_advisory_lock(&mut client, lock_key)?;
             continue;
         }
-        if database_exists(&mut client, &name)? {
-            let recoverable = database_comment(&mut client, &name)?
+        if let Some(record) = find_database(&mut client, &name)? {
+            let recoverable = record
+                .comment
                 .as_deref()
                 .and_then(ResourceMetadata::parse)
                 .is_some_and(|metadata| {
@@ -347,10 +348,10 @@ fn begin_template(
             }
             drop_database(&mut client, &name)?;
         }
-        create_database(&mut client, &name, "template0")?;
-        set_database_metadata(
+        create_managed_database(
             &mut client,
             &name,
+            "template0",
             &ResourceMetadata::template(
                 server.project.clone(),
                 lock_key,
@@ -430,21 +431,36 @@ fn template_is_ready(
     fingerprint: TemplateFingerprint,
     lock_key: i64,
 ) -> Result<bool> {
-    let Some(comment) = database_comment(client, name)? else {
-        return Ok(false);
+    let record = find_database(client, name)?;
+    Ok(template_record_is_ready(
+        record.as_ref(),
+        &server.project,
+        fingerprint,
+        lock_key,
+    ))
+}
+
+fn template_record_is_ready(
+    record: Option<&DatabaseRecord>,
+    project: &ProjectName,
+    fingerprint: TemplateFingerprint,
+    lock_key: i64,
+) -> bool {
+    let Some(comment) = record.and_then(|record| record.comment.as_deref()) else {
+        return false;
     };
-    Ok(matches!(
-        ResourceMetadata::parse(&comment),
+    matches!(
+        ResourceMetadata::parse(comment),
         Some(ResourceMetadata::Template {
-            project,
+            project: metadata_project,
             lock_key: metadata_lock_key,
             fingerprint: metadata_fingerprint,
             state: TemplateState::Ready,
             ..
-        }) if project == server.project
+        }) if metadata_project == *project
             && metadata_lock_key == lock_key
             && metadata_fingerprint == fingerprint
-    ))
+    )
 }
 
 async fn create_test_database(
@@ -461,19 +477,15 @@ async fn create_test_database(
             server_for_create.operation_timeout,
             "connect for disposable database creation",
         )?;
-        if let Err(error) = create_database(&mut client, &name, &template_name).and_then(|()| {
-            set_database_metadata(
-                &mut client,
-                &name,
-                &ResourceMetadata::test(
-                    server_for_create.project.clone(),
-                    server_for_create.owner_key,
-                ),
-            )
-        }) {
-            let _ = drop_database(&mut client, &name);
-            return Err(error);
-        }
+        create_managed_database(
+            &mut client,
+            &name,
+            &template_name,
+            &ResourceMetadata::test(
+                server_for_create.project.clone(),
+                server_for_create.owner_key,
+            ),
+        )?;
         Ok(CancellationGuard::new(
             DatabaseLeaseInner {
                 server: server_for_create,
@@ -686,6 +698,7 @@ mod tests {
     use super::{
         CancellationGuard, CleanupClassification, classify_cleanup_record,
         recoverable_template_initialization, run_blocking, template_lock_key,
+        template_record_is_ready,
     };
     use crate::{
         FingerprintBuilder, ProjectName,
@@ -771,6 +784,69 @@ mod tests {
         assert!(!recoverable_template_initialization(
             &initializing,
             &ProjectName::new("another").unwrap(),
+            fingerprint,
+            lock_key
+        ));
+    }
+
+    #[test]
+    fn exact_template_records_preserve_catalog_states() {
+        let project = ProjectName::new("creditkit").unwrap();
+        let fingerprint = FingerprintBuilder::new("schema").finish();
+        let lock_key = template_lock_key(&project, fingerprint);
+        let name = DatabaseName::template(&project, fingerprint)
+            .as_str()
+            .to_owned();
+        let untagged = DatabaseRecord {
+            name: name.clone(),
+            comment: None,
+        };
+        let initializing = DatabaseRecord {
+            name: name.clone(),
+            comment: Some(
+                ResourceMetadata::template(
+                    project.clone(),
+                    lock_key,
+                    fingerprint,
+                    TemplateState::Initializing,
+                )
+                .encode(),
+            ),
+        };
+        let ready = DatabaseRecord {
+            name,
+            comment: Some(
+                ResourceMetadata::template(
+                    project.clone(),
+                    lock_key,
+                    fingerprint,
+                    TemplateState::Ready,
+                )
+                .encode(),
+            ),
+        };
+
+        assert!(!template_record_is_ready(
+            None,
+            &project,
+            fingerprint,
+            lock_key
+        ));
+        assert!(!template_record_is_ready(
+            Some(&untagged),
+            &project,
+            fingerprint,
+            lock_key
+        ));
+        assert!(!template_record_is_ready(
+            Some(&initializing),
+            &project,
+            fingerprint,
+            lock_key
+        ));
+        assert!(template_record_is_ready(
+            Some(&ready),
+            &project,
             fingerprint,
             lock_key
         ));

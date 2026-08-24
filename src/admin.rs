@@ -307,7 +307,7 @@ pub(crate) fn release_shared_advisory_lock(client: &mut AdminClient, key: i64) -
     Ok(())
 }
 
-pub(crate) fn create_database(
+fn create_database(
     client: &mut AdminClient,
     database_name: &DatabaseName,
     template_name: &str,
@@ -321,6 +321,31 @@ pub(crate) fn create_database(
         .map_err(|source| Error::postgres("create disposable PostgreSQL database", source))
 }
 
+pub(crate) fn create_managed_database(
+    client: &mut AdminClient,
+    database_name: &DatabaseName,
+    template_name: &str,
+    metadata: &ResourceMetadata,
+) -> Result<()> {
+    create_database(client, database_name, template_name)?;
+    if let Err(tagging) = set_database_metadata(client, database_name, metadata) {
+        return Err(compensate_failed_metadata_write(tagging, || {
+            drop_database(client, database_name)
+        }));
+    }
+    Ok(())
+}
+
+fn compensate_failed_metadata_write(tagging: Error, cleanup: impl FnOnce() -> Result<()>) -> Error {
+    match cleanup() {
+        Ok(()) => tagging,
+        Err(cleanup) => Error::ManagedDatabaseTagAndCleanup {
+            tagging: Box::new(tagging),
+            cleanup: Box::new(cleanup),
+        },
+    }
+}
+
 pub(crate) fn drop_database(client: &mut AdminClient, database_name: &DatabaseName) -> Result<()> {
     client
         .batch_execute(&format!(
@@ -330,30 +355,23 @@ pub(crate) fn drop_database(client: &mut AdminClient, database_name: &DatabaseNa
         .map_err(|source| Error::postgres("drop disposable PostgreSQL database", source))
 }
 
-pub(crate) fn database_exists(
+pub(crate) fn find_database(
     client: &mut AdminClient,
     database_name: &DatabaseName,
-) -> Result<bool> {
-    client
-        .query_one(
-            "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)",
-            &[&database_name.as_str()],
-        )
-        .map(|row| row.get(0))
-        .map_err(|source| Error::postgres("check disposable PostgreSQL database", source))
-}
-
-pub(crate) fn database_comment(
-    client: &mut AdminClient,
-    database_name: &DatabaseName,
-) -> Result<Option<String>> {
+) -> Result<Option<DatabaseRecord>> {
     client
         .query_opt(
-            "SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = $1",
+            "SELECT datname, shobj_description(oid, 'pg_database') \
+             FROM pg_database WHERE datname = $1",
             &[&database_name.as_str()],
         )
-        .map(|row| row.and_then(|row| row.get(0)))
-        .map_err(|source| Error::postgres("read disposable PostgreSQL database metadata", source))
+        .map(|row| {
+            row.map(|row| DatabaseRecord {
+                name: row.get(0),
+                comment: row.get(1),
+            })
+        })
+        .map_err(|source| Error::postgres("find disposable PostgreSQL database", source))
 }
 
 pub(crate) fn set_database_metadata(
@@ -481,7 +499,8 @@ mod tests {
     use std::{io::Read, net::TcpListener, thread, time::Duration};
 
     use super::{
-        AdminDatabaseUrl, advisory_key, connect_admin_with_timeout, quote_identifier, quote_literal,
+        AdminDatabaseUrl, advisory_key, compensate_failed_metadata_write,
+        connect_admin_with_timeout, quote_identifier, quote_literal,
     };
     use crate::{Error, FingerprintBuilder, ProjectName, name::DatabaseName};
 
@@ -556,5 +575,31 @@ mod tests {
             advisory_key("run", "same"),
             advisory_key("template", "same")
         );
+    }
+
+    #[test]
+    fn successful_compensation_returns_the_metadata_error() {
+        let error = compensate_failed_metadata_write(
+            Error::InvalidConfiguration { reason: "tagging" },
+            || Ok(()),
+        );
+        assert!(matches!(
+            error,
+            Error::InvalidConfiguration { reason: "tagging" }
+        ));
+    }
+
+    #[test]
+    fn failed_compensation_reports_both_errors() {
+        let error = compensate_failed_metadata_write(
+            Error::InvalidConfiguration { reason: "tagging" },
+            || Err(Error::InvalidConfiguration { reason: "cleanup" }),
+        );
+        assert!(matches!(
+            error,
+            Error::ManagedDatabaseTagAndCleanup { tagging, cleanup }
+                if matches!(*tagging, Error::InvalidConfiguration { reason: "tagging" })
+                    && matches!(*cleanup, Error::InvalidConfiguration { reason: "cleanup" })
+        ));
     }
 }

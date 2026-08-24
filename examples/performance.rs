@@ -10,7 +10,7 @@ use std::{
     env,
     error::Error as StdError,
     fmt,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{self, BufWriter, Write},
     path::{Path, PathBuf},
     process::Command,
@@ -370,6 +370,17 @@ struct SampleMeasurements {
     server_metadata: ServerMetadata,
 }
 
+enum ReportOutput {
+    Stdout,
+    File(PreparedReportFile),
+}
+
+struct PreparedReportFile {
+    destination: PathBuf,
+    temporary: PathBuf,
+    writer: Option<BufWriter<File>>,
+}
+
 struct Observer {
     client: Option<Client>,
     connection: tokio::task::JoinHandle<std::result::Result<(), tokio_postgres::Error>>,
@@ -519,6 +530,7 @@ async fn main() -> AnyResult<()> {
     let invocation = format!("{generated_at_unix_ms}-{}", std::process::id());
     let config = BenchmarkConfig::from_environment(benchmark_project())?;
     let source = source_report();
+    let output = ReportOutput::prepare(config.output.as_deref())?;
     let (image_digest, storage_driver) = environment_metadata(&config)?;
     let expected_owned_image_digest = image_digest.value.as_deref();
 
@@ -575,7 +587,7 @@ async fn main() -> AnyResult<()> {
         ],
     };
 
-    write_report(&report, config.output.as_deref())?;
+    output.write_report(&report)?;
     Ok(())
 }
 
@@ -1072,28 +1084,108 @@ fn verify_started_image(
     Ok(Some(actual_digest))
 }
 
-fn write_report(report: &BenchmarkReport, output: Option<&Path>) -> AnyResult<()> {
-    match output {
-        Some(path) => {
-            if let Some(parent) = path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-            {
-                fs::create_dir_all(parent)?;
-            }
-            let mut writer = BufWriter::new(File::create(path)?);
-            serde_json::to_writer_pretty(&mut writer, report)?;
-            writeln!(writer)?;
-            writer.flush()?;
-            eprintln!("wrote structured report to {}", path.display());
+impl ReportOutput {
+    fn prepare(destination: Option<&Path>) -> AnyResult<Self> {
+        let Some(destination) = destination else {
+            return Ok(Self::Stdout);
+        };
+        if destination.is_dir() {
+            return Err(invalid_input(format!(
+                "{OUTPUT_ENV} must name a file, got directory {}",
+                destination.display()
+            )));
         }
-        None => {
-            let stdout = io::stdout();
-            let mut writer = stdout.lock();
-            serde_json::to_writer_pretty(&mut writer, report)?;
-            writeln!(writer)?;
+        if let Some(parent) = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)?;
+        }
+        let file_name = destination.file_name().ok_or_else(|| {
+            invalid_input(format!(
+                "{OUTPUT_ENV} must name a file, got {}",
+                destination.display()
+            ))
+        })?;
+        let mut temporary_name = file_name.to_os_string();
+        temporary_name.push(format!(".{}.tmp", Uuid::new_v4().simple()));
+        let temporary = destination.with_file_name(temporary_name);
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)?;
+        Ok(Self::File(PreparedReportFile {
+            destination: destination.to_owned(),
+            temporary,
+            writer: Some(BufWriter::new(file)),
+        }))
+    }
+
+    fn write_report(self, report: &BenchmarkReport) -> AnyResult<()> {
+        let mut encoded = Vec::new();
+        serde_json::to_writer_pretty(&mut encoded, report)?;
+        encoded.push(b'\n');
+        self.write_encoded(&encoded)
+    }
+
+    fn write_encoded(self, encoded: &[u8]) -> AnyResult<()> {
+        match self {
+            Self::Stdout => write_stdout(encoded),
+            Self::File(file) => {
+                let destination = file.destination.clone();
+                if let Err(file_error) = file.commit(encoded) {
+                    eprintln!(
+                        "failed to write structured report to {}; emitting it to stdout: {file_error}",
+                        destination.display()
+                    );
+                    if let Err(stdout_error) = write_stdout(encoded) {
+                        return Err(io::Error::other(format!(
+                            "failed to write report to {} ({file_error}); stdout fallback also failed ({stdout_error})",
+                            destination.display()
+                        ))
+                        .into());
+                    }
+                    return Err(file_error);
+                }
+                Ok(())
+            }
         }
     }
+}
+
+impl PreparedReportFile {
+    fn commit(mut self, encoded: &[u8]) -> AnyResult<()> {
+        let mut writer = self
+            .writer
+            .take()
+            .expect("prepared report writer exists until commit");
+        writer.write_all(encoded)?;
+        writer.flush()?;
+        drop(writer);
+        fs::rename(&self.temporary, &self.destination)?;
+        eprintln!("wrote structured report to {}", self.destination.display());
+        Ok(())
+    }
+}
+
+impl Drop for PreparedReportFile {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_file(&self.temporary)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "failed to remove temporary performance report {}: {error}",
+                self.temporary.display()
+            );
+        }
+    }
+}
+
+fn write_stdout(encoded: &[u8]) -> AnyResult<()> {
+    let stdout = io::stdout();
+    let mut writer = stdout.lock();
+    writer.write_all(encoded)?;
+    writer.flush()?;
     Ok(())
 }
 
@@ -1305,14 +1397,15 @@ fn ns_to_ms(nanoseconds: u128) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, io, time::Duration};
+    use std::{collections::HashSet, fs, io, time::Duration};
 
     use postgres_test_harness::ProjectName;
+    use uuid::Uuid;
 
     use super::{
-        CleanupAttemptReport, ExternalCleanupReport, OperationAndCleanupError, SCHEMA_VERSION,
-        SummaryReport, benchmark_project, combine_operation_and_cleanup, summary_report,
-        validate_completed_external_cleanup, validate_external_sweep,
+        CleanupAttemptReport, ExternalCleanupReport, OperationAndCleanupError, ReportOutput,
+        SCHEMA_VERSION, SummaryReport, benchmark_project, combine_operation_and_cleanup,
+        summary_report, validate_completed_external_cleanup, validate_external_sweep,
     };
 
     #[test]
@@ -1380,6 +1473,37 @@ mod tests {
             error.to_string(),
             "measurement failed; cleanup also failed: cleanup failed"
         );
+    }
+
+    #[test]
+    fn report_output_is_prepared_before_work_and_published_atomically() {
+        let root = std::env::temp_dir().join(format!(
+            "postgres-test-harness-performance-{}",
+            Uuid::new_v4().simple()
+        ));
+        let destination = root.join("reports/performance.json");
+        let output = ReportOutput::prepare(Some(&destination)).expect("prepare report output");
+        assert!(!destination.exists());
+
+        output
+            .write_encoded(b"{\"complete\":true}\n")
+            .expect("publish complete report");
+        assert_eq!(
+            fs::read(&destination).expect("read published report"),
+            b"{\"complete\":true}\n"
+        );
+        assert_eq!(
+            fs::read_dir(destination.parent().expect("report parent"))
+                .expect("read report directory")
+                .count(),
+            1
+        );
+
+        let non_directory = root.join("not-a-directory");
+        fs::write(&non_directory, b"blocker").expect("create non-directory parent");
+        assert!(ReportOutput::prepare(Some(&non_directory.join("report.json"))).is_err());
+
+        fs::remove_dir_all(root).expect("remove report test directory");
     }
 
     #[test]

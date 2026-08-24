@@ -4,7 +4,10 @@
 for `postgres-test-harness`. It uses only the crate's public lifecycle API and
 emits a versioned JSON document to stdout by default. Set `PTH_PERF_OUTPUT` to
 write it directly to a file instead. Progress and a compact min/median/max
-summary always go to stderr.
+summary always go to stderr. File destinations are validated before PostgreSQL
+work begins, after source provenance is captured. The completed JSON replaces
+the destination atomically; a final write failure emits the report to stdout
+and still returns an error.
 
 This is characterization, not a correctness test. Durations are observations;
 the example and CI workflow do not contain pass/fail latency thresholds.

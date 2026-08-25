@@ -77,6 +77,21 @@ pub(crate) struct DatabaseRecord {
     pub(crate) comment: Option<String>,
 }
 
+/// Failure from managed-database creation, classified by whether the attempted
+/// operation may have left the requested database behind.
+pub(crate) enum ManagedDatabaseCreationFailure {
+    NoResidual(Error),
+    ResidualPossible(Error),
+}
+
+impl ManagedDatabaseCreationFailure {
+    pub(crate) fn into_error(self) -> Error {
+        match self {
+            Self::NoResidual(error) | Self::ResidualPossible(error) => error,
+        }
+    }
+}
+
 /// Tokio-backed PostgreSQL client with a synchronous internal interface.
 ///
 /// Keeping the runtime here lets connection establishment place one deadline
@@ -734,7 +749,19 @@ pub(crate) fn create_managed_database(
     template_name: &str,
     metadata: &ResourceMetadata,
 ) -> Result<()> {
-    create_database(client, database_name, template_name)?;
+    create_managed_database_classified(client, database_name, template_name, metadata)
+        .map_err(ManagedDatabaseCreationFailure::into_error)
+}
+
+pub(crate) fn create_managed_database_classified(
+    client: &mut AdminClient,
+    database_name: &DatabaseName,
+    template_name: &str,
+    metadata: &ResourceMetadata,
+) -> std::result::Result<(), ManagedDatabaseCreationFailure> {
+    if let Err(error) = create_database(client, database_name, template_name) {
+        return Err(classify_database_creation_failure(error));
+    }
     if let Err(tagging) = set_database_metadata(client, database_name, metadata) {
         return Err(compensate_failed_metadata_write(tagging, || {
             drop_database(client, database_name)
@@ -743,13 +770,31 @@ pub(crate) fn create_managed_database(
     Ok(())
 }
 
-fn compensate_failed_metadata_write(tagging: Error, cleanup: impl FnOnce() -> Result<()>) -> Error {
+fn classify_database_creation_failure(error: Error) -> ManagedDatabaseCreationFailure {
+    if matches!(
+        &error,
+        Error::Postgres { source, .. } if source.as_db_error().is_some()
+    ) {
+        ManagedDatabaseCreationFailure::NoResidual(error)
+    } else {
+        // A client timeout, transport error, or runtime failure can lose the
+        // server's completion response after CREATE DATABASE took effect.
+        ManagedDatabaseCreationFailure::ResidualPossible(error)
+    }
+}
+
+fn compensate_failed_metadata_write(
+    tagging: Error,
+    cleanup: impl FnOnce() -> Result<()>,
+) -> ManagedDatabaseCreationFailure {
     match cleanup() {
-        Ok(()) => tagging,
-        Err(cleanup) => Error::ManagedDatabaseTagAndCleanup {
-            tagging: Box::new(tagging),
-            cleanup: Box::new(cleanup),
-        },
+        Ok(()) => ManagedDatabaseCreationFailure::NoResidual(tagging),
+        Err(cleanup) => {
+            ManagedDatabaseCreationFailure::ResidualPossible(Error::ManagedDatabaseTagAndCleanup {
+                tagging: Box::new(tagging),
+                cleanup: Box::new(cleanup),
+            })
+        }
     }
 }
 
@@ -914,9 +959,10 @@ mod tests {
     };
 
     use super::{
-        AdminClient, AdminDatabaseUrl, AdminSessionPool, CheckoutDeadline, PersistentClient,
-        advisory_key, compensate_failed_metadata_write, connect_admin_with_timeout,
-        quote_identifier, quote_literal, regular_connection_slots_from_settings,
+        AdminClient, AdminDatabaseUrl, AdminSessionPool, CheckoutDeadline,
+        ManagedDatabaseCreationFailure, PersistentClient, advisory_key,
+        compensate_failed_metadata_write, connect_admin_with_timeout, quote_identifier,
+        quote_literal, regular_connection_slots_from_settings,
     };
     use crate::{Error, FingerprintBuilder, ProjectName, name::DatabaseName};
 
@@ -1197,7 +1243,9 @@ mod tests {
         );
         assert!(matches!(
             error,
-            Error::InvalidConfiguration { reason: "tagging" }
+            ManagedDatabaseCreationFailure::NoResidual(Error::InvalidConfiguration {
+                reason: "tagging"
+            })
         ));
     }
 
@@ -1209,7 +1257,9 @@ mod tests {
         );
         assert!(matches!(
             error,
-            Error::ManagedDatabaseTagAndCleanup { tagging, cleanup }
+            ManagedDatabaseCreationFailure::ResidualPossible(
+                Error::ManagedDatabaseTagAndCleanup { tagging, cleanup }
+            )
                 if matches!(*tagging, Error::InvalidConfiguration { reason: "tagging" })
                     && matches!(*cleanup, Error::InvalidConfiguration { reason: "cleanup" })
         ));

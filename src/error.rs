@@ -104,12 +104,20 @@ pub enum Error {
     #[error("PostgreSQL 18 capability check failed: uuidv7() is unavailable")]
     MissingUuidV7,
 
+    #[cfg(not(feature = "containers"))]
+    #[error(
+        "an external PostgreSQL admin URL is required because the 'containers' feature is disabled; configure HarnessConfig::with_admin_database_url or POSTGRES_TEST_ADMIN_URL"
+    )]
+    ExternalAdminUrlRequired,
+
+    #[cfg(feature = "containers")]
     #[error("failed to start the PostgreSQL test container: {source}")]
     ContainerStart {
         #[source]
         source: testcontainers::TestcontainersError,
     },
 
+    #[cfg(feature = "containers")]
     #[error(
         "failed to start the PostgreSQL test container with a {tmpfs_size_bytes}-byte tmpfs storage cap; if this Docker daemon does not support tmpfs mounts, disable tmpfs through OwnedContainerProfile::without_tmpfs: {source}"
     )]
@@ -119,6 +127,7 @@ pub enum Error {
         source: testcontainers::TestcontainersError,
     },
 
+    #[cfg(feature = "containers")]
     #[error(
         "the PostgreSQL test container did not reach its final TCP server within the {timeout:?} startup timeout: {source}"
     )]
@@ -128,11 +137,13 @@ pub enum Error {
         source: Box<Error>,
     },
 
+    #[cfg(feature = "containers")]
     #[error(
         "the PostgreSQL test container stopped before its final TCP server was ready (exit code {exit_code:?})"
     )]
     ContainerExitedBeforeReady { exit_code: Option<i64> },
 
+    #[cfg(feature = "containers")]
     #[error(
         "the PostgreSQL test container exhausted its {tmpfs_size_bytes}-byte tmpfs before its final TCP server was ready ({evidence}); increase the cap with OwnedContainerProfile::with_tmpfs_size_bytes or disable tmpfs with OwnedContainerProfile::without_tmpfs"
     )]
@@ -141,6 +152,7 @@ pub enum Error {
         evidence: &'static str,
     },
 
+    #[cfg(feature = "containers")]
     #[error(
         "the PostgreSQL test container encountered memory exhaustion while using a {tmpfs_size_bytes}-byte tmpfs before its final TCP server was ready ({evidence}); reduce memory pressure, increase the Docker memory allowance, or disable tmpfs with OwnedContainerProfile::without_tmpfs"
     )]
@@ -149,29 +161,35 @@ pub enum Error {
         evidence: &'static str,
     },
 
+    #[cfg(feature = "containers")]
     #[error(
         "the PostgreSQL test container did not finish starting within the {timeout:?} startup timeout"
     )]
     ContainerStartupTimeout { timeout: Duration },
 
+    #[cfg(feature = "containers")]
     #[error("failed to remove the PostgreSQL test container: {source}")]
     ContainerRemove {
         #[source]
         source: testcontainers::TestcontainersError,
     },
 
+    #[cfg(feature = "containers")]
     #[error("failed to start the PostgreSQL container owner thread: {source}")]
     ContainerWorkerStart {
         #[source]
         source: std::io::Error,
     },
 
+    #[cfg(feature = "containers")]
     #[error("the PostgreSQL container owner thread stopped unexpectedly")]
     ContainerWorkerStopped,
 
+    #[cfg(feature = "containers")]
     #[error("the PostgreSQL container owner thread panicked")]
     ContainerWorkerPanicked,
 
+    #[cfg(feature = "containers")]
     #[error("failed to register PostgreSQL container process-exit cleanup")]
     ExitCleanupRegistration,
 
@@ -258,6 +276,7 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    #[cfg(feature = "containers")]
     #[error(
         "deferred PostgreSQL database cleanup failed ({cleanup}); owned-container shutdown also failed ({shutdown})"
     )]

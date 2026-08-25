@@ -279,11 +279,17 @@ the benchmark step. Dispatches are serialized by mode and the job has a
 one-hour ceiling. The workflow is deliberately not a required push or
 pull-request check.
 
-The current crate always compiles owned-container support. When an external-only
-feature is introduced, add `cargo check --no-default-features --example
-performance` (or the feature's final equivalent) to this workflow. The example
-itself does not call Testcontainers and is already expressed through the public
-harness boundary.
+The default `containers` feature includes owned-container support. External-only
+consumers can disable default features; CI compiles the example in that mode,
+and the external characterization runs it with:
+
+```console
+cargo run --locked --no-default-features --release --example performance
+```
+
+That build requires `POSTGRES_TEST_ADMIN_URL` (or an explicit URL in code) and
+does not compile the Testcontainers/container-engine path. The example remains
+expressed through the public harness boundary in both feature modes.
 
 ## Baseline
 

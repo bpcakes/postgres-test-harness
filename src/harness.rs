@@ -63,6 +63,9 @@ impl PostgresHarness {
         self.server.is_external()
     }
 
+    /// Returns the owned container ID, or `None` in external-server mode.
+    ///
+    /// Builds without the `containers` feature always return `None`.
     pub fn container_id(&self) -> Option<&str> {
         self.server.container_id()
     }
@@ -84,7 +87,8 @@ impl PostgresHarness {
     /// can no longer contact a successfully removed server. Cleanup submissions
     /// already accepted by the bounded server queue finish before its pooled
     /// admin sessions and container are closed. Deferred failures are returned
-    /// from this barrier. External-server shutdown remains a no-op; call
+    /// from this barrier. External-server shutdown remains a no-op, including
+    /// in builds without the `containers` feature; call
     /// [`Self::drain_deferred_cleanup`] explicitly for an external server.
     pub async fn shutdown(&self) -> Result<()> {
         self.server.shutdown_container().await

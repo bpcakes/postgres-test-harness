@@ -1,9 +1,9 @@
 # postgres-test-harness
 
 `postgres-test-harness` gives Rust integration tests one PostgreSQL 18 server,
-one immutable migrated template, and one isolated database per test. It starts
-PostgreSQL with Testcontainers by default or uses an externally managed admin
-database when `POSTGRES_TEST_ADMIN_URL` is set.
+one immutable migrated template, and one isolated database per test. Its
+default `containers` feature starts PostgreSQL with Testcontainers; every build
+can instead use an externally managed admin database.
 
 The public API is deliberately independent of SQLx, Diesel, or
 `tokio-postgres`. A project supplies an async initializer that receives a
@@ -237,8 +237,34 @@ removing the container.
 - `POSTGRES_TEST_ADMIN_URL` uses an existing PostgreSQL 18 server instead of
   starting a container. The URL must identify an administrative database and a
   role allowed to create and drop disposable databases. The current admin
-  client expects a local or CI endpoint that does not require TLS.
-- `POSTGRES_TEST_IMAGE` overrides the default `postgres:18` image.
+  client expects a local or CI endpoint that does not require TLS. External-only
+  builds require this variable or `HarnessConfig::with_admin_database_url`.
+- `POSTGRES_TEST_IMAGE` overrides the default `postgres:18` image when the
+  `containers` feature is enabled.
+
+## Cargo features
+
+The default `containers` feature preserves the owned-container behavior and
+API. Consumers that always provide an external PostgreSQL server can avoid
+compiling Testcontainers and its container-engine/TLS dependency graph:
+
+```toml
+[dev-dependencies]
+postgres-test-harness = { version = "0.1.1", default-features = false }
+```
+
+Without `containers`, starting without an explicit or environment-provided
+admin URL returns `Error::ExternalAdminUrlRequired`. `HarnessConfig::with_image`
+and `OwnedContainerProfile` remain available so shared configuration code stays
+source-compatible; their settings are validated but ignored in external mode.
+`PostgresHarness::container_id` always returns `None`, and `shutdown` retains
+its external-server no-op behavior.
+
+`Error` is non-exhaustive. Its owned-container variants, including variants
+whose sources use Testcontainers types, exist only with `containers` enabled;
+`ExternalAdminUrlRequired` exists only when that feature is disabled. Default
+builds therefore retain the prior public Rust API without exposing an optional
+dependency from external-only builds.
 
 ## Owned-container performance profile
 

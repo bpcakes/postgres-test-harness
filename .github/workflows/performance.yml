@@ -88,6 +88,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      - name: Check external-only example
+        run: cargo check --locked --no-default-features --example performance
+
       - name: Cache owned image
         if: inputs.mode == 'owned'
         run: docker pull "$POSTGRES_TEST_IMAGE"
@@ -107,7 +110,7 @@ jobs:
             echo "::error::The external benchmark requires the POSTGRES_TEST_ADMIN_URL repository secret."
             exit 1
           fi
-          cargo run --locked --release --example performance
+          cargo run --locked --no-default-features --release --example performance
 
       - name: Publish run summary
         if: ${{ hashFiles('target/performance.json') != '' }}

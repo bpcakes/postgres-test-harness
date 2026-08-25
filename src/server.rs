@@ -1,14 +1,20 @@
 use std::{
     collections::HashMap,
+    sync::{Arc, Mutex, Weak},
+    time::Duration,
+};
+
+#[cfg(feature = "containers")]
+use std::{
     io::Read,
     sync::{
-        Arc, Mutex, OnceLock, Weak,
+        OnceLock,
         mpsc::{self, RecvTimeoutError, Sender},
     },
     thread::JoinHandle,
-    time::{Duration, Instant, SystemTime},
+    time::{Instant, SystemTime},
 };
-
+#[cfg(feature = "containers")]
 use testcontainers::{
     Container, ContainerRequest, GenericImage, ImageExt,
     core::{IntoContainerPort, Mount, WaitFor},
@@ -21,25 +27,40 @@ use crate::{
     ConnectionLimits, Error, HarnessConfig, ProjectName, Result, TemplateFingerprint,
     admin::{
         AdminClient, AdminDatabaseUrl, AdminSessionPool, PersistentClient, acquire_advisory_lock,
-        advisory_key, connect_admin, connect_admin_with_timeout, regular_connection_slots,
-        validate_postgres_18,
+        advisory_key, connect_admin, regular_connection_slots, validate_postgres_18,
     },
     cleanup::DatabaseCleanupQueue,
-    config::{ImageReference, OwnedContainerProfile},
     harness::PrewarmPoolInner,
     name::DatabaseName,
 };
 
+#[cfg(feature = "containers")]
+use crate::{
+    admin::connect_admin_with_timeout,
+    config::{ImageReference, OwnedContainerProfile},
+};
+
+#[cfg(feature = "containers")]
 const POSTGRES_PORT: u16 = 5432;
+#[cfg(feature = "containers")]
 const POSTGRES_USER: &str = "postgres";
+#[cfg(feature = "containers")]
 const POSTGRES_PASSWORD: &str = "postgres";
+#[cfg(feature = "containers")]
 const POSTGRES_DATABASE: &str = "postgres";
+#[cfg(feature = "containers")]
 const POSTGRES_STORAGE_PATH: &str = "/var/lib/postgresql";
+#[cfg(feature = "containers")]
 const POSTGRES_INITDB_NO_SYNC: &str = "--no-sync";
+#[cfg(feature = "containers")]
 const STARTUP_CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
+#[cfg(feature = "containers")]
 const CONTAINER_ENGINE_STARTUP_TIMEOUT_FLOOR: Duration = Duration::from_secs(60);
+#[cfg(feature = "containers")]
 const STARTUP_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+#[cfg(feature = "containers")]
 const STARTUP_STATUS_INTERVAL: Duration = Duration::from_millis(25);
+#[cfg(feature = "containers")]
 const STARTUP_LOG_LIMIT_BYTES: u64 = 64 * 1024;
 // One harness's lifecycle pool may occupy at most one quarter of PostgreSQL's
 // regular connection slots. Separate harnesses and processes do not coordinate
@@ -50,12 +71,18 @@ const LIFECYCLE_ADMIN_CONNECTION_SHARE_DIVISOR: usize = 4;
 // other lifecycle work, and cap the per-server thread footprint explicitly.
 const CLEANUP_ADMIN_SESSION_SHARE_DIVISOR: usize = 2;
 const MAX_CLEANUP_WORKERS: usize = 4;
+#[cfg(feature = "containers")]
 const MANAGED_LABEL: &str = "org.postgres-test-harness.managed";
+#[cfg(feature = "containers")]
 const PROJECT_LABEL: &str = "org.postgres-test-harness.project";
+#[cfg(feature = "containers")]
 const RUN_LABEL: &str = "org.postgres-test-harness.run";
+#[cfg(feature = "containers")]
 const CREATED_LABEL: &str = "org.postgres-test-harness.created";
 
+#[cfg(feature = "containers")]
 static CONTAINER_REGISTRY: OnceLock<Mutex<Vec<Weak<ContainerOwner>>>> = OnceLock::new();
+#[cfg(feature = "containers")]
 static EXIT_REGISTRATION: OnceLock<i32> = OnceLock::new();
 
 pub(crate) struct ServerInner {
@@ -139,33 +166,39 @@ impl ServerInner {
             );
         }
 
-        let startup_started = Instant::now();
-        let image = config.resolved_image()?;
-        let profile = config.owned_container_profile;
-        let (container, admin_url) = ContainerOwner::start(
-            image,
-            profile,
-            &config.project,
-            &run_id,
-            config.startup_timeout,
-        )?;
-        let owner_lock = wait_for_owned_server(
-            &admin_url,
-            config.operation_timeout,
-            startup_started,
-            config.startup_timeout,
-            profile,
-            &container,
-        )?;
-        container.mark_ready()?;
-        Self::finish_start_with_client(
-            config,
-            connection_limits,
-            admin_url,
-            Some(container),
-            owner_key,
-            owner_lock,
-        )
+        #[cfg(not(feature = "containers"))]
+        return Err(Error::ExternalAdminUrlRequired);
+
+        #[cfg(feature = "containers")]
+        {
+            let startup_started = Instant::now();
+            let image = config.resolved_image()?;
+            let profile = config.owned_container_profile;
+            let (container, admin_url) = ContainerOwner::start(
+                image,
+                profile,
+                &config.project,
+                &run_id,
+                config.startup_timeout,
+            )?;
+            let owner_lock = wait_for_owned_server(
+                &admin_url,
+                config.operation_timeout,
+                startup_started,
+                config.startup_timeout,
+                profile,
+                &container,
+            )?;
+            container.mark_ready()?;
+            Self::finish_start_with_client(
+                config,
+                connection_limits,
+                admin_url,
+                Some(container),
+                owner_key,
+                owner_lock,
+            )
+        }
     }
 
     fn finish_start(
@@ -316,6 +349,7 @@ impl ServerInner {
         Ok(())
     }
 
+    #[cfg(feature = "containers")]
     fn close_prewarm_pools(&self) {
         let pools = std::mem::take(
             &mut *self
@@ -349,33 +383,49 @@ impl ServerInner {
     }
 
     pub(crate) fn container_id(&self) -> Option<&str> {
-        self.container
-            .as_ref()
-            .map(|container| container.id.as_str())
+        #[cfg(feature = "containers")]
+        {
+            self.container
+                .as_ref()
+                .map(|container| container.id.as_str())
+        }
+        #[cfg(not(feature = "containers"))]
+        {
+            None
+        }
     }
 
     pub(crate) async fn shutdown_container(&self) -> Result<()> {
-        let Some(container) = begin_owned_container_shutdown(self.container.as_ref(), &self.budget)
-        else {
-            return Ok(());
-        };
-        // Queue every idle prewarmed database before fixing the cleanup
-        // barrier's target. This also prevents in-flight dirty returns from
-        // creating replacements during terminal shutdown.
-        self.close_prewarm_pools();
-        let database_cleanup = self.database_cleanup.clone();
-        let admin_sessions = self.admin_sessions.clone();
-        // Keep the whole terminal sequence in one blocking task. Cancellation
-        // of the async caller can detach this task, but cannot skip pool closure
-        // or container removal after the cleanup barrier has begun.
-        let outcome = run_blocking(move || {
-            let cleanup = database_cleanup.close_and_begin_drain();
-            admin_sessions.close();
-            let shutdown = container.shutdown();
-            Ok(OwnedShutdownOutcome { cleanup, shutdown })
-        })
-        .await?;
-        outcome.finish()
+        #[cfg(not(feature = "containers"))]
+        {
+            Ok(())
+        }
+
+        #[cfg(feature = "containers")]
+        {
+            let Some(container) =
+                begin_owned_container_shutdown(self.container.as_ref(), &self.budget)
+            else {
+                return Ok(());
+            };
+            // Queue every idle prewarmed database before fixing the cleanup
+            // barrier's target. This also prevents in-flight dirty returns from
+            // creating replacements during terminal shutdown.
+            self.close_prewarm_pools();
+            let database_cleanup = self.database_cleanup.clone();
+            let admin_sessions = self.admin_sessions.clone();
+            // Keep the whole terminal sequence in one blocking task. Cancellation
+            // of the async caller can detach this task, but cannot skip pool closure
+            // or container removal after the cleanup barrier has begun.
+            let outcome = run_blocking(move || {
+                let cleanup = database_cleanup.close_and_begin_drain();
+                admin_sessions.close();
+                let shutdown = container.shutdown();
+                Ok(OwnedShutdownOutcome { cleanup, shutdown })
+            })
+            .await?;
+            outcome.finish()
+        }
     }
 }
 
@@ -495,17 +545,20 @@ impl TemplateInner {
     }
 }
 
+#[cfg(feature = "containers")]
 struct OwnedShutdownOutcome {
     cleanup: crate::cleanup::CleanupDrainOutcome,
     shutdown: Result<()>,
 }
 
+#[cfg(feature = "containers")]
 impl OwnedShutdownOutcome {
     fn finish(self) -> Result<()> {
         combine_cleanup_and_shutdown(self.cleanup.finish(), self.shutdown)
     }
 }
 
+#[cfg(feature = "containers")]
 fn combine_cleanup_and_shutdown(cleanup: Result<()>, shutdown: Result<()>) -> Result<()> {
     match (cleanup, shutdown) {
         (Ok(()), Ok(())) => Ok(()),
@@ -546,6 +599,7 @@ fn cleanup_queue_limits(admin_pool_size: usize) -> CleanupQueueLimits {
     }
 }
 
+#[cfg(feature = "containers")]
 fn begin_owned_container_shutdown(
     container: Option<&Arc<ContainerOwner>>,
     budget: &Semaphore,
@@ -565,37 +619,47 @@ where
         .map_err(|source| Error::BlockingTask { source })?
 }
 
+#[cfg(feature = "containers")]
 type RemovalResult = std::result::Result<(), testcontainers::TestcontainersError>;
 
+#[cfg(feature = "containers")]
 #[derive(Clone, Copy)]
 enum ContainerCommand {
     Ready,
     Shutdown,
 }
 
+#[cfg(feature = "containers")]
 struct ContainerWorker {
     shutdown: Sender<ContainerCommand>,
     handle: JoinHandle<RemovalResult>,
 }
 
 #[derive(Clone)]
+#[cfg(feature = "containers")]
 struct ContainerExit {
     exit_code: Option<i64>,
     output: Vec<u8>,
 }
 
+#[cfg(feature = "containers")]
 struct StartedContainer {
     id: String,
     host: String,
     port: u16,
 }
 
+#[cfg(feature = "containers")]
 pub(crate) struct ContainerOwner {
     id: String,
     worker: Mutex<Option<ContainerWorker>>,
     startup_exit: Arc<Mutex<Option<ContainerExit>>>,
 }
 
+#[cfg(not(feature = "containers"))]
+pub(crate) struct ContainerOwner;
+
+#[cfg(feature = "containers")]
 impl ContainerOwner {
     fn start(
         image: ImageReference,
@@ -722,6 +786,7 @@ impl ContainerOwner {
     }
 }
 
+#[cfg(feature = "containers")]
 fn join_failed_startup_worker(worker: JoinHandle<RemovalResult>) -> Result<()> {
     worker
         .join()
@@ -729,6 +794,7 @@ fn join_failed_startup_worker(worker: JoinHandle<RemovalResult>) -> Result<()> {
         .map_err(|source| Error::ContainerRemove { source })
 }
 
+#[cfg(feature = "containers")]
 impl Drop for ContainerOwner {
     fn drop(&mut self) {
         if let Err(error) = self.shutdown() {
@@ -740,6 +806,7 @@ impl Drop for ContainerOwner {
     }
 }
 
+#[cfg(feature = "containers")]
 fn container_request(
     image: ImageReference,
     profile: OwnedContainerProfile,
@@ -793,6 +860,7 @@ fn container_request(
     request
 }
 
+#[cfg(feature = "containers")]
 fn wait_for_owned_server(
     admin_url: &AdminDatabaseUrl,
     operation_timeout: Duration,
@@ -841,6 +909,7 @@ fn wait_for_owned_server(
     }
 }
 
+#[cfg(feature = "containers")]
 fn monitor_container_startup(
     container: &Container<GenericImage>,
     commands: &mpsc::Receiver<ContainerCommand>,
@@ -870,6 +939,7 @@ fn monitor_container_startup(
     }
 }
 
+#[cfg(feature = "containers")]
 fn bounded_container_output(container: &Container<GenericImage>) -> Vec<u8> {
     let mut output = Vec::new();
     let _ = container
@@ -886,6 +956,7 @@ fn bounded_container_output(container: &Container<GenericImage>) -> Vec<u8> {
     output
 }
 
+#[cfg(feature = "containers")]
 fn container_exit_error(profile: OwnedContainerProfile, exit: ContainerExit) -> Error {
     if let Some(tmpfs_size_bytes) = profile.tmpfs_size_bytes() {
         if let Some(evidence) = storage_exhaustion_evidence(&exit.output) {
@@ -906,6 +977,7 @@ fn container_exit_error(profile: OwnedContainerProfile, exit: ContainerExit) -> 
     }
 }
 
+#[cfg(feature = "containers")]
 fn storage_exhaustion_evidence(output: &[u8]) -> Option<&'static str> {
     let output = String::from_utf8_lossy(output).to_ascii_lowercase();
     if output.contains("no space left on device") {
@@ -915,6 +987,7 @@ fn storage_exhaustion_evidence(output: &[u8]) -> Option<&'static str> {
     }
 }
 
+#[cfg(feature = "containers")]
 fn memory_exhaustion_evidence(output: &[u8], exit_code: Option<i64>) -> Option<&'static str> {
     let output = String::from_utf8_lossy(output).to_ascii_lowercase();
     if output.contains("cannot allocate memory") || output.contains("out of memory") {
@@ -926,6 +999,7 @@ fn memory_exhaustion_evidence(output: &[u8], exit_code: Option<i64>) -> Option<&
     }
 }
 
+#[cfg(feature = "containers")]
 fn map_container_start_error(
     profile: OwnedContainerProfile,
     source: testcontainers::TestcontainersError,
@@ -939,6 +1013,7 @@ fn map_container_start_error(
     }
 }
 
+#[cfg(feature = "containers")]
 fn resolve_started_container(
     container: &Container<GenericImage>,
 ) -> std::result::Result<StartedContainer, testcontainers::TestcontainersError> {
@@ -949,6 +1024,7 @@ fn resolve_started_container(
     })
 }
 
+#[cfg(feature = "containers")]
 fn resolve_started_container_with_retry(
     container: &Container<GenericImage>,
     startup_timeout: Duration,
@@ -970,6 +1046,7 @@ fn resolve_started_container_with_retry(
     }
 }
 
+#[cfg(feature = "containers")]
 fn ipv4_mapped_container_host(host: String) -> String {
     if host.eq_ignore_ascii_case("localhost") {
         "127.0.0.1".to_owned()
@@ -978,6 +1055,7 @@ fn ipv4_mapped_container_host(host: String) -> String {
     }
 }
 
+#[cfg(feature = "containers")]
 fn register_container(container: &Arc<ContainerOwner>) -> Result<()> {
     let registration = *EXIT_REGISTRATION.get_or_init(|| {
         // SAFETY: the callback has the required C ABI and only accesses
@@ -998,6 +1076,7 @@ fn register_container(container: &Arc<ContainerOwner>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "containers")]
 extern "C" fn cleanup_owned_containers_at_exit() {
     let Some(registry) = CONTAINER_REGISTRY.get() else {
         return;
@@ -1018,6 +1097,7 @@ extern "C" fn cleanup_owned_containers_at_exit() {
     }
 }
 
+#[cfg(feature = "containers")]
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -1025,7 +1105,7 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "containers"))]
 mod tests {
     use std::{
         sync::{

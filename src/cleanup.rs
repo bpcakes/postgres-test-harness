@@ -297,6 +297,7 @@ impl DatabaseCleanupQueue {
 
     /// Stops accepting work, drains all accepted work, and joins the workers.
     /// Used by owned shutdown before the admin pool or container is closed.
+    #[cfg(any(feature = "containers", test))]
     pub(crate) fn close_and_begin_drain(self: &Arc<Self>) -> CleanupDrainOutcome {
         let _drain = self
             .drain

@@ -299,6 +299,7 @@ impl AdminSessionPool {
         result
     }
 
+    #[cfg(feature = "containers")]
     pub(crate) fn close(&self) {
         let idle = {
             let mut state = self

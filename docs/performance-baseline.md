@@ -384,3 +384,36 @@ distinct templates have independent queues, a pool retains its template lock,
 and an injected missing-template refill failure reaches the drain barrier and
 closes the queue. The raw local report is
 `target/performance-owned-perf05.json`.
+
+## PERF08 external-only compile follow-up
+
+On 2026-08-25, the feature-gated implementation was measured with Rust/Cargo
+1.97.1 on the same 64-logical-CPU Linux host. Both commands used the warm Cargo
+source cache but a distinct empty target directory, `--locked`, and `--lib`, so
+neither build reused compiled artifacts from the other:
+
+```console
+cargo check --locked --lib
+cargo check --locked --no-default-features --lib
+```
+
+One directional clean-target observation was:
+
+| Build | Elapsed | User CPU | System CPU | Peak RSS | Normal/build tree entries |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Default `containers` | 19.70 s | 78.89 s | 21.07 s | 594,256 KiB | 277 |
+| External only | 5.20 s | 20.26 s | 6.34 s | 326,896 KiB | 110 |
+
+The external-only observation reduced elapsed check time by 73.6%, peak RSS by
+45.0%, and unique `cargo tree --edges normal,build` lines by 60.3% on this
+machine. These are compile-cost observations, not stable thresholds.
+
+`cargo tree --no-default-features` contained no Testcontainers, Bollard,
+Rustls, or Ring node, and the harness root had no direct `libc` edge. `libc`
+remained transitively necessary through Tokio/Postgres networking, UUID random
+generation, and related platform crates, so making the container cleanup use
+optional removed the direct edge but could not remove that platform package.
+The ignored external-only lifecycle test also attached to a separately started
+PostgreSQL 18.1 container, created a template and disposable databases, cleaned
+them, and confirmed external `shutdown` remained a no-op; the temporary
+container was removed after validation.

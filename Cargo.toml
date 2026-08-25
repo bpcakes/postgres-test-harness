@@ -12,10 +12,14 @@ keywords = ["postgres", "testing", "testcontainers", "database"]
 categories = ["development-tools::testing", "database"]
 exclude = ["/.beads/**", "/.github/**", "/AGENTS.md"]
 
+[features]
+default = ["containers"]
+containers = ["dep:libc", "dep:testcontainers"]
+
 [dependencies]
-libc = "0.2"
+libc = { version = "0.2", optional = true }
 sha2 = "0.11"
-testcontainers = { version = "0.27.3", default-features = false, features = ["blocking", "ring", "watchdog"] }
+testcontainers = { version = "0.27.3", default-features = false, features = ["blocking", "ring", "watchdog"], optional = true }
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "sync", "time"] }
 tokio-postgres = "0.7"

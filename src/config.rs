@@ -5,6 +5,7 @@ use crate::{Error, Result};
 pub const POSTGRES_TEST_ADMIN_URL_ENV: &str = "POSTGRES_TEST_ADMIN_URL";
 pub const POSTGRES_TEST_IMAGE_ENV: &str = "POSTGRES_TEST_IMAGE";
 
+#[cfg(feature = "containers")]
 const DEFAULT_IMAGE: &str = "postgres:18";
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(90);
@@ -29,6 +30,9 @@ pub const DEFAULT_OWNED_CONTAINER_TMPFS_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
 /// command, and mapped-TCP contracts as the Docker Official PostgreSQL 18
 /// image. Disable either optimization when a compatible custom image or Docker
 /// daemon cannot provide it.
+///
+/// This type remains available without the `containers` feature so shared
+/// configuration code can compile, but external-only startup ignores it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OwnedContainerProfile {
     initdb_no_sync: bool,
@@ -213,6 +217,10 @@ impl HarnessConfig {
         self
     }
 
+    /// Selects and validates the image used for owned-container startup.
+    ///
+    /// The setting is retained but ignored for external-server startup,
+    /// including builds compiled without the `containers` feature.
     pub fn with_image(mut self, image: impl Into<String>) -> Result<Self> {
         let image = image.into();
         ImageReference::parse(&image)?;
@@ -221,7 +229,8 @@ impl HarnessConfig {
     }
 
     /// Replaces the profile applied when this configuration starts an owned
-    /// container. External-server mode ignores the profile.
+    /// container. External-server mode, including builds without the
+    /// `containers` feature, ignores the profile.
     pub fn with_owned_container_profile(mut self, profile: OwnedContainerProfile) -> Self {
         self.owned_container_profile = profile;
         self
@@ -325,6 +334,7 @@ impl HarnessConfig {
             .or_else(|| std::env::var(POSTGRES_TEST_ADMIN_URL_ENV).ok())
     }
 
+    #[cfg(feature = "containers")]
     pub(crate) fn resolved_image(&self) -> Result<ImageReference> {
         let image = self
             .image

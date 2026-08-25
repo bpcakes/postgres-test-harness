@@ -1,3 +1,5 @@
+#![cfg(feature = "containers")]
+
 use std::{
     fs,
     process::Command,

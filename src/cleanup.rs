@@ -6,9 +6,9 @@ use std::{
     thread::JoinHandle,
 };
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, oneshot};
 
-use crate::{DeferredCleanupFailure, Error, Result};
+use crate::{DeferredCleanupFailure, Error, Result, admission::DatabaseAdmission};
 
 type CleanupOperation = Box<dyn FnOnce() -> CleanupOutcome + Send + 'static>;
 
@@ -86,7 +86,7 @@ struct SubmissionState {
 struct CompletionState {
     state: Mutex<CompletionStateInner>,
     changed: Condvar,
-    database_admission: Arc<Semaphore>,
+    database_admission: Arc<DatabaseAdmission>,
 }
 
 struct CompletionStateInner {
@@ -144,7 +144,7 @@ impl DatabaseCleanupQueue {
         project: &str,
         worker_count: usize,
         queue_capacity: usize,
-        database_admission: Arc<Semaphore>,
+        database_admission: Arc<DatabaseAdmission>,
     ) -> Result<Arc<Self>> {
         debug_assert!(worker_count > 0);
         debug_assert!(queue_capacity > 0);
@@ -747,7 +747,7 @@ mod tests {
     };
 
     use super::{CleanupOutcome, DatabaseCleanupQueue};
-    use crate::Error;
+    use crate::{Error, admission::DatabaseAdmission};
 
     struct Gate {
         open: Mutex<bool>,
@@ -780,7 +780,7 @@ mod tests {
             project,
             workers,
             capacity,
-            Arc::new(tokio::sync::Semaphore::new(64)),
+            Arc::new(DatabaseAdmission::new(64)),
         )
         .unwrap()
     }
@@ -902,7 +902,7 @@ mod tests {
 
     #[test]
     fn drain_reports_deferred_failures_once() {
-        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let admission = Arc::new(DatabaseAdmission::new(1));
         let queue = DatabaseCleanupQueue::new("failure", 2, 2, admission.clone()).unwrap();
         queue
             .submit_deferred("broken-a".to_owned(), None, || {
@@ -919,14 +919,10 @@ mod tests {
             })
             .unwrap();
         let error = queue.drain().unwrap_err();
-        let Error::DeferredCleanup {
-            failure_count,
-            failures,
-        } = error
-        else {
+        let Error::DeferredCleanup { failures } = error else {
             panic!("unexpected drain error: {error:?}");
         };
-        assert_eq!(failure_count, 2);
+        assert_eq!(failures.len(), 2);
         let mut database_names = failures
             .iter()
             .map(|failure| failure.database_name())
@@ -947,7 +943,7 @@ mod tests {
 
     #[test]
     fn failure_without_residual_keeps_database_admission_open() {
-        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let admission = Arc::new(DatabaseAdmission::new(1));
         let queue = DatabaseCleanupQueue::new("no-residual", 1, 1, admission.clone()).unwrap();
         queue
             .submit_deferred_outcome("refill".to_owned(), None, || {
@@ -995,10 +991,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error,
-            Error::DeferredCleanup {
-                failure_count: 1,
-                ..
-            }
+            Error::DeferredCleanup { ref failures } if failures.len() == 1
         ));
         queue.drain().unwrap();
     }
@@ -1075,10 +1068,7 @@ mod tests {
         let error = queue.drain().unwrap_err();
         assert!(matches!(
             error,
-            Error::DeferredCleanup {
-                failure_count: 1,
-                ..
-            }
+            Error::DeferredCleanup { ref failures } if failures.len() == 1
         ));
     }
 

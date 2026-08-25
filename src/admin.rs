@@ -11,7 +11,10 @@ use tokio::{runtime::Runtime, task::JoinHandle};
 use tokio_postgres::{NoTls, Row, types::ToSql};
 use url::Url;
 
-use crate::{Error, Result, metadata::ResourceMetadata, name::DatabaseName};
+use crate::{
+    Error, Result, admission::ManagedDatabaseCreationFailure, metadata::ResourceMetadata,
+    name::DatabaseName,
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 // Give PostgreSQL enough time to report its own `statement_timeout` error;
@@ -75,13 +78,6 @@ impl fmt::Debug for AdminDatabaseUrl {
 pub(crate) struct DatabaseRecord {
     pub(crate) name: String,
     pub(crate) comment: Option<String>,
-}
-
-/// Failure from managed-database creation, classified by whether the attempted
-/// operation may have left the requested database behind.
-pub(crate) enum ManagedDatabaseCreationFailure {
-    NoResidual(Error),
-    ResidualPossible(Error),
 }
 
 /// Tokio-backed PostgreSQL client with a synchronous internal interface.
@@ -812,7 +808,11 @@ fn create_database(
     )
 }
 
-pub(crate) fn create_managed_database_classified(
+/// Performs the raw PostgreSQL creation attempt.
+///
+/// Callers that create harness-managed databases must route this through the
+/// server's [`DatabaseAdmission`](crate::admission::DatabaseAdmission) gate.
+pub(crate) fn attempt_managed_database_creation(
     client: &mut AdminClient,
     database_name: &DatabaseName,
     template_name: &str,
@@ -1018,12 +1018,15 @@ mod tests {
     };
 
     use super::{
-        AdminClient, AdminDatabaseUrl, AdminSessionPool, Deadline, ManagedDatabaseCreationFailure,
-        PersistentClient, advisory_key, compensate_failed_metadata_write,
-        connect_admin_with_setup_timeout, connect_admin_with_timeout, quote_identifier,
-        quote_literal, regular_connection_slots_from_settings,
+        AdminClient, AdminDatabaseUrl, AdminSessionPool, Deadline, PersistentClient, advisory_key,
+        compensate_failed_metadata_write, connect_admin_with_setup_timeout,
+        connect_admin_with_timeout, quote_identifier, quote_literal,
+        regular_connection_slots_from_settings,
     };
-    use crate::{Error, FingerprintBuilder, ProjectName, name::DatabaseName};
+    use crate::{
+        Error, FingerprintBuilder, ProjectName, admission::ManagedDatabaseCreationFailure,
+        name::DatabaseName,
+    };
 
     #[test]
     fn regular_connection_capacity_excludes_both_reserved_slot_classes() {

@@ -1302,6 +1302,18 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         )
         .await
         .expect("remove injected awaited-cleanup residual");
+        let template_after_terminal_admission = failure_harness
+            .template(
+                TemplateSpec::new(
+                    FingerprintBuilder::new("template-after-terminal-admission").finish(),
+                ),
+                |_| async { Ok::<_, BoxError>(()) },
+            )
+            .await;
+        assert!(matches!(
+            template_after_terminal_admission,
+            Err(Error::ConnectionBudgetClosed)
+        ));
 
         let catalog_lock = CatalogLock::acquire(admin_url.clone()).await;
         database
@@ -1317,14 +1329,10 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         .await
         .expect("deferred failure drain should remain bounded")
         .expect_err("the catalog lock should make deferred DROP time out");
-        let Error::DeferredCleanup {
-            failure_count,
-            failures,
-        } = error
-        else {
+        let Error::DeferredCleanup { failures, .. } = error else {
             panic!("unexpected deferred failure: {error:?}");
         };
-        assert_eq!(failure_count, 1);
+        assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].database_name(), database_name);
         assert!(matches!(
             failures[0].source_error(),

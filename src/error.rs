@@ -231,9 +231,12 @@ pub enum Error {
     #[error("a deferred PostgreSQL database cleanup worker panicked")]
     CleanupWorkerPanicked,
 
-    #[error("deferred PostgreSQL database cleanup failed for {failure_count} database(s)")]
+    #[error(
+        "deferred PostgreSQL database cleanup failed for {} database(s)",
+        .failures.len()
+    )]
+    #[non_exhaustive]
     DeferredCleanup {
-        failure_count: usize,
         failures: Vec<DeferredCleanupFailure>,
     },
 
@@ -285,6 +288,16 @@ pub enum Error {
         cleanup: Box<Error>,
         shutdown: Box<Error>,
     },
+
+    #[cfg(feature = "containers")]
+    #[error(
+        "PostgreSQL container startup failed ({startup}); cleanup of the partially started container also failed ({cleanup})"
+    )]
+    ContainerStartupAndCleanup {
+        #[source]
+        startup: Box<Error>,
+        cleanup: Box<Error>,
+    },
 }
 
 impl Error {
@@ -293,10 +306,7 @@ impl Error {
     }
 
     pub(crate) fn deferred_cleanup(failures: Vec<DeferredCleanupFailure>) -> Self {
-        Self::DeferredCleanup {
-            failure_count: failures.len(),
-            failures,
-        }
+        Self::DeferredCleanup { failures }
     }
 }
 
@@ -304,7 +314,26 @@ impl Error {
 mod tests {
     use std::error::Error as _;
 
-    use super::Error;
+    use super::{DeferredCleanupFailure, Error};
+
+    #[test]
+    fn deferred_cleanup_count_is_derived_from_failures() {
+        let error = Error::deferred_cleanup(vec![
+            DeferredCleanupFailure::new(
+                "first".to_owned(),
+                Error::InvalidConfiguration { reason: "one" },
+            ),
+            DeferredCleanupFailure::new(
+                "second".to_owned(),
+                Error::InvalidConfiguration { reason: "two" },
+            ),
+        ]);
+
+        assert_eq!(
+            error.to_string(),
+            "deferred PostgreSQL database cleanup failed for 2 database(s)"
+        );
+    }
 
     #[test]
     fn combined_initializer_error_preserves_a_source() {

@@ -15,14 +15,13 @@ use crate::{
     BoxError, ConnectionLimits, Error, HarnessConfig, ProjectName, Result, TemplateFingerprint,
     TemplateSpec,
     admin::{
-        AdminClient, AdminDatabaseUrl, AdminSessionDisposition, DatabaseRecord,
-        ManagedDatabaseCreationFailure, PersistentClient, acquire_shared_template_advisory_lock,
-        acquire_template_advisory_lock, advisory_key, connect_admin,
-        create_managed_database_classified, disable_database_connections, drop_database,
-        find_database, list_databases, release_advisory_lock, release_shared_advisory_lock,
-        set_database_metadata, terminate_database_connections, try_acquire_advisory_lock,
-        validate_postgres_18,
+        AdminClient, AdminDatabaseUrl, AdminSessionDisposition, DatabaseRecord, PersistentClient,
+        acquire_shared_template_advisory_lock, acquire_template_advisory_lock, advisory_key,
+        connect_admin, disable_database_connections, drop_database, find_database, list_databases,
+        release_advisory_lock, release_shared_advisory_lock, set_database_metadata,
+        terminate_database_connections, try_acquire_advisory_lock, validate_postgres_18,
     },
+    admission::ManagedDatabaseCreationFailure,
     cleanup::{CleanupOutcome, log_cleanup},
     metadata::{ResourceMetadata, TemplateState},
     name::{DatabaseKind, DatabaseName},
@@ -917,7 +916,7 @@ fn database_cleanup_operation(
                 }
 
                 let fresh_name = DatabaseName::test(&operation_server.project);
-                if let Err(error) = create_managed_database_classified(
+                if let Err(error) = operation_server.create_managed_database_classified(
                     client,
                     &fresh_name,
                     refill.pool.template.name().as_str(),
@@ -1106,18 +1105,19 @@ fn begin_template(
             }
             drop_database(client, &name)?;
         }
-        create_managed_database_with_admission_guard(
-            &server,
-            client,
-            &name,
-            "template0",
-            &ResourceMetadata::template(
-                server.project.clone(),
-                lock_key,
-                fingerprint,
-                TemplateState::Initializing,
-            ),
-        )?;
+        server
+            .create_managed_database_classified(
+                client,
+                &name,
+                "template0",
+                &ResourceMetadata::template(
+                    server.project.clone(),
+                    lock_key,
+                    fingerprint,
+                    TemplateState::Initializing,
+                ),
+            )
+            .map_err(ManagedDatabaseCreationFailure::into_error)?;
         return Ok(TemplatePreparation::Initialize(TemplateInitialization {
             server,
             name,
@@ -1233,13 +1233,14 @@ async fn create_test_database(
     let database_url = server.admin_url.database_url(&name);
     run_blocking(move || {
         server.with_lifecycle_admin("connect for disposable database creation", |client| {
-            create_managed_database_with_admission_guard(
-                &server,
-                client,
-                &name,
-                &template_name,
-                &ResourceMetadata::test(server.project.clone(), server.owner_key),
-            )
+            server
+                .create_managed_database_classified(
+                    client,
+                    &name,
+                    &template_name,
+                    &ResourceMetadata::test(server.project.clone(), server.owner_key),
+                )
+                .map_err(ManagedDatabaseCreationFailure::into_error)
         })?;
         Ok(DatabaseLease {
             inner: Some(DatabaseLeaseInner {
@@ -1262,13 +1263,14 @@ async fn create_unpublished_database(
         let name = DatabaseName::test(&server.project);
         let database_url = server.admin_url.database_url(&name);
         server.with_lifecycle_admin("connect for prewarmed database creation", |client| {
-            create_managed_database_with_admission_guard(
-                &server,
-                client,
-                &name,
-                &template_name,
-                &ResourceMetadata::test(server.project.clone(), server.owner_key),
-            )
+            server
+                .create_managed_database_classified(
+                    client,
+                    &name,
+                    &template_name,
+                    &ResourceMetadata::test(server.project.clone(), server.owner_key),
+                )
+                .map_err(ManagedDatabaseCreationFailure::into_error)
         })?;
         Ok(UnpublishedDatabase {
             server,
@@ -1276,33 +1278,6 @@ async fn create_unpublished_database(
         })
     })
     .await
-}
-
-fn create_managed_database_with_admission_guard(
-    server: &ServerInner,
-    client: &mut AdminClient,
-    database_name: &DatabaseName,
-    template_name: &str,
-    metadata: &ResourceMetadata,
-) -> Result<()> {
-    enforce_creation_residual_policy(
-        create_managed_database_classified(client, database_name, template_name, metadata),
-        || server.close_database_admission(),
-    )
-}
-
-fn enforce_creation_residual_policy(
-    result: std::result::Result<(), ManagedDatabaseCreationFailure>,
-    close_admission: impl FnOnce(),
-) -> Result<()> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(ManagedDatabaseCreationFailure::NoResidual(error)) => Err(error),
-        Err(ManagedDatabaseCreationFailure::ResidualPossible(error)) => {
-            close_admission();
-            Err(error)
-        }
-    }
 }
 
 fn queue_unpublished_database(server: Arc<ServerInner>, prepared: PreparedDatabase) {
@@ -1584,50 +1559,15 @@ mod tests {
     use super::{
         CleanupClassification, CleanupReport, PreparedDatabase, PrewarmPoolState,
         PrewarmReturnPhase, acquire_database_permit_or_pool_close, classify_cleanup_record,
-        enforce_creation_residual_policy, finish_locked_cleanup,
-        recoverable_template_initialization, revalidate_cleanup_candidate, run_blocking,
-        template_coordination_key, template_lock_key, template_record_is_ready,
+        finish_locked_cleanup, recoverable_template_initialization, revalidate_cleanup_candidate,
+        run_blocking, template_coordination_key, template_lock_key, template_record_is_ready,
     };
     use crate::{
         Error, FingerprintBuilder, ProjectName,
-        admin::{DatabaseRecord, ManagedDatabaseCreationFailure},
+        admin::DatabaseRecord,
         metadata::{ResourceMetadata, TemplateState},
         name::{DatabaseKind, DatabaseName},
     };
-
-    #[test]
-    fn ambiguous_creation_closes_admission_but_proven_failure_does_not() {
-        let admission_closed = AtomicBool::new(false);
-        let error = enforce_creation_residual_policy(
-            Err(ManagedDatabaseCreationFailure::NoResidual(
-                Error::InvalidConfiguration { reason: "proven" },
-            )),
-            || admission_closed.store(true, Ordering::SeqCst),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            Error::InvalidConfiguration { reason: "proven" }
-        ));
-        assert!(!admission_closed.load(Ordering::SeqCst));
-
-        let error = enforce_creation_residual_policy(
-            Err(ManagedDatabaseCreationFailure::ResidualPossible(
-                Error::InvalidConfiguration {
-                    reason: "ambiguous",
-                },
-            )),
-            || admission_closed.store(true, Ordering::SeqCst),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            Error::InvalidConfiguration {
-                reason: "ambiguous"
-            }
-        ));
-        assert!(admission_closed.load(Ordering::SeqCst));
-    }
 
     struct DropProbe(Arc<AtomicBool>);
 

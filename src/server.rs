@@ -20,18 +20,20 @@ use testcontainers::{
     core::{IntoContainerPort, Mount, WaitFor},
     runners::SyncRunner,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, watch};
 use uuid::Uuid;
 
 use crate::{
     ConnectionLimits, Error, HarnessConfig, ProjectName, Result, TemplateFingerprint,
     admin::{
         AdminClient, AdminDatabaseUrl, AdminSessionDisposition, AdminSessionPool, PersistentClient,
-        acquire_advisory_lock, advisory_key, connect_admin, regular_connection_slots,
-        validate_postgres_18,
+        acquire_advisory_lock, advisory_key, attempt_managed_database_creation, connect_admin,
+        regular_connection_slots, validate_postgres_18,
     },
+    admission::{DatabaseAdmission, ManagedDatabaseCreationFailure},
     cleanup::DatabaseCleanupQueue,
     harness::PrewarmPoolInner,
+    metadata::ResourceMetadata,
     name::DatabaseName,
 };
 
@@ -95,7 +97,7 @@ pub(crate) struct ServerInner {
     pub(crate) stale_after: Duration,
     pub(crate) cleanup_on_start: bool,
     pub(crate) connection_limits: ConnectionLimits,
-    budget: Arc<Semaphore>,
+    database_admission: Arc<DatabaseAdmission>,
     pub(crate) database_cleanup: Arc<DatabaseCleanupQueue>,
     admin_sessions: Arc<AdminSessionPool>,
     template_cache: Mutex<TemplateCache>,
@@ -273,7 +275,9 @@ impl ServerInner {
             config.project.as_str(),
             admin_pool_size,
         ));
-        let budget = Arc::new(Semaphore::new(connection_limits.connection_budget()));
+        let database_admission = Arc::new(DatabaseAdmission::new(
+            connection_limits.connection_budget(),
+        ));
         let cleanup_limits = cleanup_queue_limits(admin_pool_size);
         // One waiting slot per worker bounds deferred residual databases while
         // the separate worker limit preserves lifecycle-pool headroom.
@@ -281,7 +285,7 @@ impl ServerInner {
             config.project.as_str(),
             cleanup_limits.worker_count,
             cleanup_limits.queue_capacity,
-            budget.clone(),
+            database_admission.clone(),
         )?;
 
         Ok(Arc::new(Self {
@@ -293,7 +297,7 @@ impl ServerInner {
             stale_after: config.stale_after,
             cleanup_on_start: config.cleanup_on_start,
             connection_limits,
-            budget,
+            database_admission,
             database_cleanup,
             admin_sessions,
             template_cache: Mutex::new(TemplateCache::default()),
@@ -354,7 +358,7 @@ impl ServerInner {
             .prewarm_pools
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.budget.is_closed() {
+        if self.database_admission.is_closed() {
             return Err(Error::ConnectionBudgetClosed);
         }
         pools.retain(|pool| pool.strong_count() > 0);
@@ -376,15 +380,21 @@ impl ServerInner {
     }
 
     pub(crate) async fn acquire_database_permit(&self) -> Result<OwnedSemaphorePermit> {
-        self.budget
-            .clone()
-            .acquire_many_owned(self.connection_limits.connections_per_database())
+        self.database_admission
+            .acquire(self.connection_limits.connections_per_database())
             .await
-            .map_err(|_| Error::ConnectionBudgetClosed)
     }
 
-    pub(crate) fn close_database_admission(&self) {
-        self.budget.close();
+    pub(crate) fn create_managed_database_classified(
+        &self,
+        client: &mut AdminClient,
+        database_name: &DatabaseName,
+        template_name: &str,
+        metadata: &ResourceMetadata,
+    ) -> std::result::Result<(), ManagedDatabaseCreationFailure> {
+        self.database_admission.attempt_managed_creation(|| {
+            attempt_managed_database_creation(client, database_name, template_name, metadata)
+        })
     }
 
     pub(crate) fn with_lifecycle_admin<T>(
@@ -430,7 +440,7 @@ impl ServerInner {
         #[cfg(feature = "containers")]
         {
             let Some(container) =
-                begin_owned_container_shutdown(self.container.as_ref(), &self.budget)
+                begin_owned_container_shutdown(self.container.as_ref(), &self.database_admission)
             else {
                 return Ok(());
             };
@@ -628,10 +638,10 @@ fn cleanup_queue_limits(admin_pool_size: usize) -> CleanupQueueLimits {
 #[cfg(feature = "containers")]
 fn begin_owned_container_shutdown(
     container: Option<&Arc<ContainerOwner>>,
-    budget: &Semaphore,
+    database_admission: &DatabaseAdmission,
 ) -> Option<Arc<ContainerOwner>> {
     let container = container?.clone();
-    budget.close();
+    database_admission.close();
     Some(container)
 }
 
@@ -744,22 +754,30 @@ impl ContainerOwner {
             Ok(Err(source)) => {
                 drop(started_receiver);
                 drop(shutdown_sender);
-                join_failed_startup_worker(worker)?;
-                return Err(map_container_start_error(profile, source));
+                let startup = map_container_start_error(profile, source);
+                return Err(combine_startup_and_cleanup(
+                    startup,
+                    join_failed_startup_worker(worker),
+                ));
             }
             Err(RecvTimeoutError::Timeout) => {
                 drop(started_receiver);
                 drop(shutdown_sender);
-                join_failed_startup_worker(worker)?;
-                return Err(Error::ContainerStartupTimeout {
+                let startup = Error::ContainerStartupTimeout {
                     timeout: startup_timeout,
-                });
+                };
+                return Err(combine_startup_and_cleanup(
+                    startup,
+                    join_failed_startup_worker(worker),
+                ));
             }
             Err(RecvTimeoutError::Disconnected) => {
                 drop(started_receiver);
                 drop(shutdown_sender);
-                join_failed_startup_worker(worker)?;
-                return Err(Error::ContainerWorkerStopped);
+                return Err(combine_startup_and_cleanup(
+                    Error::ContainerWorkerStopped,
+                    join_failed_startup_worker(worker),
+                ));
             }
         };
         let admin_url = AdminDatabaseUrl::parse(&format!(
@@ -818,6 +836,17 @@ fn join_failed_startup_worker(worker: JoinHandle<RemovalResult>) -> Result<()> {
         .join()
         .map_err(|_| Error::ContainerWorkerPanicked)?
         .map_err(|source| Error::ContainerRemove { source })
+}
+
+#[cfg(feature = "containers")]
+fn combine_startup_and_cleanup(startup: Error, cleanup: Result<()>) -> Error {
+    match cleanup {
+        Ok(()) => startup,
+        Err(cleanup) => Error::ContainerStartupAndCleanup {
+            startup: Box::new(startup),
+            cleanup: Box::new(cleanup),
+        },
+    }
 }
 
 #[cfg(feature = "containers")]
@@ -1189,13 +1218,13 @@ mod tests {
     use super::{
         ContainerCommand, ContainerOwner, ContainerWorker, POSTGRES_INITDB_NO_SYNC,
         POSTGRES_STORAGE_PATH, ServerInner, begin_owned_container_shutdown, cleanup_queue_limits,
-        combine_cleanup_and_shutdown, container_request, ipv4_mapped_container_host,
-        map_container_start_error, memory_exhaustion_evidence, per_harness_admin_session_pool_size,
-        storage_exhaustion_evidence,
+        combine_cleanup_and_shutdown, combine_startup_and_cleanup, container_request,
+        ipv4_mapped_container_host, map_container_start_error, memory_exhaustion_evidence,
+        per_harness_admin_session_pool_size, storage_exhaustion_evidence,
     };
     use crate::{
         ConnectionLimits, Error, HarnessConfig, OwnedContainerProfile, admin::AdminDatabaseUrl,
-        config::ImageReference,
+        admission::DatabaseAdmission, config::ImageReference,
     };
 
     fn test_container_owner(
@@ -1462,29 +1491,28 @@ mod tests {
             shutdown.recv().unwrap();
             Ok(())
         });
-        let budget = Arc::new(tokio::sync::Semaphore::new(1));
-        let active_permit = budget.clone().acquire_owned().await.unwrap();
-        let waiting_budget = budget.clone();
-        let waiter = tokio::spawn(async move { waiting_budget.acquire_owned().await });
+        let admission = Arc::new(DatabaseAdmission::new(1));
+        let active_permit = admission.acquire(1).await.unwrap();
+        let waiting_admission = admission.clone();
+        let waiter = tokio::spawn(async move { waiting_admission.acquire(1).await });
         tokio::task::yield_now().await;
 
-        let owned = begin_owned_container_shutdown(Some(&container), &budget)
+        let owned = begin_owned_container_shutdown(Some(&container), &admission)
             .expect("owned container should begin shutdown");
 
-        assert!(budget.is_closed());
+        assert!(admission.is_closed());
         assert!(waiter.await.unwrap().is_err());
         assert!(owned.shutdown().is_ok());
         drop(active_permit);
-        assert!(budget.clone().acquire_owned().await.is_err());
+        assert!(admission.acquire(1).await.is_err());
     }
 
     #[test]
     fn external_shutdown_keeps_admission_open() {
-        let budget = tokio::sync::Semaphore::new(1);
+        let admission = DatabaseAdmission::new(1);
 
-        assert!(begin_owned_container_shutdown(None, &budget).is_none());
-        assert!(!budget.is_closed());
-        assert_eq!(budget.available_permits(), 1);
+        assert!(begin_owned_container_shutdown(None, &admission).is_none());
+        assert!(!admission.is_closed());
     }
 
     #[test]
@@ -1504,6 +1532,31 @@ mod tests {
     }
 
     #[test]
+    fn failed_startup_preserves_startup_and_cleanup_errors() {
+        let startup = Error::ContainerStartupTimeout {
+            timeout: Duration::from_millis(50),
+        };
+        let error = combine_startup_and_cleanup(
+            startup,
+            Err(Error::ContainerRemove {
+                source: testcontainers::TestcontainersError::other("forced removal failure"),
+            }),
+        );
+
+        let Error::ContainerStartupAndCleanup { startup, cleanup } = error else {
+            panic!("unexpected combined startup error: {error:?}");
+        };
+        assert!(matches!(*startup, Error::ContainerStartupTimeout { .. }));
+        assert!(matches!(*cleanup, Error::ContainerRemove { .. }));
+
+        let startup = Error::ContainerWorkerStopped;
+        assert!(matches!(
+            combine_startup_and_cleanup(startup, Ok(())),
+            Error::ContainerWorkerStopped
+        ));
+    }
+
+    #[test]
     fn failed_owned_shutdown_keeps_admission_terminal() {
         let container = test_container_owner(|shutdown| {
             shutdown.recv().unwrap();
@@ -1511,14 +1564,14 @@ mod tests {
                 "forced removal failure",
             ))
         });
-        let budget = tokio::sync::Semaphore::new(1);
+        let admission = DatabaseAdmission::new(1);
 
-        let owned = begin_owned_container_shutdown(Some(&container), &budget).unwrap();
+        let owned = begin_owned_container_shutdown(Some(&container), &admission).unwrap();
         assert!(matches!(
             owned.shutdown().unwrap_err(),
             Error::ContainerRemove { .. }
         ));
-        assert!(budget.is_closed());
+        assert!(admission.is_closed());
         assert!(container.shutdown().is_ok());
     }
 

@@ -332,10 +332,11 @@ readiness. Owned startup instead retries authenticated connections through the
 mapped TCP port within `with_startup_timeout`; the successful connection is
 then used for PostgreSQL 18 validation and the owner lock. Cleanup after an
 expired startup deadline is awaited before the error returns, so the deadline
-does not abandon a partially created container. Other administrative
-connections have a ten-second connection deadline. Query and lock deadlines
-remain governed separately by the configured administrative-operation and
-template-wait timeouts.
+does not abandon a partially created container. If that cleanup also fails,
+the returned error preserves both the startup failure and the cleanup failure.
+Other administrative connections have a ten-second connection deadline. Query
+and lock deadlines remain governed separately by the configured
+administrative-operation and template-wait timeouts.
 
 The harness never enables Testcontainers' reusable-container mode. Reuse is
 bounded by the owner process, and ordinary process exit removes an owned

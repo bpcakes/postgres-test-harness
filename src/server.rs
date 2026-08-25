@@ -36,7 +36,7 @@ use crate::{
 
 #[cfg(feature = "containers")]
 use crate::{
-    admin::connect_admin_with_timeout,
+    admin::connect_admin_with_setup_timeout,
     config::{ImageReference, OwnedContainerProfile},
 };
 
@@ -904,11 +904,12 @@ fn wait_for_owned_server(
         }
 
         let attempt_timeout = STARTUP_CONNECT_ATTEMPT_TIMEOUT.min(remaining);
-        match connect_admin_with_timeout(
+        match connect_admin_with_setup_timeout(
             admin_url,
             operation_timeout,
             "wait for final owned PostgreSQL TCP server",
             attempt_timeout,
+            remaining,
         ) {
             Ok(client) => return Ok(client),
             Err(error) => last_error = Some(error),

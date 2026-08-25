@@ -541,10 +541,55 @@ pub(crate) fn connect_admin_with_timeout(
     Ok(client)
 }
 
+/// Connect and configure an admin session within one end-to-end time budget.
+///
+/// The connect timeout still bounds an individual socket/authentication
+/// attempt, while `setup_timeout` bounds that attempt together with the
+/// session-configuration query that makes the client ready for use.
+#[cfg(any(feature = "containers", test))]
+pub(crate) fn connect_admin_with_setup_timeout(
+    admin_url: &AdminDatabaseUrl,
+    operation_timeout: Duration,
+    operation: &'static str,
+    connect_timeout: Duration,
+    setup_timeout: Duration,
+) -> Result<AdminClient> {
+    let deadline = Deadline::new(setup_timeout);
+    let connect_timeout =
+        connect_timeout.min(deadline.remaining().ok_or(Error::PostgresConnectTimeout {
+            operation,
+            timeout: setup_timeout,
+        })?);
+    let mut client = AdminClient::connect(
+        admin_url,
+        connect_timeout,
+        client_operation_timeout(operation_timeout),
+        operation,
+    )?;
+    let configure_timeout = deadline
+        .remaining()
+        .ok_or(Error::PostgresOperationTimeout {
+            operation: "configure admin session timeouts",
+            timeout: setup_timeout,
+        })?;
+    configure_session_timeouts_with_timeout(&mut client, operation_timeout, configure_timeout)?;
+    Ok(client)
+}
+
 fn configure_session_timeouts(client: &mut AdminClient, operation_timeout: Duration) -> Result<()> {
+    let request_timeout = client.request_timeout;
+    configure_session_timeouts_with_timeout(client, operation_timeout, request_timeout)
+}
+
+fn configure_session_timeouts_with_timeout(
+    client: &mut AdminClient,
+    operation_timeout: Duration,
+    request_timeout: Duration,
+) -> Result<()> {
     let statement_timeout = duration_millis(operation_timeout)?;
     let lock_timeout = duration_millis(LOCK_TIMEOUT.min(operation_timeout))?;
-    client.batch_execute(
+    client.batch_execute_with_timeout(
+        request_timeout,
         "configure admin session timeouts",
         &format!("SET statement_timeout = {statement_timeout}; SET lock_timeout = {lock_timeout};"),
     )
@@ -970,8 +1015,8 @@ mod tests {
     use super::{
         AdminClient, AdminDatabaseUrl, AdminSessionPool, Deadline, ManagedDatabaseCreationFailure,
         PersistentClient, advisory_key, compensate_failed_metadata_write,
-        connect_admin_with_timeout, quote_identifier, quote_literal,
-        regular_connection_slots_from_settings,
+        connect_admin_with_setup_timeout, connect_admin_with_timeout, quote_identifier,
+        quote_literal, regular_connection_slots_from_settings,
     };
     use crate::{Error, FingerprintBuilder, ProjectName, name::DatabaseName};
 
@@ -1118,10 +1163,8 @@ mod tests {
         assert!(!server.join().unwrap().is_empty());
     }
 
-    fn connect_stub_admin_client(
-        operation_timeout: Duration,
-    ) -> (
-        AdminClient,
+    fn spawn_stub_admin_server() -> (
+        AdminDatabaseUrl,
         mpsc::Receiver<io::Result<()>>,
         thread::JoinHandle<()>,
     ) {
@@ -1152,6 +1195,17 @@ mod tests {
             "postgres://user@127.0.0.1:{port}/postgres?sslmode=disable"
         ))
         .unwrap();
+        (admin, closed_receiver, server)
+    }
+
+    fn connect_stub_admin_client(
+        operation_timeout: Duration,
+    ) -> (
+        AdminClient,
+        mpsc::Receiver<io::Result<()>>,
+        thread::JoinHandle<()>,
+    ) {
+        let (admin, closed_receiver, server) = spawn_stub_admin_server();
         let client = AdminClient::connect(
             &admin,
             Duration::from_secs(1),
@@ -1160,6 +1214,42 @@ mod tests {
         )
         .unwrap();
         (client, closed_receiver, server)
+    }
+
+    #[test]
+    fn admin_setup_deadline_covers_session_configuration() {
+        let timeout = Duration::from_millis(50);
+        let (admin, closed, server) = spawn_stub_admin_server();
+        let started = Instant::now();
+
+        let error = match connect_admin_with_setup_timeout(
+            &admin,
+            Duration::from_secs(1),
+            "connect before bounded session configuration",
+            Duration::from_secs(1),
+            timeout,
+        ) {
+            Ok(_) => panic!("silent PostgreSQL peer must not complete session configuration"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            Error::PostgresOperationTimeout {
+                operation: "configure admin session timeouts",
+                ..
+            }
+        ));
+        assert!(started.elapsed() >= timeout);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "session configuration must use the end-to-end setup budget"
+        );
+        closed
+            .recv_timeout(Duration::from_secs(1))
+            .expect("timed-out admin connection should close when dropped")
+            .expect("stub PostgreSQL connection should close cleanly");
+        server.join().unwrap();
     }
 
     #[test]

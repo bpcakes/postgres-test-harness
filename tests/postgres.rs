@@ -29,6 +29,10 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
     .await
     .expect("start owned PostgreSQL 18 harness");
     assert!(!harness.is_external());
+    let limits = harness.connection_limits();
+    assert_eq!(limits.connection_budget(), 120);
+    assert_eq!(limits.connections_per_database(), 11);
+    assert_eq!(limits.max_simultaneous_leases(), 10);
     let container_id = harness
         .container_id()
         .expect("owned harness exposes its container ID")
@@ -195,6 +199,34 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         drop(template);
 
         wait_until_advisory_lock_is_acquirable(&admin_url, lock_key).await;
+    }
+
+    {
+        const LIVE_TEMPLATES: usize = 16;
+        let shared_locks_before = advisory_lock_count(admin_url.clone(), "ShareLock")
+            .await
+            .expect("count shared locks before many-template capacity regression");
+        let mut templates = Vec::with_capacity(LIVE_TEMPLATES);
+        for index in 0..LIVE_TEMPLATES {
+            let fingerprint = FingerprintBuilder::new("many-live-templates")
+                .add("index", index.to_string())
+                .finish();
+            templates.push(
+                harness
+                    .template(TemplateSpec::new(fingerprint), |_| async { Ok(()) })
+                    .await
+                    .unwrap_or_else(|error| panic!("initialize live template {index}: {error}")),
+            );
+        }
+        assert_eq!(
+            advisory_lock_count(admin_url.clone(), "ShareLock")
+                .await
+                .expect("count shared locks with many live templates"),
+            shared_locks_before + LIVE_TEMPLATES as i64,
+            "every distinct live template retains one separate PostgreSQL session"
+        );
+        drop(templates);
+        wait_until_advisory_lock_count(&admin_url, "ShareLock", shared_locks_before).await;
     }
 
     {
@@ -980,6 +1012,10 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
             HarnessConfig::new("external_it")
                 .unwrap()
                 .with_admin_database_url(admin_url.clone())
+                .with_connection_budget(1_000)
+                .unwrap()
+                .with_connections_per_database(100)
+                .unwrap()
                 .with_image("does-not-exist.invalid/postgres:18")
                 .unwrap()
                 .with_owned_container_profile(
@@ -992,6 +1028,10 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         .await
         .expect("start external-server harness");
         assert!(external.is_external());
+        let limits = external.connection_limits();
+        assert_eq!(limits.connection_budget(), 1_000);
+        assert_eq!(limits.connections_per_database(), 100);
+        assert_eq!(limits.max_simultaneous_leases(), 10);
         external
             .shutdown()
             .await

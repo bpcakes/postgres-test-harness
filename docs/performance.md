@@ -59,7 +59,8 @@ the same Docker content-ID kind used by owned mode, rather than a registry
 manifest digest. Their fields remain present with a
 `not_reported_for_external_server` source when the values are unavailable.
 The benchmark discovers `fsync`, `synchronous_commit`, `full_page_writes`,
-`data_checksums`, `wal_level`, and `max_connections` from PostgreSQL itself.
+`data_checksums`, `wal_level`, `max_connections`, `reserved_connections`, and
+`superuser_reserved_connections` from PostgreSQL itself.
 Treat reports with different values as different environments rather than
 attributing the difference to harness mode.
 
@@ -111,6 +112,16 @@ The JSON records these boundaries for every sample and fixture:
 - `bounded_concurrent_clone_cleanup`: the same complete lifecycle with a
   caller-side semaphore. Total elapsed time, throughput, and each operation's
   elapsed time are recorded.
+- `downstream_pool_checkout_spike`: creates `PTH_PERF_CONCURRENCY` leases in
+  parallel and eagerly opens `PTH_PERF_DOWNSTREAM_POOL_SIZE` independent
+  application connections to every database. The timer covers lease creation
+  and connection checkout. The phase retains every client, probes it, and
+  requires `pg_stat_activity` to report exactly the configured product before
+  closing all clients and cleaning every lease concurrently. The JSON records
+  checkout throughput, the observed peak, cleanup time, and total time. This is
+  a deliberately full synthetic pool: real pools often establish connections
+  lazily, so a configured maximum or idle limit must not be mistaken for an
+  eager connection count.
 - `explicit_cleanup_drain`: creates the configured leases before timing, then
   awaits their explicit cleanups concurrently. Its `method.execution` is
   `caller_bounded` and records the configured drain count as its concurrency.
@@ -150,22 +161,35 @@ Observer connection, query, and shutdown awaits use the same 90-second
 operation timeout recorded for the harness, so a silent external server cannot
 leave a local characterization waiting indefinitely.
 
+The pool-spike peak uses a different, database-scoped observation:
+`pg_stat_activity` is filtered to the exact disposable database names held by
+that phase. It therefore excludes the owner lock, template locks, lifecycle
+pool, and observer, all of which connect to the administrative database. A
+successful phase proves that the requested eager downstream connections were
+simultaneously established; it does not claim that a third-party pool with the
+same maximum normally opens them all.
+
 The top-level report also records the source commit and worktree state,
 PostgreSQL version and critical settings, postmaster start, logical CPU count,
 OS, architecture, server mode, image metadata, storage driver, the effective
 owned initdb/storage profile, fixture rows, execution and completion methods,
-concurrency where caller-controlled, sample counts, connection budget,
-per-database permits, timeouts, the cleanup barrier guard, and external cleanup
-retry policy. Schema version 6 replaces catalog-polled deferred completion with
-explicit caller-return and awaited-drain timings. Owned-profile and checksum/WAL
-provenance were introduced in schema version 5; consumers should branch on
-`schema_version`.
+concurrency where caller-controlled, sample counts, resolved connection budget,
+per-database permits, effective maximum leases, downstream pool size, timeouts,
+the cleanup barrier guard, and external cleanup retry policy. Schema version 7
+adds the downstream pool-spike measurement, resolved lease capacity, and both
+reserved-connection settings. Schema version 6 replaced catalog-polled deferred
+completion with explicit caller-return and awaited-drain timings. Consumers
+should branch on `schema_version`.
 
 ## Configuration
 
-All numeric overrides must be positive. The example rejects concurrency or
-drain counts that cannot fit in its explicit 120-permit, 11-per-database
-connection policy.
+All numeric overrides must be positive. The example resolves the same
+`ConnectionLimits` API used by the running harness and rejects concurrency or
+drain counts above `floor(connection_budget / connections_per_database)`. It
+also rejects a downstream pool size above the per-database reservation.
+When `PTH_PERF_CONNECTIONS_PER_DATABASE` is unset, the benchmark leaves that
+builder override unset too, so the library's default clamps to a smaller budget
+exactly as it does for downstream callers.
 
 | Variable | Default | Meaning |
 | --- | ---: | --- |
@@ -175,6 +199,9 @@ connection policy.
 | `PTH_PERF_CONCURRENT_OPERATIONS` | 8 | Total bounded-concurrent lifecycles per fixture |
 | `PTH_PERF_DRAIN_DATABASES` | 4 | Pre-created leases in each cleanup-drain measurement |
 | `PTH_PERF_REPRESENTATIVE_ROWS` | 50000 | Rows migrated into the representative fixture |
+| `PTH_PERF_CONNECTION_BUDGET` | 120 | Total downstream-connection permits (`B`) |
+| `PTH_PERF_CONNECTIONS_PER_DATABASE` | 11 | Permits reserved by each live lease (`P`) |
+| `PTH_PERF_DOWNSTREAM_POOL_SIZE` | 10 | Connections eagerly opened on every lease in the pool spike; must be at most `P` |
 | `PTH_PERF_OUTPUT` | stdout | JSON output path; use ignored `target/` for clean provenance |
 | `PTH_PERF_OWNED_INITDB_NO_SYNC` | `true` | Whether owned initdb uses `--no-sync` |
 | `PTH_PERF_OWNED_TMPFS_SIZE_BYTES` | `1073741824` | Owned tmpfs byte cap, or `off` for image-default storage |
@@ -186,14 +213,44 @@ samples remain in `samples`; `summary` provides min, median, mean, and max for
 each timing. Preserve raw JSON artifacts because a single aggregate hides
 variance and connection-count changes.
 
+To characterize lease and downstream-pool geometry without changing the
+library defaults, run a matrix of separate reports. For example, these points
+exercise one small pool, four half-sized pools, and all ten default leases with
+ten eager connections each:
+
+```bash
+PTH_PERF_CONCURRENCY=1 PTH_PERF_DOWNSTREAM_POOL_SIZE=1 \
+PTH_PERF_OUTPUT=target/performance-c1-p1.json \
+cargo run --locked --release --example performance
+
+PTH_PERF_CONCURRENCY=4 PTH_PERF_DOWNSTREAM_POOL_SIZE=5 \
+PTH_PERF_OUTPUT=target/performance-c4-p5.json \
+cargo run --locked --release --example performance
+
+PTH_PERF_CONCURRENCY=10 PTH_PERF_CONCURRENT_OPERATIONS=10 \
+PTH_PERF_DRAIN_DATABASES=10 PTH_PERF_DOWNSTREAM_POOL_SIZE=10 \
+PTH_PERF_OUTPUT=target/performance-c10-p10.json \
+cargo run --locked --release --example performance
+```
+
+The permit formula describes potential application use, not total PostgreSQL
+sessions. For `B=120` and `P=11`, `L=floor(B/P)=10` and the maximum represented
+application spike is `L*P=110`. Separately, one owner session, one session per
+live template, the lazy lifecycle pool, the observer, and ambient external
+traffic consume server slots. Compare the report's three PostgreSQL capacity
+settings with the observed pool spike before increasing either dimension.
+
 ## CI comparison
 
 The manual `Performance characterization` Actions workflow pre-pulls the owned
 image, runs the same release example, writes a Markdown summary, and uploads
-the complete JSON artifact even if summary rendering fails. Its `external`
-option scopes `POSTGRES_TEST_ADMIN_URL` from an Actions secret to the benchmark
-step. Dispatches are serialized by mode and the job has a one-hour ceiling. The
-workflow is deliberately not a required push or pull-request check.
+the complete JSON artifact even if summary rendering fails. Its dispatch inputs
+expose lease concurrency, downstream pool size, budget, per-database permits,
+operation count, and drain count so matrix points do not require source edits.
+Its `external` option scopes `POSTGRES_TEST_ADMIN_URL` from an Actions secret to
+the benchmark step. Dispatches are serialized by mode and the job has a
+one-hour ceiling. The workflow is deliberately not a required push or
+pull-request check.
 
 The current crate always compiles owned-container support. When an external-only
 feature is introduced, add `cargo check --no-default-features --example

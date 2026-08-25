@@ -554,13 +554,24 @@ pub(crate) fn regular_connection_slots(client: &mut AdminClient) -> Result<usize
                     current_setting('superuser_reserved_connections')::integer",
         &[],
     )?;
-    let max_connections = row.get::<_, i32>(0).max(1) as usize;
-    let reserved_connections = row.get::<_, i32>(1).max(0) as usize;
-    let superuser_reserved_connections = row.get::<_, i32>(2).max(0) as usize;
-    Ok(max_connections
+    Ok(regular_connection_slots_from_settings(
+        row.get(0),
+        row.get(1),
+        row.get(2),
+    ))
+}
+
+fn regular_connection_slots_from_settings(
+    max_connections: i32,
+    reserved_connections: i32,
+    superuser_reserved_connections: i32,
+) -> usize {
+    let max_connections = max_connections.max(0) as usize;
+    let reserved_connections = reserved_connections.max(0) as usize;
+    let superuser_reserved_connections = superuser_reserved_connections.max(0) as usize;
+    max_connections
         .saturating_sub(reserved_connections)
         .saturating_sub(superuser_reserved_connections)
-        .max(1))
 }
 
 pub(crate) fn acquire_advisory_lock(client: &mut AdminClient, key: i64) -> Result<()> {
@@ -835,9 +846,17 @@ mod tests {
     use super::{
         AdminClient, AdminDatabaseUrl, AdminSessionPool, PersistentClient, advisory_key,
         compensate_failed_metadata_write, connect_admin_with_timeout, quote_identifier,
-        quote_literal,
+        quote_literal, regular_connection_slots_from_settings,
     };
     use crate::{Error, FingerprintBuilder, ProjectName, name::DatabaseName};
+
+    #[test]
+    fn regular_connection_capacity_excludes_both_reserved_slot_classes() {
+        assert_eq!(regular_connection_slots_from_settings(300, 0, 3), 297);
+        assert_eq!(regular_connection_slots_from_settings(20, 5, 3), 12);
+        assert_eq!(regular_connection_slots_from_settings(3, 0, 3), 0);
+        assert_eq!(regular_connection_slots_from_settings(2, 4, 4), 0);
+    }
 
     #[test]
     fn admin_url_debug_redacts_password_and_rewrites_only_database() {

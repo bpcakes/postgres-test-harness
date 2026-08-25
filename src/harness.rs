@@ -7,7 +7,8 @@ use std::{
 use tokio::sync::OwnedSemaphorePermit;
 
 use crate::{
-    BoxError, Error, HarnessConfig, ProjectName, Result, TemplateFingerprint, TemplateSpec,
+    BoxError, ConnectionLimits, Error, HarnessConfig, ProjectName, Result, TemplateFingerprint,
+    TemplateSpec,
     admin::{
         AdminClient, AdminDatabaseUrl, DatabaseRecord, PersistentClient,
         acquire_shared_template_advisory_lock, acquire_template_advisory_lock, advisory_key,
@@ -60,6 +61,12 @@ impl PostgresHarness {
 
     pub fn container_id(&self) -> Option<&str> {
         self.server.container_id()
+    }
+
+    /// Returns the resolved downstream connection-permit policy used by this
+    /// harness's database admission control.
+    pub fn connection_limits(&self) -> ConnectionLimits {
+        self.server.connection_limits
     }
 
     /// Closes database admission, drains accepted cleanup, and removes an owned

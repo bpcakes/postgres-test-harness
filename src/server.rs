@@ -17,14 +17,14 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 
 use crate::{
-    Error, HarnessConfig, ProjectName, Result,
+    ConnectionLimits, Error, HarnessConfig, ProjectName, Result,
     admin::{
         AdminClient, AdminDatabaseUrl, AdminSessionPool, PersistentClient, acquire_advisory_lock,
         advisory_key, connect_admin, connect_admin_with_timeout, regular_connection_slots,
         validate_postgres_18,
     },
     cleanup::DatabaseCleanupQueue,
-    config::{ImageReference, OwnedContainerProfile, ResolvedConnectionLimits},
+    config::{ImageReference, OwnedContainerProfile},
 };
 
 const POSTGRES_PORT: u16 = 5432;
@@ -63,7 +63,7 @@ pub(crate) struct ServerInner {
     pub(crate) template_wait_timeout: Duration,
     pub(crate) stale_after: Duration,
     pub(crate) cleanup_on_start: bool,
-    pub(crate) connections_per_database: u32,
+    pub(crate) connection_limits: ConnectionLimits,
     budget: Arc<Semaphore>,
     pub(crate) database_cleanup: Arc<DatabaseCleanupQueue>,
     admin_sessions: Arc<AdminSessionPool>,
@@ -77,7 +77,7 @@ impl ServerInner {
     }
 
     fn start_blocking(config: HarnessConfig) -> Result<Arc<Self>> {
-        let connection_limits = config.resolved_connection_limits()?;
+        let connection_limits = config.connection_limits()?;
         let run_id = Uuid::now_v7().simple().to_string();
         let owner_key = advisory_key("run", &run_id);
         if let Some(admin_url) = config.resolved_admin_database_url() {
@@ -121,7 +121,7 @@ impl ServerInner {
 
     fn finish_start(
         config: HarnessConfig,
-        connection_limits: ResolvedConnectionLimits,
+        connection_limits: ConnectionLimits,
         admin_url: AdminDatabaseUrl,
         container: Option<Arc<ContainerOwner>>,
         owner_key: i64,
@@ -138,7 +138,7 @@ impl ServerInner {
 
     fn finish_start_with<F>(
         config: HarnessConfig,
-        connection_limits: ResolvedConnectionLimits,
+        connection_limits: ConnectionLimits,
         admin_url: AdminDatabaseUrl,
         container: Option<Arc<ContainerOwner>>,
         owner_key: i64,
@@ -164,7 +164,7 @@ impl ServerInner {
 
     fn finish_start_with_client(
         config: HarnessConfig,
-        connection_limits: ResolvedConnectionLimits,
+        connection_limits: ConnectionLimits,
         admin_url: AdminDatabaseUrl,
         container: Option<Arc<ContainerOwner>>,
         owner_key: i64,
@@ -182,7 +182,7 @@ impl ServerInner {
             config.project.as_str(),
             admin_pool_size,
         ));
-        let budget = Arc::new(Semaphore::new(connection_limits.budget));
+        let budget = Arc::new(Semaphore::new(connection_limits.connection_budget()));
         let cleanup_limits = cleanup_queue_limits(admin_pool_size);
         // One waiting slot per worker bounds deferred residual databases while
         // the separate worker limit preserves lifecycle-pool headroom.
@@ -201,7 +201,7 @@ impl ServerInner {
             template_wait_timeout: config.template_wait_timeout,
             stale_after: config.stale_after,
             cleanup_on_start: config.cleanup_on_start,
-            connections_per_database: connection_limits.per_database,
+            connection_limits,
             budget,
             database_cleanup,
             admin_sessions,
@@ -213,7 +213,7 @@ impl ServerInner {
     pub(crate) async fn acquire_database_permit(&self) -> Result<OwnedSemaphorePermit> {
         self.budget
             .clone()
-            .acquire_many_owned(self.connections_per_database)
+            .acquire_many_owned(self.connection_limits.connections_per_database())
             .await
             .map_err(|_| Error::ConnectionBudgetClosed)
     }
@@ -281,15 +281,15 @@ fn combine_cleanup_and_shutdown(cleanup: Result<()>, shutdown: Result<()>) -> Re
 }
 
 fn per_harness_admin_session_pool_size(
-    connection_limits: ResolvedConnectionLimits,
+    connection_limits: ConnectionLimits,
     regular_connection_slots: usize,
 ) -> usize {
-    let lifecycle_concurrency = connection_limits.budget
-        / usize::try_from(connection_limits.per_database)
-            .expect("u32 per-database connection limit fits usize");
     let postgres_headroom_limit =
         (regular_connection_slots / LIFECYCLE_ADMIN_CONNECTION_SHARE_DIVISOR).max(1);
-    lifecycle_concurrency.min(postgres_headroom_limit).max(1)
+    connection_limits
+        .max_simultaneous_leases()
+        .min(postgres_headroom_limit)
+        .max(1)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -807,9 +807,8 @@ mod tests {
         storage_exhaustion_evidence,
     };
     use crate::{
-        Error, HarnessConfig, OwnedContainerProfile,
-        admin::AdminDatabaseUrl,
-        config::{ImageReference, ResolvedConnectionLimits},
+        ConnectionLimits, Error, HarnessConfig, OwnedContainerProfile, admin::AdminDatabaseUrl,
+        config::ImageReference,
     };
 
     fn test_container_owner(
@@ -864,21 +863,36 @@ mod tests {
 
     #[test]
     fn per_harness_admin_pool_policy_obeys_lifecycle_concurrency_and_server_headroom() {
-        let limits = ResolvedConnectionLimits {
-            budget: 120,
-            per_database: 11,
+        let limits = ConnectionLimits {
+            connection_budget: 120,
+            connections_per_database: 11,
         };
         assert_eq!(per_harness_admin_session_pool_size(limits, 297), 10);
         assert_eq!(per_harness_admin_session_pool_size(limits, 20), 5);
         assert_eq!(per_harness_admin_session_pool_size(limits, 3), 1);
+        assert_eq!(per_harness_admin_session_pool_size(limits, 0), 1);
 
-        let single_lifecycle = ResolvedConnectionLimits {
-            budget: 2,
-            per_database: 2,
+        let single_lifecycle = ConnectionLimits {
+            connection_budget: 2,
+            connections_per_database: 2,
         };
         assert_eq!(
             per_harness_admin_session_pool_size(single_lifecycle, 297),
             1
+        );
+
+        let oversized_application_policy = ConnectionLimits {
+            connection_budget: 1_000,
+            connections_per_database: 1,
+        };
+        assert_eq!(
+            oversized_application_policy.max_simultaneous_leases(),
+            1_000
+        );
+        assert_eq!(
+            per_harness_admin_session_pool_size(oversized_application_policy, 297),
+            74,
+            "server headroom must still cap the lazy lifecycle pool"
         );
     }
 
@@ -896,6 +910,38 @@ mod tests {
         assert_eq!(cleanup_queue_limits(4).worker_count, 2);
         assert_eq!(cleanup_queue_limits(10).worker_count, 4);
         assert_eq!(cleanup_queue_limits(100).worker_count, 4);
+    }
+
+    #[test]
+    fn oversized_application_policy_is_observable_without_inflating_owned_server_default() {
+        let limits = HarnessConfig::new("oversized")
+            .unwrap()
+            .with_connection_budget(1_000)
+            .unwrap()
+            .with_connections_per_database(100)
+            .unwrap()
+            .connection_limits()
+            .unwrap();
+        assert_eq!(limits.max_simultaneous_leases(), 10);
+        assert_eq!(
+            limits.max_simultaneous_leases()
+                * usize::try_from(limits.connections_per_database()).unwrap(),
+            1_000
+        );
+
+        let request = container_request(
+            ImageReference::parse("postgres:18").unwrap(),
+            OwnedContainerProfile::default(),
+            Duration::from_secs(60),
+            "oversized".to_owned(),
+            "run".to_owned(),
+            "1".to_owned(),
+        );
+        let command = request
+            .cmd()
+            .map(|value| value.into_owned())
+            .collect::<Vec<_>>();
+        assert!(command.iter().any(|value| value == "max_connections=300"));
     }
 
     #[test]
@@ -939,6 +985,7 @@ mod tests {
             .cmd()
             .map(|value| value.into_owned())
             .collect::<Vec<_>>();
+        assert!(command.iter().any(|value| value == "max_connections=300"));
         assert!(!command.iter().any(|value| value.contains("wal_level")));
         assert!(
             !environment
@@ -1092,7 +1139,7 @@ mod tests {
             startup_exit: Arc::new(Mutex::new(None)),
         });
         let config = HarnessConfig::new("cleanup").unwrap();
-        let connection_limits = config.resolved_connection_limits().unwrap();
+        let connection_limits = config.connection_limits().unwrap();
         let admin_url = AdminDatabaseUrl::parse(
             "postgres://postgres:secret@127.0.0.1:5432/postgres?sslmode=disable",
         )

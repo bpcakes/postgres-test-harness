@@ -245,3 +245,68 @@ returns. All six PERF04 deferred phases opened zero new lifecycle sessions,
 showing reuse of the already-warm per-server pool.
 
 The raw local report is `target/performance-owned-perf04.json`.
+
+## PERF07 effective-concurrency follow-up
+
+On 2026-08-25, the schema-v7 owned workload was run at three lease/pool
+geometry points after lifecycle-session pooling, bounded deferred cleanup, and
+live-template caching were all present. Each point contains three independent
+server samples and both the small and 50,000-row representative fixture. All
+runs used base commit `9a25695b6162079b7a17805c700a44c603d909bb`
+with a dirty worktree containing the PERF03 and PERF07 implementations, the
+same cached image content ID and 1 GiB tmpfs profile, PostgreSQL 18.1, and the
+same 64-logical-CPU Linux host as the PERF03 follow-up.
+
+The harness policy remained `B=120` total permits and `P=11` permits per
+database, giving the newly exposed `L=floor(B/P)=10` effective simultaneous
+leases. PostgreSQL reported `max_connections=300`, `reserved_connections=0`,
+and `superuser_reserved_connections=3`, or 297 non-reserved slots. No defaults
+or server settings were changed for these runs.
+
+The new phase creates all measured leases concurrently, eagerly opens and
+probes the configured number of application clients on each, requires the
+exact total to be visible in `pg_stat_activity`, then closes those clients and
+cleans every lease. Median observations were:
+
+| Leases | Eager clients per lease | Total clients | Peak observed in each fixture/sample | Small checkout | Small total | Representative checkout | Representative total |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 1 | 1 | 22.077 ms | 27.994 ms | 38.324 ms | 45.134 ms |
+| 4 | 5 | 20 | 20 | 39.406 ms | 50.168 ms | 107.743 ms | 139.339 ms |
+| 10 | 10 | 100 | 100 | 117.990 ms | 209.639 ms | 290.931 ms | 476.347 ms |
+
+At the three points, median eager-checkout throughput was respectively 45.3,
+507.5, and 847.5 connections/second for the small fixture and 26.1, 185.6, and
+343.7 connections/second for the representative fixture. These are geometry
+observations rather than a claim that a third-party pool normally connects
+eagerly. The exact peak checks are the important capacity evidence: the owned
+server sustained every requested spike through all ten effective leases.
+
+The largest point used 100 application sessions. Adding the one owner, one
+live measured template, persistent benchmark observer, and at most ten lazy
+lifecycle sessions remains far below the 300-session server limit and its 297
+non-reserved slots. Throughput still scaled at that point, while the report
+contains no comparison showing a robust benefit from a different permit policy
+or `max_connections`. PERF07 therefore keeps the 120/11 defaults and owned
+`max_connections=300`. Live-template count is intentionally not bounded and
+pool maxima are not eager counts, so deriving the server setting from the
+permit budget would imply a guarantee the API does not make.
+
+The raw local reports are
+`target/performance-owned-perf07-c1-p1.json`,
+`target/performance-owned-perf07-c4-p5.json`, and
+`target/performance-owned-perf07-c10-p10.json`.
+
+A separate three-sample external-mode safety run targeted a temporary
+PostgreSQL 18.1 server configured with `max_connections=20`,
+`reserved_connections=0`, and `superuser_reserved_connections=3`. It used
+`B=10`, `P=5`, `L=2`, and five eager clients on each of two leases. Every one
+of the six fixture/sample observations reported the exact ten application
+sessions at peak. The lazy lifecycle pool was capped at two by `L`; together
+with one owner, one live template, and the observer, the measured workload fit
+within the server's 17 non-reserved slots. This directly exercises low-capacity
+external sizing and records both reserved-slot settings. Its timings are not
+compared with owned mode because the temporary external server retained
+PostgreSQL's durable defaults (`fsync=on`, `synchronous_commit=on`, and
+`full_page_writes=on`). The raw report is
+`target/performance-external-perf07-low-capacity.json`; the temporary container
+was removed after the run.

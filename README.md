@@ -62,15 +62,29 @@ names, connection permits, container ownership, and stale cleanup belong in
 this crate. Consumer adapters should not enable Testcontainers reuse, issue
 Docker CLI cleanup commands, or delete databases by a name prefix.
 
-Each harness's default connection budget is 120 permits and each live database
-lease holds 11. Projects with different pool geometry can override both values
-on `HarnessConfig`; the per-database value must cover every connection pool a
-single test may open. Connection-limit setters are order-independent and the
-last override for each value wins. With no explicit per-database override, its
-default is clamped to a smaller budget and returns to 11 if that budget is
-raised again. Zero and out-of-range values fail at their setter; an explicit
-per-database value larger than the final budget is rejected when
-`PostgresHarness::start` resolves the complete configuration.
+Each harness's default connection budget (`B`) is 120 permits and each live
+database lease reserves 11 (`P`). The effective simultaneous lease limit is
+`L = floor(B / P)`, so the defaults admit ten leases and leave ten permits
+unused. `HarnessConfig::connection_limits()` exposes the resolved values before
+startup, and `PostgresHarness::connection_limits()` returns the exact same
+read-only `ConnectionLimits` used by admission control after startup.
+
+Projects with different pool geometry can override both inputs on
+`HarnessConfig`. `P` must cover the sum of the maximum sizes of every
+application pool plus standalone connections that one test can open. For
+example, separate pools capped at ten and five connections plus one standalone
+client require at least 16 permits. Pool maximums are capacity, not an eager
+connection count: many pools start empty and connect lazily, while a minimum or
+idle limit describes how many already-open sessions they establish or retain.
+Budgeting the maximum still prevents a simultaneous checkout spike from
+overcommitting the harness.
+
+Connection-limit setters are order-independent and the last override for each
+value wins. With no explicit per-database override, its default is clamped to a
+smaller budget and returns to 11 if that budget is raised again. Zero and
+out-of-range values fail at their setter; an explicit per-database value larger
+than the final budget is rejected by `connection_limits()` and by
+`PostgresHarness::start` after the complete configuration is known.
 
 Disposable `CREATE`/metadata and `DROP` work reuses a lazy pool of administrative
 sessions owned by each harness. Each pool's limit is the smaller of the
@@ -79,11 +93,34 @@ and one quarter of PostgreSQL's non-reserved connection slots, with a minimum
 of one. The quarter-share cap preserves headroom when one harness targets a
 server. Separate harnesses and processes do not coordinate this limit, so users
 of a shared external server must budget their aggregate connection capacity.
-Sessions are checked out exclusively; independent lifecycle operations can
-progress concurrently without holding the pool lock during SQL. A reused
-session is reset and has the configured operation and lock timeouts restored
-before work. Waiting for a session is also bounded by the configured operation
-timeout. Failed or uncertain sessions are evicted and reconnected lazily.
+If `R` is PostgreSQL's non-reserved capacity
+(`max_connections - reserved_connections - superuser_reserved_connections`),
+the lifecycle pool limit is `A = max(1, min(L, floor(R / 4)))`. Sessions are
+created lazily, so `A` is not an eager connection count. Sessions are checked
+out exclusively; independent lifecycle operations can progress concurrently
+without holding the pool lock during SQL. A reused session is reset and has the
+configured operation and lock timeouts restored before work. Waiting for a
+session is also bounded by the configured operation timeout. Failed or
+uncertain sessions are evicted and reconnected lazily.
+
+The application permit budget does not include harness administration. One
+owner-lock session lives for the server, each distinct live template retains
+one shared-lock session, and lifecycle create/cleanup work uses up to `A`
+pooled sessions. The owned server keeps `max_connections=300`; the default
+PostgreSQL 18 reservation settings leave 297 regular slots. With the default
+policy, at most `L * P = 110` application sessions, ten lifecycle sessions,
+and one owner session leave 176 regular slots for live templates, observers,
+short overlap, and safety headroom. Actual use is normally lower because the
+application and lifecycle pools are lazy.
+
+`max_connections` remains fixed rather than being derived from `B`: the
+characterization has not shown a robust benefit from changing it, live-template
+count is intentionally not capped, and pool limits do not imply eager sessions.
+Configurations whose potential application spike exceeds the server's capacity
+remain observable through `ConnectionLimits`, but cannot make PostgreSQL accept
+that spike. Size them against the whole formula. On external servers, include
+ambient sessions and the limits of every harness/process; those budgets are not
+coordinated globally.
 
 Database cleanup has two explicit completion contracts. `DatabaseLease::cleanup`
 uses the server's bounded workers, retains the lease's connection-budget permit,

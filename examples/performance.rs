@@ -32,7 +32,7 @@ use tokio::{sync::Semaphore, task::JoinSet};
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 const DEFAULT_IMAGE: &str = "postgres:18";
 const OUTPUT_ENV: &str = "PTH_PERF_OUTPUT";
 const OWNED_INITDB_NO_SYNC_ENV: &str = "PTH_PERF_OWNED_INITDB_NO_SYNC";
@@ -40,8 +40,8 @@ const OWNED_TMPFS_SIZE_BYTES_ENV: &str = "PTH_PERF_OWNED_TMPFS_SIZE_BYTES";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(90);
 const TEMPLATE_WAIT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-const CONNECTION_BUDGET: usize = 120;
-const CONNECTIONS_PER_DATABASE: u32 = 11;
+const DEFAULT_CONNECTION_BUDGET: usize = 120;
+const DEFAULT_DOWNSTREAM_POOL_SIZE: usize = 10;
 const DEFAULT_SAMPLES: usize = 3;
 const DEFAULT_SEQUENTIAL_OPERATIONS: usize = 4;
 const DEFAULT_CONCURRENCY: usize = 4;
@@ -196,11 +196,24 @@ struct BenchmarkConfig {
     concurrent_operations: usize,
     drain_databases: usize,
     representative_rows: usize,
+    connection_budget: usize,
+    connections_per_database_override: Option<u32>,
+    downstream_pool_size: usize,
 }
 
 impl BenchmarkConfig {
     fn from_environment(project: String) -> AnyResult<Self> {
         let mode = ServerMode::detect()?;
+        let connections_per_database_override =
+            optional_positive_env("PTH_PERF_CONNECTIONS_PER_DATABASE")?
+                .map(|value| {
+                    u32::try_from(value).map_err(|_| {
+                        invalid_input(
+                            "PTH_PERF_CONNECTIONS_PER_DATABASE must fit in a positive u32",
+                        )
+                    })
+                })
+                .transpose()?;
         let config = Self {
             project,
             mode,
@@ -225,9 +238,19 @@ impl BenchmarkConfig {
                 "PTH_PERF_REPRESENTATIVE_ROWS",
                 DEFAULT_REPRESENTATIVE_ROWS,
             )?,
+            connection_budget: positive_env(
+                "PTH_PERF_CONNECTION_BUDGET",
+                DEFAULT_CONNECTION_BUDGET,
+            )?,
+            connections_per_database_override,
+            downstream_pool_size: positive_env(
+                "PTH_PERF_DOWNSTREAM_POOL_SIZE",
+                DEFAULT_DOWNSTREAM_POOL_SIZE,
+            )?,
         };
 
-        let database_capacity = CONNECTION_BUDGET / CONNECTIONS_PER_DATABASE as usize;
+        let limits = config.harness_config()?.connection_limits()?;
+        let database_capacity = limits.max_simultaneous_leases();
         if config.concurrency > database_capacity {
             return Err(invalid_input(format!(
                 "PTH_PERF_CONCURRENCY={} exceeds the configured database capacity of {database_capacity}",
@@ -246,6 +269,13 @@ impl BenchmarkConfig {
                 config.concurrent_operations, config.concurrency
             )));
         }
+        if config.downstream_pool_size > usize::try_from(limits.connections_per_database())? {
+            return Err(invalid_input(format!(
+                "PTH_PERF_DOWNSTREAM_POOL_SIZE={} exceeds PTH_PERF_CONNECTIONS_PER_DATABASE={}; per-database permits must cover every eagerly opened downstream connection",
+                config.downstream_pool_size,
+                limits.connections_per_database()
+            )));
+        }
         Ok(config)
     }
 
@@ -254,9 +284,14 @@ impl BenchmarkConfig {
             .with_startup_timeout(STARTUP_TIMEOUT)?
             .with_operation_timeout(OPERATION_TIMEOUT)?
             .with_template_wait_timeout(TEMPLATE_WAIT_TIMEOUT)?
-            .with_connection_budget(CONNECTION_BUDGET)?
-            .with_connections_per_database(CONNECTIONS_PER_DATABASE)?
+            .with_connection_budget(self.connection_budget)?
             .with_cleanup_on_start(false);
+        let config = match self.connections_per_database_override {
+            Some(connections_per_database) => {
+                config.with_connections_per_database(connections_per_database)?
+            }
+            None => config,
+        };
         match self.mode {
             ServerMode::Owned => Ok(config
                 .with_image(self.image.clone())?
@@ -266,6 +301,10 @@ impl BenchmarkConfig {
     }
 
     fn report(&self) -> ConfigurationReport {
+        let limits = self
+            .harness_config()
+            .and_then(|config| config.connection_limits().map_err(Into::into))
+            .expect("validated benchmark connection limits remain resolvable");
         ConfigurationReport {
             project: self.project.clone(),
             samples: self.samples,
@@ -283,8 +322,10 @@ impl BenchmarkConfig {
                 EXTERNAL_CLEANUP_INITIAL_RETRY_INTERVAL,
             ),
             external_cleanup_max_retry_interval_ms: millis(EXTERNAL_CLEANUP_MAX_RETRY_INTERVAL),
-            connection_budget: CONNECTION_BUDGET,
-            connections_per_database: CONNECTIONS_PER_DATABASE,
+            connection_budget: limits.connection_budget(),
+            connections_per_database: limits.connections_per_database(),
+            max_simultaneous_leases: limits.max_simultaneous_leases(),
+            downstream_pool_size: self.downstream_pool_size,
             cleanup_on_start: false,
             owned_container_profile: matches!(self.mode, ServerMode::Owned)
                 .then(|| OwnedContainerProfileReport::from(self.owned_container_profile)),
@@ -350,6 +391,8 @@ struct ConfigurationReport {
     external_cleanup_max_retry_interval_ms: u128,
     connection_budget: usize,
     connections_per_database: u32,
+    max_simultaneous_leases: usize,
+    downstream_pool_size: usize,
     cleanup_on_start: bool,
     owned_container_profile: Option<OwnedContainerProfileReport>,
 }
@@ -413,6 +456,7 @@ struct FixtureReport {
     warm_template_acquisition: TimedOperation,
     sequential_clone_cleanup: BatchOperation,
     bounded_concurrent_clone_cleanup: BatchOperation,
+    downstream_pool_checkout_spike: DownstreamPoolCheckoutOperation,
     explicit_cleanup_drain: BatchOperation,
     deferred_cleanup: DeferredCleanupOperation,
 }
@@ -446,6 +490,19 @@ struct DeferredCleanupOperation {
 }
 
 #[derive(Serialize)]
+struct DownstreamPoolCheckoutOperation {
+    leases: usize,
+    eager_connections_per_lease: usize,
+    eager_connections_total: usize,
+    lease_and_connection_checkout_elapsed_ns: u128,
+    eager_connections_per_second: f64,
+    observed_application_sessions_at_peak: i64,
+    cleanup_elapsed_ns: u128,
+    total_elapsed_ns: u128,
+    admin_sessions: SessionDelta,
+}
+
+#[derive(Serialize)]
 struct BatchMethodReport {
     execution: BatchExecutionReport,
     completion: CompletionObservationReport,
@@ -473,6 +530,8 @@ struct PostgresSettingsReport {
     data_checksums: bool,
     wal_level: String,
     max_connections: i32,
+    reserved_connections: i32,
+    superuser_reserved_connections: i32,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -641,7 +700,9 @@ impl Observer {
                         current_setting('full_page_writes')::boolean,
                         current_setting('data_checksums')::boolean,
                         current_setting('wal_level'),
-                        current_setting('max_connections')::integer",
+                        current_setting('max_connections')::integer,
+                        current_setting('reserved_connections')::integer,
+                        current_setting('superuser_reserved_connections')::integer",
                 &[],
             ),
         )
@@ -657,6 +718,8 @@ impl Observer {
                 data_checksums: row.get(6),
                 wal_level: row.get(7),
                 max_connections: row.get(8),
+                reserved_connections: row.get(9),
+                superuser_reserved_connections: row.get(10),
             },
         })
     }
@@ -687,6 +750,19 @@ impl Observer {
             self.operation_timeout,
             self.client()
                 .query_one("SELECT pg_database_size($1)", &[&database_name]),
+        )
+        .await?;
+        Ok(row.get(0))
+    }
+
+    async fn application_session_count(&self, database_names: &[String]) -> AnyResult<i64> {
+        let row = run_observer_operation(
+            "count eager downstream sessions",
+            self.operation_timeout,
+            self.client().query_one(
+                "SELECT count(*) FROM pg_stat_activity WHERE datname = ANY($1)",
+                &[&database_names],
+            ),
         )
         .await?;
         Ok(row.get(0))
@@ -812,13 +888,14 @@ async fn main() -> AnyResult<()> {
     let expected_owned_image_content_id = image_content_id.value.as_deref();
 
     eprintln!(
-        "postgres-test-harness performance: project={}, mode={}, samples={}, sequential={}, concurrent={} at {}, drains={}",
+        "postgres-test-harness performance: project={}, mode={}, samples={}, sequential={}, concurrent={} at {}, downstream_pool_size={}, drains={}",
         config.project,
         config.mode.as_str(),
         config.samples,
         config.sequential_operations,
         config.concurrent_operations,
         config.concurrency,
+        config.downstream_pool_size,
         config.drain_databases
     );
 
@@ -873,6 +950,8 @@ async fn main() -> AnyResult<()> {
             "The owned profile does not disable data checksums or lower wal_level; reports record both server settings.",
             "Deferred cleanup records caller-return latency separately from the awaited final drain barrier.",
             "The drain barrier reports worker failures; one post-barrier catalog query verifies that every exact lease name is absent.",
+            "The downstream pool spike eagerly opens its configured maximum on every measured lease and verifies the exact peak in pg_stat_activity; ordinary application pools may establish fewer physical connections lazily.",
+            "Connection permits reserve downstream application capacity only; owner, template-lock, lifecycle-pool, observer, and ambient external-server sessions are separate PostgreSQL connections.",
             "Run both modes under comparable load and compare the versioned JSON output; URLs and credentials are never recorded.",
         ],
     };
@@ -1089,6 +1168,13 @@ async fn run_fixture(
         config.concurrency,
     )
     .await?;
+    let downstream_pool_checkout_spike = run_downstream_pool_checkout_spike(
+        &template,
+        observer,
+        config.concurrency,
+        config.downstream_pool_size,
+    )
+    .await?;
     let explicit_cleanup_drain =
         run_explicit_drain(&template, observer, config.drain_databases).await?;
     let deferred_cleanup =
@@ -1104,6 +1190,7 @@ async fn run_fixture(
         warm_template_acquisition,
         sequential_clone_cleanup,
         bounded_concurrent_clone_cleanup,
+        downstream_pool_checkout_spike,
         explicit_cleanup_drain,
         deferred_cleanup,
     })
@@ -1180,6 +1267,193 @@ async fn run_bounded_concurrent(
         individual,
         before.delta(after),
     ))
+}
+
+struct EagerDatabaseConnections {
+    lease: postgres_test_harness::DatabaseLease,
+    clients: Vec<Client>,
+    connection_tasks: Vec<tokio::task::JoinHandle<std::result::Result<(), tokio_postgres::Error>>>,
+    operation_timeout: Duration,
+}
+
+impl EagerDatabaseConnections {
+    async fn close(self) -> AnyResult<()> {
+        let Self {
+            lease,
+            clients,
+            connection_tasks,
+            operation_timeout,
+        } = self;
+        drop(clients);
+        let connection_shutdown = async {
+            for task in connection_tasks {
+                run_observer_operation(
+                    "close an eager downstream connection",
+                    operation_timeout,
+                    task,
+                )
+                .await??;
+            }
+            Ok(())
+        }
+        .await;
+        let cleanup = lease
+            .cleanup()
+            .await
+            .map_err(|error| Box::new(error) as AnyError);
+        combine_operation_and_cleanup(connection_shutdown, cleanup).map(|_| ())
+    }
+}
+
+async fn open_eager_database_connections(
+    template: &postgres_test_harness::DatabaseTemplate,
+    connections: usize,
+    operation_timeout: Duration,
+) -> AnyResult<EagerDatabaseConnections> {
+    let lease = template.database().await?;
+    let database_url = lease.database_url().to_owned();
+    let mut checkouts = JoinSet::new();
+    for _ in 0..connections {
+        let database_url = database_url.clone();
+        checkouts.spawn(async move {
+            let (client, connection) = run_observer_operation(
+                "open an eager downstream connection",
+                operation_timeout,
+                tokio_postgres::connect(&database_url, NoTls),
+            )
+            .await?;
+            let connection = tokio::spawn(connection);
+            run_observer_operation(
+                "probe an eager downstream connection",
+                operation_timeout,
+                client.simple_query("SELECT 1"),
+            )
+            .await?;
+            Ok::<_, AnyError>((client, connection))
+        });
+    }
+
+    let mut clients = Vec::with_capacity(connections);
+    let mut connection_tasks = Vec::with_capacity(connections);
+    while let Some(result) = checkouts.join_next().await {
+        let (client, connection) = result??;
+        clients.push(client);
+        connection_tasks.push(connection);
+    }
+    Ok(EagerDatabaseConnections {
+        lease,
+        clients,
+        connection_tasks,
+        operation_timeout,
+    })
+}
+
+async fn close_eager_database_connections(
+    connections: Vec<EagerDatabaseConnections>,
+) -> AnyResult<()> {
+    let mut tasks = JoinSet::new();
+    for connections in connections {
+        tasks.spawn(connections.close());
+    }
+    let mut first_error = None;
+    while let Some(result) = tasks.join_next().await {
+        let result = result
+            .map_err(|error| Box::new(error) as AnyError)
+            .and_then(|result| result);
+        if let Err(error) = result
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+async fn run_downstream_pool_checkout_spike(
+    template: &postgres_test_harness::DatabaseTemplate,
+    observer: &Observer,
+    leases: usize,
+    connections_per_lease: usize,
+) -> AnyResult<DownstreamPoolCheckoutOperation> {
+    let eager_connections_total = leases
+        .checked_mul(connections_per_lease)
+        .ok_or_else(|| invalid_input("eager downstream connection count overflowed usize"))?;
+    let expected_application_sessions = i64::try_from(eager_connections_total)
+        .map_err(|_| invalid_input("eager downstream connection count must fit in i64"))?;
+    let before = observer.session_snapshot().await?;
+    let total_started = Instant::now();
+    let mut checkouts = JoinSet::new();
+    let operation_timeout = observer.operation_timeout;
+    for _ in 0..leases {
+        let template = template.clone();
+        checkouts.spawn(async move {
+            open_eager_database_connections(&template, connections_per_lease, operation_timeout)
+                .await
+        });
+    }
+
+    let mut opened = Vec::with_capacity(leases);
+    let mut first_error = None;
+    while let Some(result) = checkouts.join_next().await {
+        match result {
+            Ok(Ok(connections)) => opened.push(connections),
+            Ok(Err(error)) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(Box::new(error));
+                }
+            }
+        }
+    }
+    let checkout_elapsed = total_started.elapsed();
+
+    if let Some(error) = first_error {
+        let cleanup = close_eager_database_connections(opened).await;
+        return combine_operation_and_cleanup::<(), ()>(Err(error), cleanup)
+            .map(|_| unreachable!("an eager checkout error cannot become successful"));
+    }
+
+    let database_names = opened
+        .iter()
+        .map(|connections| connections.lease.database_name().to_owned())
+        .collect::<Vec<_>>();
+    let observed = observer
+        .application_session_count(&database_names)
+        .await
+        .and_then(|observed| {
+            if observed == expected_application_sessions {
+                Ok(observed)
+            } else {
+                Err(io::Error::other(format!(
+                    "expected {eager_connections_total} eager downstream sessions across {leases} leases, observed {observed}"
+                ))
+                .into())
+            }
+        });
+    let cleanup_started = Instant::now();
+    let cleanup = close_eager_database_connections(opened).await;
+    let cleanup_elapsed = cleanup_started.elapsed();
+    let (observed_application_sessions_at_peak, ()) =
+        combine_operation_and_cleanup(observed, cleanup)?;
+    let total_elapsed = total_started.elapsed();
+    let after = observer.session_snapshot().await?;
+
+    Ok(DownstreamPoolCheckoutOperation {
+        leases,
+        eager_connections_per_lease: connections_per_lease,
+        eager_connections_total,
+        lease_and_connection_checkout_elapsed_ns: checkout_elapsed.as_nanos(),
+        eager_connections_per_second: eager_connections_total as f64
+            / checkout_elapsed.as_secs_f64(),
+        observed_application_sessions_at_peak,
+        cleanup_elapsed_ns: cleanup_elapsed.as_nanos(),
+        total_elapsed_ns: total_elapsed.as_nanos(),
+        admin_sessions: before.delta(after),
+    })
 }
 
 async fn run_explicit_drain(
@@ -1588,8 +1862,12 @@ fn command_output(program: &str, arguments: &[&str]) -> AnyResult<String> {
 }
 
 fn positive_env(name: &str, default: usize) -> AnyResult<usize> {
+    Ok(optional_positive_env(name)?.unwrap_or(default))
+}
+
+fn optional_positive_env(name: &str) -> AnyResult<Option<usize>> {
     let Some(value) = env::var_os(name) else {
-        return Ok(default);
+        return Ok(None);
     };
     let value = value
         .into_string()
@@ -1602,7 +1880,7 @@ fn positive_env(name: &str, default: usize) -> AnyResult<usize> {
             "{name} must be a positive integer, got zero"
         )));
     }
-    Ok(parsed)
+    Ok(Some(parsed))
 }
 
 fn owned_container_profile_from_environment() -> AnyResult<OwnedContainerProfile> {
@@ -1685,6 +1963,16 @@ fn summarize(samples: &[SampleReport]) -> Vec<SummaryReport> {
                 (
                     "bounded_concurrent_clone_cleanup",
                     fixture.bounded_concurrent_clone_cleanup.elapsed_ns,
+                ),
+                (
+                    "downstream_pool_checkout_spike",
+                    fixture
+                        .downstream_pool_checkout_spike
+                        .lease_and_connection_checkout_elapsed_ns,
+                ),
+                (
+                    "downstream_pool_checkout_spike_total",
+                    fixture.downstream_pool_checkout_spike.total_elapsed_ns,
                 ),
                 (
                     "explicit_cleanup_drain",
@@ -1774,11 +2062,12 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        BatchMethodReport, CleanupAttemptReport, ExternalCleanupReport, Observer,
-        OperationAndCleanupError, OwnedContainerProfileReport, PostgresSettingsReport,
-        ReportOutput, RetryBackoff, SCHEMA_VERSION, ServerMode, SessionSnapshotReport,
-        SummaryReport, benchmark_project, combine_operation_and_cleanup, run_observer_operation,
-        summary_report, validate_completed_external_cleanup, validate_external_sweep,
+        BatchMethodReport, CleanupAttemptReport, DownstreamPoolCheckoutOperation,
+        ExternalCleanupReport, Observer, OperationAndCleanupError, OwnedContainerProfileReport,
+        PostgresSettingsReport, ReportOutput, RetryBackoff, SCHEMA_VERSION, ServerMode,
+        SessionDelta, SessionSnapshotReport, SummaryReport, benchmark_project,
+        combine_operation_and_cleanup, run_observer_operation, summary_report,
+        validate_completed_external_cleanup, validate_external_sweep,
     };
 
     #[test]
@@ -1963,8 +2252,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_v6_encodes_cleanup_barrier_storage_and_provenance() {
-        assert_eq!(SCHEMA_VERSION, 6);
+    fn schema_v7_encodes_concurrency_cleanup_storage_and_provenance() {
+        assert_eq!(SCHEMA_VERSION, 7);
         assert_eq!(
             serde_json::to_value(BatchMethodReport::caller_bounded(4))
                 .expect("serialize caller-bounded method"),
@@ -1982,6 +2271,41 @@ mod tests {
             })
         );
         assert_eq!(
+            serde_json::to_value(DownstreamPoolCheckoutOperation {
+                leases: 4,
+                eager_connections_per_lease: 5,
+                eager_connections_total: 20,
+                lease_and_connection_checkout_elapsed_ns: 400_000_000,
+                eager_connections_per_second: 50.0,
+                observed_application_sessions_at_peak: 20,
+                cleanup_elapsed_ns: 100_000_000,
+                total_elapsed_ns: 500_000_000,
+                admin_sessions: SessionDelta {
+                    before: 7,
+                    after: 9,
+                    delta: 2,
+                    active_after: 4,
+                },
+            })
+            .expect("serialize downstream pool checkout spike"),
+            serde_json::json!({
+                "leases": 4,
+                "eager_connections_per_lease": 5,
+                "eager_connections_total": 20,
+                "lease_and_connection_checkout_elapsed_ns": 400_000_000_u128,
+                "eager_connections_per_second": 50.0,
+                "observed_application_sessions_at_peak": 20,
+                "cleanup_elapsed_ns": 100_000_000_u128,
+                "total_elapsed_ns": 500_000_000_u128,
+                "admin_sessions": {
+                    "before": 7,
+                    "after": 9,
+                    "delta": 2,
+                    "active_after": 4
+                }
+            })
+        );
+        assert_eq!(
             serde_json::to_value(PostgresSettingsReport {
                 fsync: true,
                 synchronous_commit: "on".to_owned(),
@@ -1989,6 +2313,8 @@ mod tests {
                 data_checksums: true,
                 wal_level: "replica".to_owned(),
                 max_connections: 100,
+                reserved_connections: 2,
+                superuser_reserved_connections: 3,
             })
             .expect("serialize PostgreSQL settings"),
             serde_json::json!({
@@ -1997,7 +2323,9 @@ mod tests {
                 "full_page_writes": true,
                 "data_checksums": true,
                 "wal_level": "replica",
-                "max_connections": 100
+                "max_connections": 100,
+                "reserved_connections": 2,
+                "superuser_reserved_connections": 3
             })
         );
         assert_eq!(

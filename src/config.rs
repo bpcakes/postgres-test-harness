@@ -156,10 +156,39 @@ pub struct HarnessConfig {
     pub(crate) cleanup_on_start: bool,
 }
 
+/// Resolved connection-permit policy for disposable database leases.
+///
+/// The budget models downstream application connections. Each live database
+/// lease reserves [`Self::connections_per_database`] permits, so the effective
+/// lease limit is floor division and any remainder stays unused. Harness-owned
+/// owner, template-coordination, and lifecycle-administration sessions are
+/// separate from this application budget.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ResolvedConnectionLimits {
-    pub(crate) budget: usize,
-    pub(crate) per_database: u32,
+pub struct ConnectionLimits {
+    pub(crate) connection_budget: usize,
+    pub(crate) connections_per_database: u32,
+}
+
+impl ConnectionLimits {
+    /// Returns the total number of downstream-connection permits.
+    pub const fn connection_budget(&self) -> usize {
+        self.connection_budget
+    }
+
+    /// Returns the permits reserved by every live database lease.
+    ///
+    /// This value should cover the sum of the maximum sizes of every
+    /// application pool or standalone connection that one test can open.
+    pub const fn connections_per_database(&self) -> u32 {
+        self.connections_per_database
+    }
+
+    /// Returns the effective maximum number of simultaneous database leases.
+    ///
+    /// This is `connection_budget / connections_per_database`, rounded down.
+    pub const fn max_simultaneous_leases(&self) -> usize {
+        self.connection_budget / self.connections_per_database as usize
+    }
 }
 
 impl HarnessConfig {
@@ -264,6 +293,32 @@ impl HarnessConfig {
         &self.owned_container_profile
     }
 
+    /// Resolves this configuration's database connection-permit policy.
+    ///
+    /// Resolution is order-independent. An explicit per-database value greater
+    /// than the final budget is reported here (and by
+    /// [`crate::PostgresHarness::start`]) because either builder may be called
+    /// first. When the per-database value is not overridden, its default is
+    /// clamped to a smaller budget.
+    pub fn connection_limits(&self) -> Result<ConnectionLimits> {
+        let connection_budget = self
+            .connection_budget_override
+            .map_or(DEFAULT_CONNECTION_BUDGET, NonZeroU32::get);
+        let connections_per_database = self.connections_per_database_override.map_or(
+            DEFAULT_CONNECTIONS_PER_DATABASE.min(connection_budget),
+            NonZeroU32::get,
+        );
+        if connections_per_database > connection_budget {
+            return Err(Error::InvalidConfiguration {
+                reason: "per-database permits must be no greater than the connection budget",
+            });
+        }
+        Ok(ConnectionLimits {
+            connection_budget: connection_budget as usize,
+            connections_per_database,
+        })
+    }
+
     pub(crate) fn resolved_admin_database_url(&self) -> Option<String> {
         self.admin_database_url
             .clone()
@@ -277,25 +332,6 @@ impl HarnessConfig {
             .or_else(|| std::env::var(POSTGRES_TEST_IMAGE_ENV).ok())
             .unwrap_or_else(|| DEFAULT_IMAGE.to_owned());
         ImageReference::parse(&image)
-    }
-
-    pub(crate) fn resolved_connection_limits(&self) -> Result<ResolvedConnectionLimits> {
-        let budget = self
-            .connection_budget_override
-            .map_or(DEFAULT_CONNECTION_BUDGET, NonZeroU32::get);
-        let per_database = self.connections_per_database_override.map_or(
-            DEFAULT_CONNECTIONS_PER_DATABASE.min(budget),
-            NonZeroU32::get,
-        );
-        if per_database > budget {
-            return Err(Error::InvalidConfiguration {
-                reason: "per-database permits must be no greater than the connection budget",
-            });
-        }
-        Ok(ResolvedConnectionLimits {
-            budget: budget as usize,
-            per_database,
-        })
     }
 }
 
@@ -394,8 +430,8 @@ fn validate_postgres_timeout(timeout: Duration) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_OWNED_CONTAINER_TMPFS_SIZE_BYTES, HarnessConfig, ImageReference,
-        OwnedContainerProfile, ProjectName, ResolvedConnectionLimits,
+        ConnectionLimits, DEFAULT_OWNED_CONTAINER_TMPFS_SIZE_BYTES, HarnessConfig, ImageReference,
+        OwnedContainerProfile, ProjectName,
     };
 
     #[test]
@@ -500,11 +536,11 @@ mod tests {
         assert_eq!(
             HarnessConfig::new("creditkit")
                 .unwrap()
-                .resolved_connection_limits()
+                .connection_limits()
                 .unwrap(),
-            ResolvedConnectionLimits {
-                budget: 120,
-                per_database: 11,
+            ConnectionLimits {
+                connection_budget: 120,
+                connections_per_database: 11,
             }
         );
 
@@ -513,19 +549,19 @@ mod tests {
             .with_connection_budget(5)
             .unwrap();
         assert_eq!(
-            small_budget.resolved_connection_limits().unwrap(),
-            ResolvedConnectionLimits {
-                budget: 5,
-                per_database: 5,
+            small_budget.connection_limits().unwrap(),
+            ConnectionLimits {
+                connection_budget: 5,
+                connections_per_database: 5,
             }
         );
 
         let raised_budget = small_budget.with_connection_budget(20).unwrap();
         assert_eq!(
-            raised_budget.resolved_connection_limits().unwrap(),
-            ResolvedConnectionLimits {
-                budget: 20,
-                per_database: 11,
+            raised_budget.connection_limits().unwrap(),
+            ConnectionLimits {
+                connection_budget: 20,
+                connections_per_database: 11,
             }
         );
     }
@@ -545,12 +581,8 @@ mod tests {
             .with_connection_budget(30)
             .unwrap();
         assert_eq!(
-            budget_then_per_database
-                .resolved_connection_limits()
-                .unwrap(),
-            per_database_then_budget
-                .resolved_connection_limits()
-                .unwrap()
+            budget_then_per_database.connection_limits().unwrap(),
+            per_database_then_budget.connection_limits().unwrap()
         );
 
         let repeated = HarnessConfig::new("creditkit")
@@ -564,10 +596,10 @@ mod tests {
             .with_connections_per_database(15)
             .unwrap();
         assert_eq!(
-            repeated.resolved_connection_limits().unwrap(),
-            ResolvedConnectionLimits {
-                budget: 30,
-                per_database: 15,
+            repeated.connection_limits().unwrap(),
+            ConnectionLimits {
+                connection_budget: 30,
+                connections_per_database: 15,
             }
         );
     }
@@ -579,7 +611,7 @@ mod tests {
             .with_connections_per_database(121)
             .unwrap();
         assert!(matches!(
-            standalone_per_database.resolved_connection_limits(),
+            standalone_per_database.connection_limits(),
             Err(crate::Error::InvalidConfiguration { .. })
         ));
 
@@ -595,16 +627,34 @@ mod tests {
             .unwrap()
             .with_connections_per_database(20)
             .unwrap();
-        assert!(
-            per_database_then_budget
-                .resolved_connection_limits()
-                .is_err()
-        );
-        assert!(
-            budget_then_per_database
-                .resolved_connection_limits()
-                .is_err()
-        );
+        assert!(per_database_then_budget.connection_limits().is_err());
+        assert!(budget_then_per_database.connection_limits().is_err());
+    }
+
+    #[test]
+    fn resolved_connection_limits_expose_effective_floor_division() {
+        let limits = HarnessConfig::new("creditkit")
+            .unwrap()
+            .with_connection_budget(120)
+            .unwrap()
+            .with_connections_per_database(11)
+            .unwrap()
+            .connection_limits()
+            .unwrap();
+
+        assert_eq!(limits.connection_budget(), 120);
+        assert_eq!(limits.connections_per_database(), 11);
+        assert_eq!(limits.max_simultaneous_leases(), 10);
+
+        let exact = HarnessConfig::new("creditkit")
+            .unwrap()
+            .with_connection_budget(33)
+            .unwrap()
+            .with_connections_per_database(11)
+            .unwrap()
+            .connection_limits()
+            .unwrap();
+        assert_eq!(exact.max_simultaneous_leases(), 3);
     }
 
     #[test]

@@ -11,8 +11,8 @@ mod name;
 mod server;
 
 pub use config::{
-    DEFAULT_OWNED_CONTAINER_TMPFS_SIZE_BYTES, HarnessConfig, OwnedContainerProfile,
-    POSTGRES_TEST_ADMIN_URL_ENV, POSTGRES_TEST_IMAGE_ENV, ProjectName,
+    ConnectionLimits, DEFAULT_OWNED_CONTAINER_TMPFS_SIZE_BYTES, HarnessConfig,
+    OwnedContainerProfile, POSTGRES_TEST_ADMIN_URL_ENV, POSTGRES_TEST_IMAGE_ENV, ProjectName,
 };
 pub use error::{BoxError, DeferredCleanupFailure, Error, Result};
 pub use fingerprint::{FingerprintBuilder, TemplateFingerprint, TemplateSpec};

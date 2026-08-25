@@ -122,9 +122,18 @@ impl AdminClient {
     }
 
     fn batch_execute(&mut self, operation: &'static str, query: &str) -> Result<()> {
+        self.batch_execute_with_timeout(self.request_timeout, operation, query)
+    }
+
+    fn batch_execute_with_timeout(
+        &mut self,
+        timeout: Duration,
+        operation: &'static str,
+        query: &str,
+    ) -> Result<()> {
         run_admin_operation(
             &self.runtime,
-            self.request_timeout,
+            timeout,
             operation,
             self.client.batch_execute(query),
         )
@@ -264,6 +273,40 @@ struct AdminSession<'a> {
     reusable: bool,
 }
 
+#[derive(Clone, Copy)]
+struct CheckoutDeadline {
+    started: Instant,
+    timeout: Duration,
+}
+
+impl CheckoutDeadline {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            timeout,
+        }
+    }
+
+    fn remaining(self) -> Result<Duration> {
+        self.timeout
+            .checked_sub(self.started.elapsed())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or(Error::AdminSessionCheckoutTimeout {
+                timeout: self.timeout,
+            })
+    }
+
+    fn is_elapsed(self) -> bool {
+        self.started.elapsed() >= self.timeout
+    }
+
+    fn elapsed_error(self) -> Error {
+        Error::AdminSessionCheckoutTimeout {
+            timeout: self.timeout,
+        }
+    }
+}
+
 impl AdminSessionPool {
     pub(crate) fn new(
         admin_url: AdminDatabaseUrl,
@@ -319,18 +362,23 @@ impl AdminSessionPool {
     }
 
     fn checkout(&self, connect_operation: &'static str) -> Result<AdminSession<'_>> {
+        let deadline = CheckoutDeadline::new(self.operation_timeout);
         loop {
-            match self.acquire_checkout()? {
+            match self.acquire_checkout(deadline)? {
                 Some(mut client) => {
                     if prepare_reused_lifecycle_session(
                         client.client_mut(),
                         self.operation_timeout,
                         &self.application_name,
+                        deadline,
                     )
                     .is_err()
                     {
                         drop(client);
                         self.release_slot();
+                        if deadline.is_elapsed() {
+                            return Err(deadline.elapsed_error());
+                        }
                         continue;
                     }
                     return Ok(AdminSession {
@@ -373,8 +421,7 @@ impl AdminSessionPool {
         }
     }
 
-    fn acquire_checkout(&self) -> Result<Option<PersistentClient>> {
-        let wait_started = Instant::now();
+    fn acquire_checkout(&self, deadline: CheckoutDeadline) -> Result<Option<PersistentClient>> {
         let mut state = self.state.lock().map_err(|_| Error::StatePoisoned {
             operation: "lock disposable admin-session pool",
         })?;
@@ -389,11 +436,7 @@ impl AdminSessionPool {
                 state.total += 1;
                 return Ok(None);
             }
-            let Some(remaining) = self.operation_timeout.checked_sub(wait_started.elapsed()) else {
-                return Err(Error::AdminSessionCheckoutTimeout {
-                    timeout: self.operation_timeout,
-                });
-            };
+            let remaining = deadline.remaining()?;
             (state, _) = self.available.wait_timeout(state, remaining).map_err(|_| {
                 Error::StatePoisoned {
                     operation: "wait for disposable admin session",
@@ -495,9 +538,19 @@ fn prepare_reused_lifecycle_session(
     client: &mut AdminClient,
     operation_timeout: Duration,
     application_name: &str,
+    checkout_deadline: CheckoutDeadline,
 ) -> Result<()> {
-    client.batch_execute("reset pooled admin session", "DISCARD ALL")?;
-    configure_lifecycle_session(client, operation_timeout, application_name)
+    client.batch_execute_with_timeout(
+        checkout_deadline.remaining()?,
+        "reset pooled admin session",
+        "DISCARD ALL",
+    )?;
+    configure_lifecycle_session_with_timeout(
+        client,
+        operation_timeout,
+        application_name,
+        checkout_deadline.remaining()?,
+    )
 }
 
 fn configure_lifecycle_session(
@@ -505,9 +558,25 @@ fn configure_lifecycle_session(
     operation_timeout: Duration,
     application_name: &str,
 ) -> Result<()> {
+    let request_timeout = client.request_timeout;
+    configure_lifecycle_session_with_timeout(
+        client,
+        operation_timeout,
+        application_name,
+        request_timeout,
+    )
+}
+
+fn configure_lifecycle_session_with_timeout(
+    client: &mut AdminClient,
+    operation_timeout: Duration,
+    application_name: &str,
+    request_timeout: Duration,
+) -> Result<()> {
     let statement_timeout = duration_millis(operation_timeout)?;
     let lock_timeout = duration_millis(LOCK_TIMEOUT.min(operation_timeout))?;
-    client.batch_execute(
+    client.batch_execute_with_timeout(
+        request_timeout,
         "configure pooled admin session",
         &format!(
             "SET statement_timeout = {statement_timeout}; \
@@ -845,9 +914,9 @@ mod tests {
     };
 
     use super::{
-        AdminClient, AdminDatabaseUrl, AdminSessionPool, PersistentClient, advisory_key,
-        compensate_failed_metadata_write, connect_admin_with_timeout, quote_identifier,
-        quote_literal, regular_connection_slots_from_settings,
+        AdminClient, AdminDatabaseUrl, AdminSessionPool, CheckoutDeadline, PersistentClient,
+        advisory_key, compensate_failed_metadata_write, connect_admin_with_timeout,
+        quote_identifier, quote_literal, regular_connection_slots_from_settings,
     };
     use crate::{Error, FingerprintBuilder, ProjectName, name::DatabaseName};
 
@@ -895,7 +964,7 @@ mod tests {
         pool.state.lock().unwrap().total = 1;
 
         let started = Instant::now();
-        let error = match pool.acquire_checkout() {
+        let error = match pool.acquire_checkout(CheckoutDeadline::new(timeout)) {
             Ok(_) => panic!("a saturated admin-session pool must not admit another checkout"),
             Err(error) => error,
         };
@@ -906,6 +975,51 @@ mod tests {
         ));
         assert!(started.elapsed() >= timeout);
         pool.release_slot();
+    }
+
+    #[test]
+    fn admin_pool_reuse_retries_share_one_checkout_deadline() {
+        let timeout = Duration::from_millis(50);
+        let (first, first_closed, first_server) = connect_stub_admin_client(timeout);
+        let (second, second_closed, second_server) = connect_stub_admin_client(timeout);
+        let pool = AdminSessionPool::new(
+            AdminDatabaseUrl::parse("postgres://user@localhost/postgres").unwrap(),
+            timeout,
+            "reuse_timeout",
+            2,
+        );
+        {
+            let mut state = pool.state.lock().unwrap();
+            state.idle = vec![PersistentClient::new(first), PersistentClient::new(second)];
+            state.total = 2;
+        }
+
+        let error = match pool.checkout("connect after expired pooled sessions") {
+            Ok(_) => panic!("silent pooled sessions must exhaust one checkout deadline"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            Error::AdminSessionCheckoutTimeout { timeout: actual } if actual == timeout
+        ));
+        assert_eq!(
+            pool.state.lock().unwrap().idle.len(),
+            1,
+            "the checkout must stop before probing another idle session"
+        );
+
+        drop(pool);
+        first_closed
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first stub connection closes after its reset times out")
+            .expect("first stub connection closes cleanly");
+        second_closed
+            .recv_timeout(Duration::from_secs(1))
+            .expect("unprobed stub connection closes with the pool")
+            .expect("second stub connection closes cleanly");
+        first_server.join().unwrap();
+        second_server.join().unwrap();
     }
 
     #[test]

@@ -281,7 +281,7 @@ impl HarnessConfig {
     pub fn with_connections_per_database(mut self, permits: u32) -> Result<Self> {
         let Some(permits) = NonZeroU32::new(permits) else {
             return Err(Error::InvalidConfiguration {
-                reason: "per-database permits must be positive and no greater than the connection budget",
+                reason: "per-database permits must be positive",
             });
         };
         self.connections_per_database_override = Some(permits);
@@ -530,7 +530,12 @@ mod tests {
             .unwrap()
             .with_connections_per_database(0)
             .unwrap_err();
-        assert!(matches!(error, crate::Error::InvalidConfiguration { .. }));
+        assert!(matches!(
+            error,
+            crate::Error::InvalidConfiguration {
+                reason: "per-database permits must be positive"
+            }
+        ));
 
         if let Ok(too_large) = usize::try_from(u64::from(u32::MAX) + 1) {
             let error = HarnessConfig::new("creditkit")

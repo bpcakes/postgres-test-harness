@@ -15,12 +15,13 @@ use crate::{
     BoxError, ConnectionLimits, Error, HarnessConfig, ProjectName, Result, TemplateFingerprint,
     TemplateSpec,
     admin::{
-        AdminClient, AdminDatabaseUrl, DatabaseRecord, ManagedDatabaseCreationFailure,
-        PersistentClient, acquire_shared_template_advisory_lock, acquire_template_advisory_lock,
-        advisory_key, connect_admin, create_managed_database_classified,
-        disable_database_connections, drop_database, find_database, list_databases,
-        release_advisory_lock, release_shared_advisory_lock, set_database_metadata,
-        terminate_database_connections, try_acquire_advisory_lock, validate_postgres_18,
+        AdminClient, AdminDatabaseUrl, AdminSessionDisposition, DatabaseRecord,
+        ManagedDatabaseCreationFailure, PersistentClient, acquire_shared_template_advisory_lock,
+        acquire_template_advisory_lock, advisory_key, connect_admin,
+        create_managed_database_classified, disable_database_connections, drop_database,
+        find_database, list_databases, release_advisory_lock, release_shared_advisory_lock,
+        set_database_metadata, terminate_database_connections, try_acquire_advisory_lock,
+        validate_postgres_18,
     },
     cleanup::{CleanupOutcome, log_cleanup},
     metadata::{ResourceMetadata, TemplateState},
@@ -900,14 +901,19 @@ fn database_cleanup_operation(
 ) -> impl FnOnce() -> CleanupOutcome + Send + 'static {
     move || {
         let operation_server = server.clone();
-        let outcome =
-            server.with_lifecycle_admin("connect for disposable database cleanup", move |client| {
-                drop_database(client, &name)?;
+        let outcome = server.with_lifecycle_admin_disposition(
+            "connect for disposable database cleanup",
+            move |client| {
+                if let Err(error) = drop_database(client, &name) {
+                    return AdminSessionDisposition::Evict(CleanupOutcome::residual_possible(
+                        error,
+                    ));
+                }
                 let Some(ref mut refill) = prewarm_return else {
-                    return Ok(CleanupOutcome::succeeded());
+                    return AdminSessionDisposition::Reuse(CleanupOutcome::succeeded());
                 };
                 if !refill.after_drop() {
-                    return Ok(CleanupOutcome::succeeded());
+                    return AdminSessionDisposition::Reuse(CleanupOutcome::succeeded());
                 }
 
                 let fresh_name = DatabaseName::test(&operation_server.project);
@@ -920,14 +926,14 @@ fn database_cleanup_operation(
                         operation_server.owner_key,
                     ),
                 ) {
-                    return Ok(match error {
+                    return match error {
                         ManagedDatabaseCreationFailure::NoResidual(error) => {
-                            CleanupOutcome::no_residual(error)
+                            AdminSessionDisposition::Reuse(CleanupOutcome::no_residual(error))
                         }
                         ManagedDatabaseCreationFailure::ResidualPossible(error) => {
-                            return Err(error);
+                            AdminSessionDisposition::Evict(CleanupOutcome::residual_possible(error))
                         }
-                    });
+                    };
                 }
                 let prepared = PreparedDatabase {
                     database_url: operation_server.admin_url.database_url(&fresh_name),
@@ -939,10 +945,15 @@ fn database_cleanup_operation(
                     // still covers the complete slot transition.
                     let result = drop_database(client, &prepared.name);
                     deletion.finish();
-                    result?;
+                    if let Err(error) = result {
+                        return AdminSessionDisposition::Evict(CleanupOutcome::residual_possible(
+                            error,
+                        ));
+                    }
                 }
-                Ok(CleanupOutcome::succeeded())
-            });
+                AdminSessionDisposition::Reuse(CleanupOutcome::succeeded())
+            },
+        );
         match outcome {
             Ok(outcome) => outcome,
             Err(error) => CleanupOutcome::residual_possible(error),

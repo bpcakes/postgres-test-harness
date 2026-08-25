@@ -14,6 +14,9 @@ type CleanupOperation = Box<dyn FnOnce() -> CleanupOutcome + Send + 'static>;
 
 /// Result of a cleanup job, including the storage consequence that controls
 /// whether the server must stop admitting new databases.
+///
+/// Cleanup operations pair this storage outcome with an independent
+/// `AdminSessionDisposition` at the lifecycle-admin pool boundary.
 pub(crate) enum CleanupOutcome {
     Succeeded,
     NoResidual(Error),

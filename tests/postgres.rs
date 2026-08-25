@@ -1286,6 +1286,7 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
                 ..
             }
         ));
+        wait_until_lifecycle_admin_session_count(&admin_url, "cleanup_fail_it", 0).await;
         failure_harness
             .drain_deferred_cleanup()
             .await

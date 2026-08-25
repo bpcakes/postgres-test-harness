@@ -280,6 +280,15 @@ struct AdminSession<'a> {
     reusable: bool,
 }
 
+/// Explicit disposition of a completed operation's checked-out admin session.
+///
+/// The payload carries the operation outcome independently from whether the
+/// session is safe to return to the idle pool.
+pub(crate) enum AdminSessionDisposition<T> {
+    Reuse(T),
+    Evict(T),
+}
+
 #[derive(Clone, Copy)]
 struct Deadline {
     started: Instant,
@@ -350,12 +359,26 @@ impl AdminSessionPool {
         connect_operation: &'static str,
         operation: impl FnOnce(&mut AdminClient) -> Result<T>,
     ) -> Result<T> {
+        self.execute_with_disposition(connect_operation, |client| match operation(client) {
+            Ok(value) => AdminSessionDisposition::Reuse(Ok(value)),
+            Err(error) => AdminSessionDisposition::Evict(Err(error)),
+        })?
+    }
+
+    /// Runs an operation whose result and session disposition are independent.
+    pub(crate) fn execute_with_disposition<T>(
+        &self,
+        connect_operation: &'static str,
+        operation: impl FnOnce(&mut AdminClient) -> AdminSessionDisposition<T>,
+    ) -> Result<T> {
         let mut session = self.checkout(connect_operation)?;
-        let result = operation(session.client_mut());
-        if result.is_ok() {
-            session.reusable = true;
+        match operation(session.client_mut()) {
+            AdminSessionDisposition::Reuse(value) => {
+                session.reusable = true;
+                Ok(value)
+            }
+            AdminSessionDisposition::Evict(value) => Ok(value),
         }
-        result
     }
 
     #[cfg(feature = "containers")]

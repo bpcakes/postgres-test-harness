@@ -26,8 +26,9 @@ use uuid::Uuid;
 use crate::{
     ConnectionLimits, Error, HarnessConfig, ProjectName, Result, TemplateFingerprint,
     admin::{
-        AdminClient, AdminDatabaseUrl, AdminSessionPool, PersistentClient, acquire_advisory_lock,
-        advisory_key, connect_admin, regular_connection_slots, validate_postgres_18,
+        AdminClient, AdminDatabaseUrl, AdminSessionDisposition, AdminSessionPool, PersistentClient,
+        acquire_advisory_lock, advisory_key, connect_admin, regular_connection_slots,
+        validate_postgres_18,
     },
     cleanup::DatabaseCleanupQueue,
     harness::PrewarmPoolInner,
@@ -392,6 +393,15 @@ impl ServerInner {
         operation: impl FnOnce(&mut AdminClient) -> Result<T>,
     ) -> Result<T> {
         self.admin_sessions.execute(connect_operation, operation)
+    }
+
+    pub(crate) fn with_lifecycle_admin_disposition<T>(
+        &self,
+        connect_operation: &'static str,
+        operation: impl FnOnce(&mut AdminClient) -> AdminSessionDisposition<T>,
+    ) -> Result<T> {
+        self.admin_sessions
+            .execute_with_disposition(connect_operation, operation)
     }
 
     pub(crate) fn is_external(&self) -> bool {

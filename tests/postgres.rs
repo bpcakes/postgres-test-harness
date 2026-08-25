@@ -530,6 +530,13 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         pool.shutdown()
             .await
             .expect("a second barrier should find no hidden refill work");
+        failure_harness
+            .empty_database()
+            .await
+            .expect("a refill failure without a residual must preserve harness admission")
+            .cleanup()
+            .await
+            .expect("clean up the post-refill admission probe");
     }
 
     {

@@ -15,14 +15,14 @@ use crate::{
     BoxError, ConnectionLimits, Error, HarnessConfig, ProjectName, Result, TemplateFingerprint,
     TemplateSpec,
     admin::{
-        AdminClient, AdminDatabaseUrl, DatabaseRecord, PersistentClient,
-        acquire_shared_template_advisory_lock, acquire_template_advisory_lock, advisory_key,
-        connect_admin, create_managed_database, disable_database_connections, drop_database,
-        find_database, list_databases, release_advisory_lock, release_shared_advisory_lock,
-        set_database_metadata, terminate_database_connections, try_acquire_advisory_lock,
-        validate_postgres_18,
+        AdminClient, AdminDatabaseUrl, DatabaseRecord, ManagedDatabaseCreationFailure,
+        PersistentClient, acquire_shared_template_advisory_lock, acquire_template_advisory_lock,
+        advisory_key, connect_admin, create_managed_database, create_managed_database_classified,
+        disable_database_connections, drop_database, find_database, list_databases,
+        release_advisory_lock, release_shared_advisory_lock, set_database_metadata,
+        terminate_database_connections, try_acquire_advisory_lock, validate_postgres_18,
     },
-    cleanup::log_cleanup,
+    cleanup::{CleanupOutcome, log_cleanup},
     metadata::{ResourceMetadata, TemplateState},
     name::{DatabaseKind, DatabaseName},
     server::{ServerInner, TemplateCacheAction, TemplateInner, run_blocking},
@@ -100,8 +100,8 @@ impl PostgresHarness {
     /// Failures from [`DatabaseLease::defer_cleanup`], the `Drop` fallback, or
     /// an awaited cleanup whose caller was cancelled are retained and returned
     /// exactly once. Cleanup submitted concurrently after the barrier begins is
-    /// covered by a later drain. Any cleanup failure closes new database
-    /// admission so residual databases cannot accumulate without bound.
+    /// covered by a later drain. A failure that may leave a residual database
+    /// closes new admission so storage cannot accumulate without bound.
     pub async fn drain_deferred_cleanup(&self) -> Result<()> {
         let database_cleanup = self.server.database_cleanup.clone();
         let outcome = run_blocking(move || Ok(database_cleanup.begin_drain())).await?;
@@ -786,8 +786,9 @@ impl DatabaseLease {
     /// then releases the database's connection-budget permit. Call
     /// [`PostgresHarness::drain_deferred_cleanup`] before process or external
     /// server teardown to await final completion and observe cleanup failures.
-    /// A failed drop closes new database admission for this harness. Close all
-    /// application connections and pools before calling.
+    /// A failure that may leave a residual database closes new database
+    /// admission for this harness. Close all application connections and pools
+    /// before calling.
     pub async fn defer_cleanup(mut self) -> Result<()> {
         let inner = self
             .inner
@@ -846,7 +847,7 @@ impl DatabaseLeaseInner {
         let prewarm_return = prewarm_pool
             .and_then(|pool| pool.upgrade())
             .map(|pool| pool.begin_return());
-        database_cleanup.submit_awaited(
+        database_cleanup.submit_awaited_outcome(
             database_name,
             permit,
             database_cleanup_operation(server, name, prewarm_return),
@@ -865,7 +866,7 @@ impl DatabaseLeaseInner {
         let prewarm_return = prewarm_pool
             .and_then(|pool| pool.upgrade())
             .map(|pool| pool.begin_return());
-        database_cleanup.submit_deferred(
+        database_cleanup.submit_deferred_outcome(
             database_name,
             Some(permit),
             database_cleanup_operation(server, name, prewarm_return),
@@ -884,7 +885,7 @@ impl DatabaseLeaseInner {
         let prewarm_return = prewarm_pool
             .and_then(|pool| pool.upgrade())
             .map(|pool| pool.begin_return());
-        database_cleanup.submit_fallback(
+        database_cleanup.submit_fallback_outcome(
             database_name,
             permit,
             database_cleanup_operation(server, name, prewarm_return),
@@ -896,42 +897,60 @@ fn database_cleanup_operation(
     server: Arc<ServerInner>,
     name: DatabaseName,
     mut prewarm_return: Option<PrewarmReturn>,
-) -> impl FnOnce() -> Result<()> + Send + 'static {
+) -> impl FnOnce() -> CleanupOutcome + Send + 'static {
     move || {
         let operation_server = server.clone();
-        server.with_lifecycle_admin("connect for disposable database cleanup", move |client| {
-            drop_database(client, &name)?;
-            let Some(ref mut refill) = prewarm_return else {
-                return Ok(());
-            };
-            if !refill.after_drop() {
-                return Ok(());
-            }
+        let outcome =
+            server.with_lifecycle_admin("connect for disposable database cleanup", move |client| {
+                if let Err(error) = drop_database(client, &name) {
+                    return Ok(CleanupOutcome::residual_possible(error));
+                }
+                let Some(ref mut refill) = prewarm_return else {
+                    return Ok(CleanupOutcome::succeeded());
+                };
+                if !refill.after_drop() {
+                    return Ok(CleanupOutcome::succeeded());
+                }
 
-            let fresh_name = DatabaseName::test(&operation_server.project);
-            create_managed_database(
-                client,
-                &fresh_name,
-                refill.pool.template.name().as_str(),
-                &ResourceMetadata::test(
-                    operation_server.project.clone(),
-                    operation_server.owner_key,
-                ),
-            )?;
-            let prepared = PreparedDatabase {
-                database_url: operation_server.admin_url.database_url(&fresh_name),
-                name: fresh_name,
-            };
-            if let Some((prepared, deletion)) = refill.publish(prepared) {
-                // The pool closed after reserving this replacement. Remove it
-                // on the same admin session so the enclosing cleanup barrier
-                // still covers the complete slot transition.
-                let result = drop_database(client, &prepared.name);
-                deletion.finish();
-                result?;
-            }
-            Ok(())
-        })
+                let fresh_name = DatabaseName::test(&operation_server.project);
+                if let Err(error) = create_managed_database_classified(
+                    client,
+                    &fresh_name,
+                    refill.pool.template.name().as_str(),
+                    &ResourceMetadata::test(
+                        operation_server.project.clone(),
+                        operation_server.owner_key,
+                    ),
+                ) {
+                    return Ok(match error {
+                        ManagedDatabaseCreationFailure::NoResidual(error) => {
+                            CleanupOutcome::no_residual(error)
+                        }
+                        ManagedDatabaseCreationFailure::ResidualPossible(error) => {
+                            CleanupOutcome::residual_possible(error)
+                        }
+                    });
+                }
+                let prepared = PreparedDatabase {
+                    database_url: operation_server.admin_url.database_url(&fresh_name),
+                    name: fresh_name,
+                };
+                if let Some((prepared, deletion)) = refill.publish(prepared) {
+                    // The pool closed after reserving this replacement. Remove it
+                    // on the same admin session so the enclosing cleanup barrier
+                    // still covers the complete slot transition.
+                    let result = drop_database(client, &prepared.name);
+                    deletion.finish();
+                    if let Err(error) = result {
+                        return Ok(CleanupOutcome::residual_possible(error));
+                    }
+                }
+                Ok(CleanupOutcome::succeeded())
+            });
+        match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => CleanupOutcome::residual_possible(error),
+        }
     }
 }
 

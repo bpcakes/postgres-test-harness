@@ -10,7 +10,47 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 use crate::{DeferredCleanupFailure, Error, Result};
 
-type CleanupOperation = Box<dyn FnOnce() -> Result<()> + Send + 'static>;
+type CleanupOperation = Box<dyn FnOnce() -> CleanupOutcome + Send + 'static>;
+
+/// Result of a cleanup job, including the storage consequence that controls
+/// whether the server must stop admitting new databases.
+pub(crate) enum CleanupOutcome {
+    Succeeded,
+    NoResidual(Error),
+    ResidualPossible(Error),
+}
+
+impl CleanupOutcome {
+    fn from_cleanup_result(result: Result<()>) -> Self {
+        match result {
+            Ok(()) => Self::Succeeded,
+            Err(error) => Self::ResidualPossible(error),
+        }
+    }
+
+    pub(crate) fn no_residual(error: Error) -> Self {
+        Self::NoResidual(error)
+    }
+
+    pub(crate) fn residual_possible(error: Error) -> Self {
+        Self::ResidualPossible(error)
+    }
+
+    pub(crate) const fn succeeded() -> Self {
+        Self::Succeeded
+    }
+
+    fn may_leave_residual(&self) -> bool {
+        matches!(self, Self::ResidualPossible(_))
+    }
+
+    fn into_result(self) -> Result<()> {
+        match self {
+            Self::Succeeded => Ok(()),
+            Self::NoResidual(error) | Self::ResidualPossible(error) => Err(error),
+        }
+    }
+}
 
 /// Server-scoped execution and completion tracking for disposable database
 /// cleanup.
@@ -152,6 +192,7 @@ impl DatabaseCleanupQueue {
         }))
     }
 
+    #[cfg(test)]
     pub(crate) fn submit_awaited<F>(
         self: &Arc<Self>,
         database_name: String,
@@ -160,6 +201,20 @@ impl DatabaseCleanupQueue {
     ) -> Result<oneshot::Receiver<AwaitedCleanupOutcome>>
     where
         F: FnOnce() -> Result<()> + Send + 'static,
+    {
+        self.submit_awaited_outcome(database_name, permit, move || {
+            CleanupOutcome::from_cleanup_result(operation())
+        })
+    }
+
+    pub(crate) fn submit_awaited_outcome<F>(
+        self: &Arc<Self>,
+        database_name: String,
+        permit: OwnedSemaphorePermit,
+        operation: F,
+    ) -> Result<oneshot::Receiver<AwaitedCleanupOutcome>>
+    where
+        F: FnOnce() -> CleanupOutcome + Send + 'static,
     {
         let (sender, receiver) = oneshot::channel();
         self.enqueue(
@@ -172,6 +227,7 @@ impl DatabaseCleanupQueue {
         Ok(receiver)
     }
 
+    #[cfg(test)]
     pub(crate) fn submit_deferred<F>(
         self: &Arc<Self>,
         database_name: String,
@@ -180,6 +236,20 @@ impl DatabaseCleanupQueue {
     ) -> Result<()>
     where
         F: FnOnce() -> Result<()> + Send + 'static,
+    {
+        self.submit_deferred_outcome(database_name, permit, move || {
+            CleanupOutcome::from_cleanup_result(operation())
+        })
+    }
+
+    pub(crate) fn submit_deferred_outcome<F>(
+        self: &Arc<Self>,
+        database_name: String,
+        permit: Option<OwnedSemaphorePermit>,
+        operation: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> CleanupOutcome + Send + 'static,
     {
         self.enqueue(
             database_name,
@@ -198,6 +268,7 @@ impl DatabaseCleanupQueue {
     ///
     /// The retained permit bounds these extra waiting jobs by the live database
     /// limit and transfers any backpressure to the next database acquisition.
+    #[cfg(test)]
     pub(crate) fn submit_fallback<F>(
         self: &Arc<Self>,
         database_name: String,
@@ -206,6 +277,20 @@ impl DatabaseCleanupQueue {
     ) -> Result<()>
     where
         F: FnOnce() -> Result<()> + Send + 'static,
+    {
+        self.submit_fallback_outcome(database_name, permit, move || {
+            CleanupOutcome::from_cleanup_result(operation())
+        })
+    }
+
+    pub(crate) fn submit_fallback_outcome<F>(
+        self: &Arc<Self>,
+        database_name: String,
+        permit: OwnedSemaphorePermit,
+        operation: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> CleanupOutcome + Send + 'static,
     {
         self.enqueue(
             database_name,
@@ -231,7 +316,7 @@ impl DatabaseCleanupQueue {
     {
         self.enqueue(
             database_name,
-            Box::new(operation),
+            Box::new(move || CleanupOutcome::from_cleanup_result(operation())),
             CleanupCompletion::Deferred,
             None,
             CleanupAdmission::NonblockingFallback,
@@ -605,16 +690,17 @@ fn run_cleanup_job(job: CleanupJob, completion_state: &CompletionState) {
         permit,
         queue_guard,
     } = job;
-    let result = match catch_unwind(AssertUnwindSafe(operation)) {
-        Ok(result) => result,
-        Err(_) => Err(Error::CleanupWorkerPanicked),
+    let outcome = match catch_unwind(AssertUnwindSafe(operation)) {
+        Ok(outcome) => outcome,
+        Err(_) => CleanupOutcome::residual_possible(Error::CleanupWorkerPanicked),
     };
-    if result.is_err() {
-        // A failed DROP leaves a residual database outside the in-flight queue.
-        // Closing admission prevents repeated failures from growing storage
-        // without bound; already-live leases remain cleanable.
+    if outcome.may_leave_residual() {
+        // A failure that may leave a database outside the in-flight queue must
+        // stop later work from growing storage without bound; already-live
+        // leases remain cleanable.
         completion_state.close_database_admission();
     }
+    let result = outcome.into_result();
     // Awaited cleanup and nonblocking destructor fallback retain application
     // capacity through the database drop.
     drop(permit);
@@ -657,7 +743,7 @@ mod tests {
         time::Duration,
     };
 
-    use super::DatabaseCleanupQueue;
+    use super::{CleanupOutcome, DatabaseCleanupQueue};
     use crate::Error;
 
     struct Gate {
@@ -854,6 +940,25 @@ mod tests {
             "a cleanup failure must stop new databases from growing the residual set"
         );
         queue.drain().unwrap();
+    }
+
+    #[test]
+    fn failure_without_residual_keeps_database_admission_open() {
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let queue = DatabaseCleanupQueue::new("no-residual", 1, 1, admission.clone()).unwrap();
+        queue
+            .submit_deferred_outcome("refill".to_owned(), None, || {
+                CleanupOutcome::no_residual(Error::InvalidConfiguration {
+                    reason: "replacement creation failed",
+                })
+            })
+            .unwrap();
+
+        assert!(queue.drain().is_err());
+        assert!(
+            !admission.is_closed(),
+            "a failure proven not to leave residual storage must not close admission"
+        );
     }
 
     #[test]

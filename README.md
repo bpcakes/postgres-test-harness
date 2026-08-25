@@ -149,11 +149,12 @@ capacity, at most `L + W + Q` disposable databases can be live, running cleanup,
 or waiting for cleanup in one server. Awaited and fallback jobs retain their
 lease permits, so this formula is a conservative mixed-workload bound. Every
 later lease is created under a fresh unique name from `template0` or the
-immutable project template; a returned database is never reset or reused. Any
-cleanup failure closes new database admission for that harness before the
-worker releases its slot. Already-live leases remain cleanable, but callers must
-observe the drain error and recover or replace the harness; repeated failures
-cannot accumulate an unbounded residual set.
+immutable project template; a returned database is never reset or reused. A
+cleanup failure that may leave a residual database closes new database admission
+for that harness before the worker releases its slot. Already-live leases remain
+cleanable, but callers must observe the drain error and recover or replace the
+harness; repeated ambiguous failures cannot accumulate an unbounded residual
+set.
 
 An opt-in prewarmed pool adds its declared capacity `N` to that storage bound.
 Each of its slots is exactly one of ready, leased, deleting, or creating, so
@@ -226,9 +227,10 @@ with a fresh unique name to become ready.
 
 The pool never truncates or resets a dirty database. `cleanup()` waits for its
 dirty drop and replacement; `defer_cleanup()` and `Drop` hand that work to the
-bounded server lifecycle queue. Refill failures close both the pool and new
-database admission and are reported by the awaited cleanup or the harness drain
-barrier. `status()` exposes the ready, leased, deleting, and creating counts for
+bounded server lifecycle queue. Refill failures close the pool and are reported
+by the awaited cleanup or the harness drain barrier. They close harness-wide
+database admission only when the failure may have left a replacement database
+behind. `status()` exposes the ready, leased, deleting, and creating counts for
 diagnostics. A pool keeps its source template and shared advisory-lock session
 alive. Explicit `shutdown()` closes the pool, removes all idle databases, and
 drains accepted lifecycle work; it does not revoke leases still held by callers.

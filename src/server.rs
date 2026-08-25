@@ -1016,13 +1016,23 @@ fn map_container_start_error(
     profile: OwnedContainerProfile,
     source: testcontainers::TestcontainersError,
 ) -> Error {
-    match profile.tmpfs_size_bytes() {
-        Some(tmpfs_size_bytes) => Error::ContainerStorageStart {
+    match (
+        profile.tmpfs_size_bytes(),
+        tmpfs_start_error_evidence(&source),
+    ) {
+        (Some(tmpfs_size_bytes), true) => Error::ContainerStorageStart {
             tmpfs_size_bytes,
             source,
         },
-        None => Error::ContainerStart { source },
+        _ => Error::ContainerStart { source },
     }
+}
+
+#[cfg(feature = "containers")]
+fn tmpfs_start_error_evidence(source: &testcontainers::TestcontainersError) -> bool {
+    let message = source.to_string().to_ascii_lowercase();
+    message.contains("tmpfs")
+        || (message.contains("mount") && message.contains(POSTGRES_STORAGE_PATH))
 }
 
 #[cfg(feature = "containers")]
@@ -1379,19 +1389,33 @@ mod tests {
     }
 
     #[test]
-    fn tmpfs_start_failures_retain_daemon_details_and_an_opt_out() {
+    fn tmpfs_start_failures_require_storage_specific_evidence() {
         let error = map_container_start_error(
             OwnedContainerProfile::default(),
-            testcontainers::TestcontainersError::other("operation not permitted"),
+            testcontainers::TestcontainersError::other("tmpfs mounts are not supported"),
         );
 
         assert!(matches!(error, Error::ContainerStorageStart { .. }));
-        assert!(error.to_string().contains("operation not permitted"));
+        assert!(error.to_string().contains("tmpfs mounts are not supported"));
         assert!(error.to_string().contains("without_tmpfs"));
 
         let error = map_container_start_error(
-            OwnedContainerProfile::default().without_tmpfs(),
+            OwnedContainerProfile::default(),
+            testcontainers::TestcontainersError::other(format!(
+                "invalid mount configuration for {POSTGRES_STORAGE_PATH}"
+            )),
+        );
+        assert!(matches!(error, Error::ContainerStorageStart { .. }));
+
+        let error = map_container_start_error(
+            OwnedContainerProfile::default(),
             testcontainers::TestcontainersError::other("daemon unavailable"),
+        );
+        assert!(matches!(error, Error::ContainerStart { .. }));
+
+        let error = map_container_start_error(
+            OwnedContainerProfile::default().without_tmpfs(),
+            testcontainers::TestcontainersError::other("tmpfs mounts are not supported"),
         );
         assert!(matches!(error, Error::ContainerStart { .. }));
     }

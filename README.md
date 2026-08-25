@@ -107,6 +107,11 @@ configured operation and lock timeouts restored before work. Waiting for a
 session is also bounded by the configured operation timeout. Failed or
 uncertain sessions are evicted and reconnected lazily.
 
+Managed creation failures that may have taken effect without a response close
+new database admission before returning, so repeated ambiguous attempts cannot
+grow an untracked residual set. A PostgreSQL error that proves creation did not
+occur is returned without closing admission.
+
 The application permit budget does not include harness administration. One
 owner-lock session lives for the server, each distinct live template retains
 one shared-lock session, and lifecycle create/cleanup work uses up to `A`

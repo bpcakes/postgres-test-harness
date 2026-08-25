@@ -84,14 +84,6 @@ pub(crate) enum ManagedDatabaseCreationFailure {
     ResidualPossible(Error),
 }
 
-impl ManagedDatabaseCreationFailure {
-    pub(crate) fn into_error(self) -> Error {
-        match self {
-            Self::NoResidual(error) | Self::ResidualPossible(error) => error,
-        }
-    }
-}
-
 /// Tokio-backed PostgreSQL client with a synchronous internal interface.
 ///
 /// Keeping the runtime here lets connection establishment place one deadline
@@ -795,16 +787,6 @@ fn create_database(
             database_name.quoted()
         ),
     )
-}
-
-pub(crate) fn create_managed_database(
-    client: &mut AdminClient,
-    database_name: &DatabaseName,
-    template_name: &str,
-    metadata: &ResourceMetadata,
-) -> Result<()> {
-    create_managed_database_classified(client, database_name, template_name, metadata)
-        .map_err(ManagedDatabaseCreationFailure::into_error)
 }
 
 pub(crate) fn create_managed_database_classified(

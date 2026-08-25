@@ -382,6 +382,10 @@ impl ServerInner {
             .map_err(|_| Error::ConnectionBudgetClosed)
     }
 
+    pub(crate) fn close_database_admission(&self) {
+        self.budget.close();
+    }
+
     pub(crate) fn with_lifecycle_admin<T>(
         &self,
         connect_operation: &'static str,

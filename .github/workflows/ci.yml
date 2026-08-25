@@ -47,6 +47,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: docker info
+      - run: docker pull postgres:18
       - run: cargo test --locked --test postgres -- --ignored --test-threads=1
 
   external-postgres:

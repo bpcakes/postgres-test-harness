@@ -48,3 +48,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: docker info
       - run: cargo test --locked --test postgres -- --ignored --test-threads=1
+
+  external-postgres:
+    name: External-only reference adapter
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d postgres"
+          --health-interval 1s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      POSTGRES_TEST_ADMIN_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run --locked --no-default-features --example downstream_adapter
+      - run: cargo test --locked --no-default-features --test external_only external_only_lifecycle_works_end_to_end -- --ignored --exact

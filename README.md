@@ -43,6 +43,10 @@ database.cleanup().await?;
 
 ## Consumer adapter contract
 
+For a complete process-caching adapter, connection-budget worksheet,
+prewarming/cleanup policy, and one-service-per-CI-job example, see the
+[downstream performance guide](docs/downstream-performance.md).
+
 Each project should keep a small test-support adapter that owns only
 project-specific policy:
 

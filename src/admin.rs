@@ -289,12 +289,12 @@ struct AdminSession<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct CheckoutDeadline {
+struct Deadline {
     started: Instant,
     timeout: Duration,
 }
 
-impl CheckoutDeadline {
+impl Deadline {
     fn new(timeout: Duration) -> Self {
         Self {
             started: Instant::now(),
@@ -302,23 +302,32 @@ impl CheckoutDeadline {
         }
     }
 
-    fn remaining(self) -> Result<Duration> {
+    fn remaining(self) -> Option<Duration> {
         self.timeout
             .checked_sub(self.started.elapsed())
             .filter(|remaining| !remaining.is_zero())
-            .ok_or(Error::AdminSessionCheckoutTimeout {
-                timeout: self.timeout,
-            })
     }
 
     fn is_elapsed(self) -> bool {
         self.started.elapsed() >= self.timeout
     }
 
-    fn elapsed_error(self) -> Error {
-        Error::AdminSessionCheckoutTimeout {
-            timeout: self.timeout,
-        }
+    const fn timeout(self) -> Duration {
+        self.timeout
+    }
+}
+
+fn checkout_remaining(deadline: Deadline) -> Result<Duration> {
+    deadline
+        .remaining()
+        .ok_or(Error::AdminSessionCheckoutTimeout {
+            timeout: deadline.timeout(),
+        })
+}
+
+fn checkout_timeout(deadline: Deadline) -> Error {
+    Error::AdminSessionCheckoutTimeout {
+        timeout: deadline.timeout(),
     }
 }
 
@@ -377,7 +386,7 @@ impl AdminSessionPool {
     }
 
     fn checkout(&self, connect_operation: &'static str) -> Result<AdminSession<'_>> {
-        let deadline = CheckoutDeadline::new(self.operation_timeout);
+        let deadline = Deadline::new(self.operation_timeout);
         loop {
             match self.acquire_checkout(deadline)? {
                 Some(mut client) => {
@@ -392,7 +401,7 @@ impl AdminSessionPool {
                         drop(client);
                         self.release_slot();
                         if deadline.is_elapsed() {
-                            return Err(deadline.elapsed_error());
+                            return Err(checkout_timeout(deadline));
                         }
                         continue;
                     }
@@ -436,7 +445,7 @@ impl AdminSessionPool {
         }
     }
 
-    fn acquire_checkout(&self, deadline: CheckoutDeadline) -> Result<Option<PersistentClient>> {
+    fn acquire_checkout(&self, deadline: Deadline) -> Result<Option<PersistentClient>> {
         let mut state = self.state.lock().map_err(|_| Error::StatePoisoned {
             operation: "lock disposable admin-session pool",
         })?;
@@ -451,7 +460,7 @@ impl AdminSessionPool {
                 state.total += 1;
                 return Ok(None);
             }
-            let remaining = deadline.remaining()?;
+            let remaining = checkout_remaining(deadline)?;
             (state, _) = self.available.wait_timeout(state, remaining).map_err(|_| {
                 Error::StatePoisoned {
                     operation: "wait for disposable admin session",
@@ -553,10 +562,10 @@ fn prepare_reused_lifecycle_session(
     client: &mut AdminClient,
     operation_timeout: Duration,
     application_name: &str,
-    checkout_deadline: CheckoutDeadline,
+    checkout_deadline: Deadline,
 ) -> Result<()> {
     client.batch_execute_with_timeout(
-        checkout_deadline.remaining()?,
+        checkout_remaining(checkout_deadline)?,
         "reset pooled admin session",
         "DISCARD ALL",
     )?;
@@ -564,7 +573,7 @@ fn prepare_reused_lifecycle_session(
         client,
         operation_timeout,
         application_name,
-        checkout_deadline.remaining()?,
+        checkout_remaining(checkout_deadline)?,
     )
 }
 
@@ -959,10 +968,10 @@ mod tests {
     };
 
     use super::{
-        AdminClient, AdminDatabaseUrl, AdminSessionPool, CheckoutDeadline,
-        ManagedDatabaseCreationFailure, PersistentClient, advisory_key,
-        compensate_failed_metadata_write, connect_admin_with_timeout, quote_identifier,
-        quote_literal, regular_connection_slots_from_settings,
+        AdminClient, AdminDatabaseUrl, AdminSessionPool, Deadline, ManagedDatabaseCreationFailure,
+        PersistentClient, advisory_key, compensate_failed_metadata_write,
+        connect_admin_with_timeout, quote_identifier, quote_literal,
+        regular_connection_slots_from_settings,
     };
     use crate::{Error, FingerprintBuilder, ProjectName, name::DatabaseName};
 
@@ -1010,7 +1019,7 @@ mod tests {
         pool.state.lock().unwrap().total = 1;
 
         let started = Instant::now();
-        let error = match pool.acquire_checkout(CheckoutDeadline::new(timeout)) {
+        let error = match pool.acquire_checkout(Deadline::new(timeout)) {
             Ok(_) => panic!("a saturated admin-session pool must not admit another checkout"),
             Err(error) => error,
         };

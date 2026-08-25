@@ -105,8 +105,9 @@ The JSON records these boundaries for every sample and fixture:
 - `cold_template_acquisition`: a run-unique fingerprint whose initializer must
   execute. This includes the fixture migration and template finalization.
 - `warm_template_acquisition`: the same fingerprint while the cold handle is
-  live. Its initializer deliberately returns an error if called, proving the
-  ready path was used.
+  live. Its initializer deliberately returns an error if called. The
+  per-server cache should return the same live template allocation without a
+  new PostgreSQL catalog query, advisory-lock round trip, or retained session.
 - `sequential_clone_cleanup`: repeated `DatabaseTemplate::database` plus
   awaited `DatabaseLease::cleanup`, one at a time.
 - `bounded_concurrent_clone_cleanup`: the same complete lifecycle with a
@@ -153,6 +154,9 @@ shows one-session warm-up, growth to the caller's concurrency, and zero-churn
 reuse in later phases. Correctness tests separately identify these sessions by
 their `postgres-test-harness lifecycle:<project>` application name and prove
 the configured bound with `pg_stat_activity`.
+Cold template acquisition adds one retained shared-lock session. On a
+single-purpose owned server, a live warm acquisition should report a zero
+session delta; an external run can contain unrelated server-wide sessions.
 The startup field is explicitly named
 `admin_sessions_after_observer_connect`: it is an untimed post-start snapshot
 and includes the observer itself, while each phase delta keeps the same

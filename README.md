@@ -163,8 +163,18 @@ barrier before teardown. If the process is terminated before a drain, owned
 container cleanup removes the whole server and tagged external databases remain
 eligible for the next owner-aware stale sweep.
 
-Template coordination has a separate 15-minute wait timeout so a short
-administrative-operation timeout does not make concurrent callers fail while a
+Calls for the same live template on clones of one `PostgresHarness` are
+single-flighted and cached by fingerprint. They return handles backed by one
+template allocation and one retained shared-lock session; waiting callers do
+not run their initializers. The cache keeps only a weak reference, so dropping
+the final `DatabaseTemplate` releases that session. An initializer error or
+cancelled caller clears its flight and lets a waiting or later caller retry
+with its own initializer.
+
+Distinct `PostgresHarness::start` calls and separate processes deliberately do
+not share this in-memory cache. They continue to coordinate through PostgreSQL
+advisory locks. That coordination has a separate 15-minute wait timeout so a
+short administrative-operation timeout does not make a caller fail while a
 real migration suite is still running. Override it with
 `HarnessConfig::with_template_wait_timeout` when needed.
 

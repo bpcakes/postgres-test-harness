@@ -1,6 +1,6 @@
 use std::{
     future::Future,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, SystemTime},
 };
 
@@ -20,7 +20,7 @@ use crate::{
     cleanup::log_cleanup,
     metadata::{ResourceMetadata, TemplateState},
     name::{DatabaseKind, DatabaseName},
-    server::{ServerInner, run_blocking},
+    server::{ServerInner, TemplateCacheAction, TemplateInner, run_blocking},
 };
 
 const DEFAULT_CLEANUP_OPERATION_TIMEOUT: Duration = Duration::from_secs(90);
@@ -105,6 +105,12 @@ impl PostgresHarness {
     }
 
     /// Gets or initializes one immutable, content-addressed template database.
+    ///
+    /// Calls with the same fingerprint on clones of this harness single-flight
+    /// initialization and share one live template handle. The cache is weak:
+    /// dropping the final [`DatabaseTemplate`] releases its retained PostgreSQL
+    /// shared-lock session. Separate harness starts continue to coordinate through
+    /// PostgreSQL advisory locks.
     pub async fn template<F, Fut>(
         &self,
         spec: TemplateSpec,
@@ -115,43 +121,62 @@ impl PostgresHarness {
         Fut: Future<Output = std::result::Result<(), BoxError>>,
     {
         let fingerprint = spec.fingerprint();
-        let name = DatabaseName::template(&self.server.project, fingerprint);
-        let server = self.server.clone();
-        let preparation = run_blocking(move || begin_template(server, name, fingerprint)).await?;
-
-        let template_lock = match preparation {
-            TemplatePreparation::Ready(template_lock) => template_lock,
-            TemplatePreparation::Initialize(initialization) => {
-                let database_url = initialization
-                    .server
-                    .admin_url
-                    .database_url(&initialization.name);
-                match initializer(database_url).await {
-                    Ok(()) => run_blocking(move || initialization.finish()).await?,
-                    Err(initializer) => {
-                        let cleanup = run_blocking(move || initialization.abort()).await;
-                        return match cleanup {
-                            Ok(()) => Err(Error::TemplateInitializer {
-                                source: initializer,
-                            }),
-                            Err(cleanup) => Err(Error::TemplateInitializerAndCleanup {
-                                initializer,
-                                cleanup: Box::new(cleanup),
-                            }),
-                        };
+        let mut initializer = Some(initializer);
+        loop {
+            match self.server.template_cache_action(fingerprint) {
+                TemplateCacheAction::Ready(inner) => return Ok(DatabaseTemplate { inner }),
+                TemplateCacheAction::Wait(waiter) => {
+                    if let Some(inner) = waiter.wait().await {
+                        return Ok(DatabaseTemplate { inner });
                     }
                 }
-            }
-        };
+                TemplateCacheAction::Initialize(cache_initializer) => {
+                    let name = DatabaseName::template(&self.server.project, fingerprint);
+                    let server = self.server.clone();
+                    let preparation =
+                        run_blocking(move || begin_template(server, name, fingerprint)).await?;
 
-        Ok(DatabaseTemplate {
-            inner: Arc::new(TemplateInner {
-                server: self.server.clone(),
-                name: DatabaseName::template(&self.server.project, fingerprint),
-                fingerprint,
-                _shared_lock: Mutex::new(template_lock),
-            }),
-        })
+                    let template_lock = match preparation {
+                        TemplatePreparation::Ready(template_lock) => template_lock,
+                        TemplatePreparation::Initialize(initialization) => {
+                            let database_url = initialization
+                                .server
+                                .admin_url
+                                .database_url(&initialization.name);
+                            let initialize = initializer
+                                .take()
+                                .expect("a template caller initializes at most once");
+                            match initialize(database_url).await {
+                                Ok(()) => run_blocking(move || initialization.finish()).await?,
+                                Err(initializer) => {
+                                    let cleanup =
+                                        run_blocking(move || initialization.abort()).await;
+                                    return match cleanup {
+                                        Ok(()) => Err(Error::TemplateInitializer {
+                                            source: initializer,
+                                        }),
+                                        Err(cleanup) => Err(Error::TemplateInitializerAndCleanup {
+                                            initializer,
+                                            cleanup: Box::new(cleanup),
+                                        }),
+                                    };
+                                }
+                            }
+                        }
+                    };
+
+                    let inner = Arc::new(TemplateInner::new(
+                        self.server.clone(),
+                        DatabaseName::template(&self.server.project, fingerprint),
+                        fingerprint,
+                        template_lock,
+                    ));
+                    return Ok(DatabaseTemplate {
+                        inner: cache_initializer.publish(inner),
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -163,23 +188,16 @@ pub struct DatabaseTemplate {
 
 impl DatabaseTemplate {
     pub fn database_name(&self) -> &str {
-        self.inner.name.as_str()
+        self.inner.name().as_str()
     }
 
     pub fn fingerprint(&self) -> TemplateFingerprint {
-        self.inner.fingerprint
+        self.inner.fingerprint()
     }
 
     pub async fn database(&self) -> Result<DatabaseLease> {
-        create_test_database(self.inner.server.clone(), self.inner.name.as_str()).await
+        create_test_database(self.inner.server().clone(), self.inner.name().as_str()).await
     }
-}
-
-struct TemplateInner {
-    server: Arc<ServerInner>,
-    name: DatabaseName,
-    fingerprint: TemplateFingerprint,
-    _shared_lock: Mutex<PersistentClient>,
 }
 
 /// Exclusive ownership of one disposable test database.

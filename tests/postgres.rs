@@ -511,7 +511,8 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
             advisory_lock_count(admin_url.clone(), "ShareLock")
                 .await
                 .expect("count shared advisory locks after cold start"),
-            shared_locks_before + CONCURRENT_CALLERS as i64
+            shared_locks_before + 1,
+            "same-server cold-start callers must retain one shared-lock session"
         );
 
         drop(templates);
@@ -538,6 +539,23 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         );
         drop(template_clone);
         wait_until_advisory_lock_is_acquirable(&admin_url, clone_lock_key).await;
+
+        let reacquired = tokio::time::timeout(
+            Duration::from_secs(5),
+            harness.template(TemplateSpec::new(clone_fingerprint), |_| async {
+                Err(std::io::Error::other("ready template initializer must not rerun").into())
+            }),
+        )
+        .await
+        .expect("a stale weak cache entry must start a new acquisition flight")
+        .expect("reacquire the catalog-ready template after its final handle drops");
+        assert!(
+            !advisory_lock_is_acquirable(admin_url.clone(), clone_lock_key)
+                .await
+                .expect("check lock retained by the reacquired template")
+        );
+        drop(reacquired);
+        wait_until_advisory_lock_is_acquirable(&admin_url, clone_lock_key).await;
     }
 
     {
@@ -547,12 +565,42 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
             "template",
             &format!("harness_it:{}", queued_fingerprint.to_hex()),
         );
+        let shared_locks_before = advisory_lock_count(admin_url.clone(), "ShareLock")
+            .await
+            .expect("count shared advisory locks before warm-path regression");
+        let peer_harness = PostgresHarness::start(
+            HarnessConfig::new("harness_it")
+                .unwrap()
+                .with_admin_database_url(admin_url.clone())
+                .with_cleanup_on_start(false),
+        )
+        .await
+        .expect("start distinct server cache for queued-exclusive regression");
         let first_template = harness
             .template(queued_spec, |_| async { Ok(()) })
             .await
             .expect("initialize queued-exclusive template");
         let mut exclusive = QueuedAdvisoryLock::queue(admin_url.clone(), queued_lock_key).await;
-        let waiting_harness = harness.clone();
+        let catalog_lock = CatalogLock::acquire(admin_url.clone()).await;
+        let warm_template = tokio::time::timeout(
+            Duration::from_secs(1),
+            harness.template(queued_spec, |_| async {
+                Err(std::io::Error::other("warm template initializer must not run").into())
+            }),
+        )
+        .await
+        .expect("warm cache path must not wait on PostgreSQL catalog or advisory locks")
+        .expect("reuse live same-server template from cache");
+        assert_eq!(
+            advisory_lock_count(admin_url.clone(), "ShareLock")
+                .await
+                .expect("count shared advisory locks after warm acquisition"),
+            shared_locks_before + 1,
+            "warm acquisition must reuse the retained shared-lock session"
+        );
+        drop(catalog_lock);
+
+        let waiting_harness = peer_harness.clone();
         let waiting_template = tokio::spawn(async move {
             waiting_harness
                 .template(queued_spec, |_| async {
@@ -566,14 +614,15 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
             !waiting_template.is_finished(),
-            "shared template acquisition must queue behind an exclusive waiter"
+            "a distinct server's shared template acquisition must queue behind an exclusive waiter"
         );
 
         drop(first_template);
+        drop(warm_template);
         exclusive.wait_until_acquired().await;
         assert!(
             !waiting_template.is_finished(),
-            "shared template acquisition must wait while the exclusive lock is held"
+            "a distinct server's shared template acquisition must wait while the exclusive lock is held"
         );
         exclusive.release();
         let waiting_template = tokio::time::timeout(Duration::from_secs(5), waiting_template)
@@ -587,24 +636,57 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
     {
         let error_fingerprint = FingerprintBuilder::new("initializer-error-recovery").finish();
         let error_spec = TemplateSpec::new(error_fingerprint);
-        let error = match harness
-            .template(error_spec, |_| async {
-                Err(std::io::Error::other("forced initializer failure").into())
-            })
+        let failing_harness = harness.clone();
+        let (initializer_started_sender, initializer_started_receiver) =
+            tokio::sync::oneshot::channel();
+        let (fail_sender, fail_receiver) = tokio::sync::oneshot::channel();
+        let failing_initialization = tokio::spawn(async move {
+            failing_harness
+                .template(error_spec, move |_| async move {
+                    let _ = initializer_started_sender.send(());
+                    let _ = fail_receiver.await;
+                    Err(std::io::Error::other("forced initializer failure").into())
+                })
+                .await
+        });
+        initializer_started_receiver
             .await
+            .expect("failing initializer should start");
+
+        let waiting_harness = harness.clone();
+        let (waiter_started_sender, waiter_started_receiver) = tokio::sync::oneshot::channel();
+        let recovery_initializations = Arc::new(AtomicUsize::new(0));
+        let waiter_initializations = recovery_initializations.clone();
+        let waiting_recovery = tokio::spawn(async move {
+            let _ = waiter_started_sender.send(());
+            waiting_harness
+                .template(error_spec, move |_| async move {
+                    waiter_initializations.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+        });
+        waiter_started_receiver
+            .await
+            .expect("recovery caller should reach the in-flight template");
+        assert!(!waiting_recovery.is_finished());
+        let _ = fail_sender.send(());
+
+        let error = match failing_initialization
+            .await
+            .expect("failing template task should not panic")
         {
             Ok(_) => panic!("initializer failure should be reported"),
             Err(error) => error,
         };
         assert!(matches!(error, Error::TemplateInitializer { .. }));
 
-        let recovered = tokio::time::timeout(
-            Duration::from_secs(5),
-            harness.template(error_spec, |_| async { Ok(()) }),
-        )
-        .await
-        .expect("initializer error must not leak its exclusive lock")
-        .expect("recover after initializer failure");
+        let recovered = tokio::time::timeout(Duration::from_secs(5), waiting_recovery)
+            .await
+            .expect("initializer error must wake its same-server waiter")
+            .expect("recovery template task should not panic")
+            .expect("recover after initializer failure");
+        assert_eq!(recovery_initializations.load(Ordering::SeqCst), 1);
         drop(recovered);
     }
 
@@ -627,6 +709,19 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         initializer_started_receiver
             .await
             .expect("initializer should start before cancellation");
+
+        let waiting_harness = harness.clone();
+        let (waiter_started_sender, waiter_started_receiver) = tokio::sync::oneshot::channel();
+        let waiting_recovery = tokio::spawn(async move {
+            let _ = waiter_started_sender.send(());
+            waiting_harness
+                .template(cancellation_spec, |_| async { Ok(()) })
+                .await
+        });
+        waiter_started_receiver
+            .await
+            .expect("recovery caller should reach the cancellable flight");
+        assert!(!waiting_recovery.is_finished());
         initialization.abort();
         let join_error = match initialization.await {
             Ok(_) => panic!("cancelled initialization should not return"),
@@ -634,13 +729,11 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         };
         assert!(join_error.is_cancelled());
 
-        let recovered = tokio::time::timeout(
-            Duration::from_secs(5),
-            harness.template(cancellation_spec, |_| async { Ok(()) }),
-        )
-        .await
-        .expect("cancelled initializer must release its exclusive lock")
-        .expect("recover initializing template after cancellation");
+        let recovered = tokio::time::timeout(Duration::from_secs(5), waiting_recovery)
+            .await
+            .expect("cancelled initializer must wake its same-server waiter")
+            .expect("recovery template task should not panic")
+            .expect("recover initializing template after cancellation");
         drop(recovered);
     }
 
@@ -657,6 +750,18 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         )
         .await
         .expect("start short-operation-timeout harness");
+        let slow_peer_harness = PostgresHarness::start(
+            HarnessConfig::new("slow_it")
+                .unwrap()
+                .with_admin_database_url(harness.admin_database_url())
+                .with_operation_timeout(Duration::from_secs(1))
+                .unwrap()
+                .with_template_wait_timeout(Duration::from_secs(4))
+                .unwrap()
+                .with_cleanup_on_start(false),
+        )
+        .await
+        .expect("start distinct short-operation-timeout server cache");
         let slow_spec = TemplateSpec::new(FingerprintBuilder::new("slow-schema").finish());
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
         let slow_initializations = Arc::new(AtomicUsize::new(0));
@@ -665,7 +770,7 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         let first_slow_harness = slow_harness.clone();
         let second_barrier = barrier.clone();
         let second_count = slow_initializations.clone();
-        let second_slow_harness = slow_harness.clone();
+        let second_slow_harness = slow_peer_harness.clone();
         let (first_slow, second_slow) = tokio::time::timeout(Duration::from_secs(8), async move {
             tokio::join!(
                 first_slow_harness.template(slow_spec, move |database_url| async move {

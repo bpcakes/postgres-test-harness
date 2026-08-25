@@ -246,6 +246,43 @@ showing reuse of the already-warm per-server pool.
 
 The raw local report is `target/performance-owned-perf04.json`.
 
+## PERF03 live-template cache follow-up
+
+On 2026-08-25, the default owned schema-v6 workload was rerun three times after
+adding fingerprint-keyed single-flight and weak live-template caching to each
+server. It used the same host, cached PostgreSQL image content ID, 1 GiB tmpfs
+profile, fixture sizes, operation counts, and four-way concurrency as the
+earlier owned measurements. The report records base commit
+`9a25695b6162079b7a17805c700a44c603d909bb` and a dirty worktree containing the
+PERF03 implementation. Its project was `pghp_300a1280627`.
+
+Median acquisition time compared with the original PERF01 owned baseline:
+
+| Metric | Fixture | PERF01 | PERF03 | Directional reduction |
+| --- | --- | ---: | ---: | ---: |
+| Cold template acquisition | Small | 83.651 ms | 66.114 ms | 21.0% |
+| Cold template acquisition | Representative | 468.013 ms | 461.711 ms | 1.3% |
+| Warm template acquisition | Small | 7.279 ms | 0.004261 ms | 99.94% |
+| Warm template acquisition | Representative | 7.301 ms | 0.002864 ms | 99.96% |
+
+The cold differences are cross-run observations that also include intervening
+changes and ordinary machine variance; they are not attributed to the cache.
+The warm mechanism is directly supported by the session counter: all six cold
+phases opened exactly one administrative session and all six warm phases
+opened zero. The original PERF01 workload opened one session on both paths.
+Thus the warm call reused the cold handle's retained shared-lock session rather
+than creating a second PostgreSQL coordination client.
+
+The ignored PostgreSQL regression independently starts eight same-server cold
+callers and observes one initializer plus one retained shared-lock session. It
+also completes a warm lookup while the shared-description catalog is locked
+and an exclusive advisory-lock waiter is queued, then verifies that a distinct
+server still queues behind that waiter. Those synchronization conditions prove
+the live warm path performs neither catalog nor advisory-lock round trips while
+preserving cross-server fairness.
+
+The raw local report is `target/performance-owned-perf03.json`.
+
 ## PERF07 effective-concurrency follow-up
 
 On 2026-08-25, the schema-v7 owned workload was run at three lease/pool

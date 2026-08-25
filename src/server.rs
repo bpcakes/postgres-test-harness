@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::Read,
     sync::{
         Arc, Mutex, OnceLock, Weak,
@@ -13,11 +14,11 @@ use testcontainers::{
     core::{IntoContainerPort, Mount, WaitFor},
     runners::SyncRunner,
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use uuid::Uuid;
 
 use crate::{
-    ConnectionLimits, Error, HarnessConfig, ProjectName, Result,
+    ConnectionLimits, Error, HarnessConfig, ProjectName, Result, TemplateFingerprint,
     admin::{
         AdminClient, AdminDatabaseUrl, AdminSessionPool, PersistentClient, acquire_advisory_lock,
         advisory_key, connect_admin, connect_admin_with_timeout, regular_connection_slots,
@@ -25,6 +26,7 @@ use crate::{
     },
     cleanup::DatabaseCleanupQueue,
     config::{ImageReference, OwnedContainerProfile},
+    name::DatabaseName,
 };
 
 const POSTGRES_PORT: u16 = 5432;
@@ -67,8 +69,53 @@ pub(crate) struct ServerInner {
     budget: Arc<Semaphore>,
     pub(crate) database_cleanup: Arc<DatabaseCleanupQueue>,
     admin_sessions: Arc<AdminSessionPool>,
+    template_cache: Mutex<TemplateCache>,
     _owner_lock: Mutex<Option<PersistentClient>>,
     container: Option<Arc<ContainerOwner>>,
+}
+
+#[derive(Default)]
+struct TemplateCache {
+    entries: HashMap<TemplateFingerprint, TemplateCacheEntry>,
+}
+
+enum TemplateCacheEntry {
+    Initializing(Arc<TemplateFlight>),
+    // TemplateInner owns its ServerInner, so the server-side cache must not
+    // retain a strong reference and form a permanent cycle.
+    Ready(Weak<TemplateInner>),
+}
+
+struct TemplateFlight {
+    completed: watch::Sender<bool>,
+    // Registered waiters retain the flight and therefore this successful
+    // value until each can clone the exact TemplateInner that won the flight.
+    template: Mutex<Option<Arc<TemplateInner>>>,
+}
+
+pub(crate) enum TemplateCacheAction {
+    Ready(Arc<TemplateInner>),
+    Initialize(TemplateCacheInitializer),
+    Wait(TemplateCacheWaiter),
+}
+
+pub(crate) struct TemplateCacheInitializer {
+    server: Arc<ServerInner>,
+    fingerprint: TemplateFingerprint,
+    flight: Arc<TemplateFlight>,
+    active: bool,
+}
+
+pub(crate) struct TemplateCacheWaiter {
+    flight: Arc<TemplateFlight>,
+    completed: watch::Receiver<bool>,
+}
+
+pub(crate) struct TemplateInner {
+    server: Arc<ServerInner>,
+    name: DatabaseName,
+    fingerprint: TemplateFingerprint,
+    _shared_lock: Mutex<PersistentClient>,
 }
 
 impl ServerInner {
@@ -205,9 +252,52 @@ impl ServerInner {
             budget,
             database_cleanup,
             admin_sessions,
+            template_cache: Mutex::new(TemplateCache::default()),
             _owner_lock: Mutex::new(Some(PersistentClient::new(owner_lock))),
             container,
         }))
+    }
+
+    pub(crate) fn template_cache_action(
+        self: &Arc<Self>,
+        fingerprint: TemplateFingerprint,
+    ) -> TemplateCacheAction {
+        let mut cache = self.lock_template_cache();
+        match cache.entries.get(&fingerprint) {
+            Some(TemplateCacheEntry::Ready(template)) => {
+                if let Some(template) = template.upgrade() {
+                    return TemplateCacheAction::Ready(template);
+                }
+            }
+            Some(TemplateCacheEntry::Initializing(flight)) => {
+                return TemplateCacheAction::Wait(TemplateCacheWaiter {
+                    flight: flight.clone(),
+                    completed: flight.completed.subscribe(),
+                });
+            }
+            None => {}
+        }
+
+        let flight = Arc::new(TemplateFlight::new());
+        cache.entries.insert(
+            fingerprint,
+            TemplateCacheEntry::Initializing(flight.clone()),
+        );
+        TemplateCacheAction::Initialize(TemplateCacheInitializer {
+            server: self.clone(),
+            fingerprint,
+            flight,
+            active: true,
+        })
+    }
+
+    fn lock_template_cache(&self) -> std::sync::MutexGuard<'_, TemplateCache> {
+        // Cache critical sections never run user code. Recovering the contents
+        // lets an initializer's cancellation guard still wake waiters if some
+        // unrelated panic poisoned the mutex.
+        self.template_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub(crate) async fn acquire_database_permit(&self) -> Result<OwnedSemaphorePermit> {
@@ -254,6 +344,122 @@ impl ServerInner {
         })
         .await?;
         outcome.finish()
+    }
+}
+
+impl TemplateFlight {
+    fn new() -> Self {
+        let (completed, _) = watch::channel(false);
+        Self {
+            completed,
+            template: Mutex::new(None),
+        }
+    }
+
+    fn publish(&self, template: Arc<TemplateInner>) {
+        let mut published = self
+            .template
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(published.is_none());
+        *published = Some(template);
+    }
+
+    fn published_template(&self) -> Option<Arc<TemplateInner>> {
+        self.template
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn complete(&self) {
+        self.completed.send_replace(true);
+    }
+}
+
+impl TemplateCacheInitializer {
+    pub(crate) fn publish(mut self, template: Arc<TemplateInner>) -> Arc<TemplateInner> {
+        debug_assert_eq!(template.fingerprint(), self.fingerprint);
+        let installed = {
+            let mut cache = self.server.lock_template_cache();
+            let owns_entry = matches!(
+                cache.entries.get(&self.fingerprint),
+                Some(TemplateCacheEntry::Initializing(flight))
+                    if Arc::ptr_eq(flight, &self.flight)
+            );
+            if owns_entry {
+                self.flight.publish(template.clone());
+                cache.entries.insert(
+                    self.fingerprint,
+                    TemplateCacheEntry::Ready(Arc::downgrade(&template)),
+                );
+            }
+            owns_entry
+        };
+        debug_assert!(
+            installed,
+            "template flight owner must publish its own entry"
+        );
+        self.active = false;
+        self.flight.complete();
+        template
+    }
+}
+
+impl Drop for TemplateCacheInitializer {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        {
+            let mut cache = self.server.lock_template_cache();
+            let owns_entry = matches!(
+                cache.entries.get(&self.fingerprint),
+                Some(TemplateCacheEntry::Initializing(flight))
+                    if Arc::ptr_eq(flight, &self.flight)
+            );
+            if owns_entry {
+                cache.entries.remove(&self.fingerprint);
+            }
+        }
+        self.flight.complete();
+    }
+}
+
+impl TemplateCacheWaiter {
+    pub(crate) async fn wait(mut self) -> Option<Arc<TemplateInner>> {
+        if !*self.completed.borrow() {
+            let _ = self.completed.changed().await;
+        }
+        self.flight.published_template()
+    }
+}
+
+impl TemplateInner {
+    pub(crate) fn new(
+        server: Arc<ServerInner>,
+        name: DatabaseName,
+        fingerprint: TemplateFingerprint,
+        shared_lock: PersistentClient,
+    ) -> Self {
+        Self {
+            server,
+            name,
+            fingerprint,
+            _shared_lock: Mutex::new(shared_lock),
+        }
+    }
+
+    pub(crate) fn server(&self) -> &Arc<ServerInner> {
+        &self.server
+    }
+
+    pub(crate) fn name(&self) -> &DatabaseName {
+        &self.name
+    }
+
+    pub(crate) fn fingerprint(&self) -> TemplateFingerprint {
+        self.fingerprint
     }
 }
 

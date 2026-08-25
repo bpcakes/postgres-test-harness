@@ -216,6 +216,28 @@ impl DatabaseCleanupQueue {
         )
     }
 
+    /// Enqueues bounded internal lifecycle work without an application permit.
+    ///
+    /// This is reserved for prewarmed databases. Their pool capacity bounds
+    /// the number of jobs that can bypass the ordinary waiting-queue limit,
+    /// just as live-database permits bound destructor fallbacks.
+    pub(crate) fn submit_prewarmer<F>(
+        self: &Arc<Self>,
+        database_name: String,
+        operation: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Result<()> + Send + 'static,
+    {
+        self.enqueue(
+            database_name,
+            Box::new(operation),
+            CleanupCompletion::Deferred,
+            None,
+            CleanupAdmission::NonblockingFallback,
+        )
+    }
+
     fn enqueue(
         self: &Arc<Self>,
         database_name: String,

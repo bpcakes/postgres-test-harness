@@ -187,6 +187,17 @@ pub enum Error {
     #[error("PostgreSQL test connection budget is closed")]
     ConnectionBudgetClosed,
 
+    #[error(
+        "prewarmed database queue capacity must be between 1 and the effective lease limit of {max_capacity}, got {capacity}"
+    )]
+    InvalidPrewarmCapacity {
+        capacity: usize,
+        max_capacity: usize,
+    },
+
+    #[error("the prewarmed PostgreSQL database queue is closed")]
+    PrewarmPoolClosed,
+
     #[error("the disposable PostgreSQL admin-session pool is closed")]
     AdminSessionPoolClosed,
 

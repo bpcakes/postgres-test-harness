@@ -32,7 +32,7 @@ use tokio::{sync::Semaphore, task::JoinSet};
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 const DEFAULT_IMAGE: &str = "postgres:18";
 const OUTPUT_ENV: &str = "PTH_PERF_OUTPUT";
 const OWNED_INITDB_NO_SYNC_ENV: &str = "PTH_PERF_OWNED_INITDB_NO_SYNC";
@@ -42,6 +42,7 @@ const OPERATION_TIMEOUT: Duration = Duration::from_secs(90);
 const TEMPLATE_WAIT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_CONNECTION_BUDGET: usize = 120;
 const DEFAULT_DOWNSTREAM_POOL_SIZE: usize = 10;
+const DEFAULT_PREWARM_DATABASES: usize = 4;
 const DEFAULT_SAMPLES: usize = 3;
 const DEFAULT_SEQUENTIAL_OPERATIONS: usize = 4;
 const DEFAULT_CONCURRENCY: usize = 4;
@@ -199,6 +200,7 @@ struct BenchmarkConfig {
     connection_budget: usize,
     connections_per_database_override: Option<u32>,
     downstream_pool_size: usize,
+    prewarm_databases: usize,
 }
 
 impl BenchmarkConfig {
@@ -247,6 +249,10 @@ impl BenchmarkConfig {
                 "PTH_PERF_DOWNSTREAM_POOL_SIZE",
                 DEFAULT_DOWNSTREAM_POOL_SIZE,
             )?,
+            prewarm_databases: positive_env(
+                "PTH_PERF_PREWARM_DATABASES",
+                DEFAULT_PREWARM_DATABASES,
+            )?,
         };
 
         let limits = config.harness_config()?.connection_limits()?;
@@ -262,6 +268,17 @@ impl BenchmarkConfig {
                 "PTH_PERF_DRAIN_DATABASES={} exceeds the configured database capacity of {database_capacity}",
                 config.drain_databases
             )));
+        }
+        if config.prewarm_databases > database_capacity {
+            return Err(invalid_input(format!(
+                "PTH_PERF_PREWARM_DATABASES={} exceeds the configured database capacity of {database_capacity}",
+                config.prewarm_databases
+            )));
+        }
+        if config.prewarm_databases < 2 {
+            return Err(invalid_input(
+                "PTH_PERF_PREWARM_DATABASES must be at least 2 to report steady-state lease latency",
+            ));
         }
         if config.concurrent_operations < config.concurrency {
             return Err(invalid_input(format!(
@@ -326,6 +343,7 @@ impl BenchmarkConfig {
             connections_per_database: limits.connections_per_database(),
             max_simultaneous_leases: limits.max_simultaneous_leases(),
             downstream_pool_size: self.downstream_pool_size,
+            prewarm_databases: self.prewarm_databases,
             cleanup_on_start: false,
             owned_container_profile: matches!(self.mode, ServerMode::Owned)
                 .then(|| OwnedContainerProfileReport::from(self.owned_container_profile)),
@@ -393,6 +411,7 @@ struct ConfigurationReport {
     connections_per_database: u32,
     max_simultaneous_leases: usize,
     downstream_pool_size: usize,
+    prewarm_databases: usize,
     cleanup_on_start: bool,
     owned_container_profile: Option<OwnedContainerProfileReport>,
 }
@@ -457,6 +476,7 @@ struct FixtureReport {
     sequential_clone_cleanup: BatchOperation,
     bounded_concurrent_clone_cleanup: BatchOperation,
     downstream_pool_checkout_spike: DownstreamPoolCheckoutOperation,
+    prewarmed_database_queue: PrewarmedDatabaseQueueOperation,
     explicit_cleanup_drain: BatchOperation,
     deferred_cleanup: DeferredCleanupOperation,
 }
@@ -497,6 +517,22 @@ struct DownstreamPoolCheckoutOperation {
     lease_and_connection_checkout_elapsed_ns: u128,
     eager_connections_per_second: f64,
     observed_application_sessions_at_peak: i64,
+    cleanup_elapsed_ns: u128,
+    total_elapsed_ns: u128,
+    admin_sessions: SessionDelta,
+}
+
+#[derive(Serialize)]
+struct PrewarmedDatabaseQueueOperation {
+    capacity: usize,
+    initial_fill_elapsed_ns: u128,
+    first_lease_elapsed_ns: u128,
+    steady_state_lease_elapsed_ns: Vec<u128>,
+    steady_state_median_elapsed_ns: u128,
+    initial_ready_storage_growth_bytes: i64,
+    refill_elapsed_ns: u128,
+    refill_databases_per_second: f64,
+    ready_after_refill: usize,
     cleanup_elapsed_ns: u128,
     total_elapsed_ns: u128,
     admin_sessions: SessionDelta,
@@ -755,6 +791,20 @@ impl Observer {
         Ok(row.get(0))
     }
 
+    async fn database_sizes(&self, database_names: &[String]) -> AnyResult<i64> {
+        let row = run_observer_operation(
+            "read prewarmed database storage growth",
+            self.operation_timeout,
+            self.client().query_one(
+                "SELECT COALESCE(sum(pg_database_size(name)), 0)::bigint
+                 FROM unnest($1::text[]) AS database_names(name)",
+                &[&database_names],
+            ),
+        )
+        .await?;
+        Ok(row.get(0))
+    }
+
     async fn application_session_count(&self, database_names: &[String]) -> AnyResult<i64> {
         let row = run_observer_operation(
             "count eager downstream sessions",
@@ -888,7 +938,7 @@ async fn main() -> AnyResult<()> {
     let expected_owned_image_content_id = image_content_id.value.as_deref();
 
     eprintln!(
-        "postgres-test-harness performance: project={}, mode={}, samples={}, sequential={}, concurrent={} at {}, downstream_pool_size={}, drains={}",
+        "postgres-test-harness performance: project={}, mode={}, samples={}, sequential={}, concurrent={} at {}, downstream_pool_size={}, prewarm={}, drains={}",
         config.project,
         config.mode.as_str(),
         config.samples,
@@ -896,6 +946,7 @@ async fn main() -> AnyResult<()> {
         config.concurrent_operations,
         config.concurrency,
         config.downstream_pool_size,
+        config.prewarm_databases,
         config.drain_databases
     );
 
@@ -951,6 +1002,7 @@ async fn main() -> AnyResult<()> {
             "Deferred cleanup records caller-return latency separately from the awaited final drain barrier.",
             "The drain barrier reports worker failures; one post-barrier catalog query verifies that every exact lease name is absent.",
             "The downstream pool spike eagerly opens its configured maximum on every measured lease and verifies the exact peak in pg_stat_activity; ordinary application pools may establish fewer physical connections lazily.",
+            "The prewarm phase reports synchronous initial fill, first and steady-state ready-queue lease latency, exact initial clone storage, background dirty-drop/refill throughput, and final idle-pool cleanup; dirty databases are never reused.",
             "Connection permits reserve downstream application capacity only; owner, template-lock, lifecycle-pool, observer, and ambient external-server sessions are separate PostgreSQL connections.",
             "Run both modes under comparable load and compare the versioned JSON output; URLs and credentials are never recorded.",
         ],
@@ -1175,6 +1227,9 @@ async fn run_fixture(
         config.downstream_pool_size,
     )
     .await?;
+    let prewarmed_database_queue =
+        run_prewarmed_database_queue(harness, &template, observer, config.prewarm_databases)
+            .await?;
     let explicit_cleanup_drain =
         run_explicit_drain(&template, observer, config.drain_databases).await?;
     let deferred_cleanup =
@@ -1191,6 +1246,7 @@ async fn run_fixture(
         sequential_clone_cleanup,
         bounded_concurrent_clone_cleanup,
         downstream_pool_checkout_spike,
+        prewarmed_database_queue,
         explicit_cleanup_drain,
         deferred_cleanup,
     })
@@ -1450,6 +1506,126 @@ async fn run_downstream_pool_checkout_spike(
         eager_connections_per_second: eager_connections_total as f64
             / checkout_elapsed.as_secs_f64(),
         observed_application_sessions_at_peak,
+        cleanup_elapsed_ns: cleanup_elapsed.as_nanos(),
+        total_elapsed_ns: total_elapsed.as_nanos(),
+        admin_sessions: before.delta(after),
+    })
+}
+
+struct PrewarmMeasurement {
+    initial_fill_elapsed_ns: u128,
+    first_lease_elapsed_ns: u128,
+    steady_state_lease_elapsed_ns: Vec<u128>,
+    steady_state_median_elapsed_ns: u128,
+    initial_ready_storage_growth_bytes: i64,
+    refill_elapsed_ns: u128,
+    refill_databases_per_second: f64,
+    ready_after_refill: usize,
+}
+
+async fn run_prewarmed_database_queue(
+    harness: &PostgresHarness,
+    template: &postgres_test_harness::DatabaseTemplate,
+    observer: &Observer,
+    capacity: usize,
+) -> AnyResult<PrewarmedDatabaseQueueOperation> {
+    let before = observer.session_snapshot().await?;
+    let total_started = Instant::now();
+    let fill_started = Instant::now();
+    let pool = template.prewarm(capacity).await?;
+    let initial_fill_elapsed = fill_started.elapsed();
+    let mut leases = Vec::with_capacity(capacity);
+
+    let measurement: AnyResult<PrewarmMeasurement> = async {
+        let first_started = Instant::now();
+        leases.push(pool.database().await?);
+        let first_lease_elapsed = first_started.elapsed();
+
+        let mut steady_state_lease_elapsed_ns = Vec::with_capacity(capacity - 1);
+        for _ in 1..capacity {
+            let started = Instant::now();
+            leases.push(pool.database().await?);
+            steady_state_lease_elapsed_ns.push(started.elapsed().as_nanos());
+        }
+        let database_names = leases
+            .iter()
+            .map(|lease| lease.database_name().to_owned())
+            .collect::<Vec<_>>();
+        let initial_ready_storage_growth_bytes =
+            observer.database_sizes(&database_names).await?;
+
+        let refill_started = Instant::now();
+        let mut return_error = None;
+        for lease in std::mem::take(&mut leases) {
+            if let Err(error) = lease.defer_cleanup().await
+                && return_error.is_none()
+            {
+                return_error = Some(Box::new(error) as AnyError);
+            }
+        }
+        if let Some(error) = return_error {
+            return Err(error);
+        }
+        harness.drain_deferred_cleanup().await?;
+        let refill_elapsed = refill_started.elapsed();
+        let ready_after_refill = pool.status().ready();
+        if ready_after_refill != capacity {
+            return Err(io::Error::other(format!(
+                "prewarmed queue drained with {ready_after_refill} ready databases, expected {capacity}"
+            ))
+            .into());
+        }
+
+        let steady_state_median_elapsed_ns =
+            median_nanoseconds(&mut steady_state_lease_elapsed_ns);
+        Ok(PrewarmMeasurement {
+            initial_fill_elapsed_ns: initial_fill_elapsed.as_nanos(),
+            first_lease_elapsed_ns: first_lease_elapsed.as_nanos(),
+            steady_state_lease_elapsed_ns,
+            steady_state_median_elapsed_ns,
+            initial_ready_storage_growth_bytes,
+            refill_elapsed_ns: refill_elapsed.as_nanos(),
+            refill_databases_per_second: capacity as f64 / refill_elapsed.as_secs_f64(),
+            ready_after_refill,
+        })
+    }
+    .await;
+
+    let cleanup_started = Instant::now();
+    let mut return_error = None;
+    for lease in leases {
+        if let Err(error) = lease.defer_cleanup().await
+            && return_error.is_none()
+        {
+            return_error = Some(Box::new(error) as AnyError);
+        }
+    }
+    let pool_cleanup = pool
+        .shutdown()
+        .await
+        .map_err(|error| Box::new(error) as AnyError);
+    let cleanup = match (return_error, pool_cleanup) {
+        (None, Ok(())) => Ok(()),
+        (Some(error), Ok(())) | (None, Err(error)) => Err(error),
+        (Some(operation), Err(cleanup)) => {
+            Err(Box::new(OperationAndCleanupError { operation, cleanup }) as AnyError)
+        }
+    };
+    let cleanup_elapsed = cleanup_started.elapsed();
+    let (measurement, ()) = combine_operation_and_cleanup(measurement, cleanup)?;
+    let total_elapsed = total_started.elapsed();
+    let after = observer.session_snapshot().await?;
+
+    Ok(PrewarmedDatabaseQueueOperation {
+        capacity,
+        initial_fill_elapsed_ns: measurement.initial_fill_elapsed_ns,
+        first_lease_elapsed_ns: measurement.first_lease_elapsed_ns,
+        steady_state_lease_elapsed_ns: measurement.steady_state_lease_elapsed_ns,
+        steady_state_median_elapsed_ns: measurement.steady_state_median_elapsed_ns,
+        initial_ready_storage_growth_bytes: measurement.initial_ready_storage_growth_bytes,
+        refill_elapsed_ns: measurement.refill_elapsed_ns,
+        refill_databases_per_second: measurement.refill_databases_per_second,
+        ready_after_refill: measurement.ready_after_refill,
         cleanup_elapsed_ns: cleanup_elapsed.as_nanos(),
         total_elapsed_ns: total_elapsed.as_nanos(),
         admin_sessions: before.delta(after),
@@ -1975,6 +2151,28 @@ fn summarize(samples: &[SampleReport]) -> Vec<SummaryReport> {
                     fixture.downstream_pool_checkout_spike.total_elapsed_ns,
                 ),
                 (
+                    "prewarmed_database_queue_initial_fill",
+                    fixture.prewarmed_database_queue.initial_fill_elapsed_ns,
+                ),
+                (
+                    "prewarmed_database_queue_first_lease",
+                    fixture.prewarmed_database_queue.first_lease_elapsed_ns,
+                ),
+                (
+                    "prewarmed_database_queue_steady_lease",
+                    fixture
+                        .prewarmed_database_queue
+                        .steady_state_median_elapsed_ns,
+                ),
+                (
+                    "prewarmed_database_queue_refill",
+                    fixture.prewarmed_database_queue.refill_elapsed_ns,
+                ),
+                (
+                    "prewarmed_database_queue_total",
+                    fixture.prewarmed_database_queue.total_elapsed_ns,
+                ),
+                (
                     "explicit_cleanup_drain",
                     fixture.explicit_cleanup_drain.elapsed_ns,
                 ),
@@ -2011,15 +2209,8 @@ fn summary_report(
     fixture: Option<&'static str>,
     mut values: Vec<u128>,
 ) -> SummaryReport {
-    values.sort_unstable();
     let observations = values.len();
-    let median_ns = if observations.is_multiple_of(2) {
-        let upper = values[observations / 2];
-        let lower = values[observations / 2 - 1];
-        lower + (upper - lower) / 2
-    } else {
-        values[observations / 2]
-    };
+    let median_ns = median_nanoseconds(&mut values);
     SummaryReport {
         metric,
         fixture,
@@ -2028,6 +2219,18 @@ fn summary_report(
         median_ns,
         mean_ns: values.iter().sum::<u128>() / observations as u128,
         max_ns: values[observations - 1],
+    }
+}
+
+fn median_nanoseconds(values: &mut [u128]) -> u128 {
+    assert!(!values.is_empty(), "a latency median needs observations");
+    values.sort_unstable();
+    if values.len().is_multiple_of(2) {
+        let upper = values[values.len() / 2];
+        let lower = values[values.len() / 2 - 1];
+        lower + (upper - lower) / 2
+    } else {
+        values[values.len() / 2]
     }
 }
 
@@ -2064,9 +2267,9 @@ mod tests {
     use super::{
         BatchMethodReport, CleanupAttemptReport, DownstreamPoolCheckoutOperation,
         ExternalCleanupReport, Observer, OperationAndCleanupError, OwnedContainerProfileReport,
-        PostgresSettingsReport, ReportOutput, RetryBackoff, SCHEMA_VERSION, ServerMode,
-        SessionDelta, SessionSnapshotReport, SummaryReport, benchmark_project,
-        combine_operation_and_cleanup, run_observer_operation, summary_report,
+        PostgresSettingsReport, PrewarmedDatabaseQueueOperation, ReportOutput, RetryBackoff,
+        SCHEMA_VERSION, ServerMode, SessionDelta, SessionSnapshotReport, SummaryReport,
+        benchmark_project, combine_operation_and_cleanup, run_observer_operation, summary_report,
         validate_completed_external_cleanup, validate_external_sweep,
     };
 
@@ -2252,8 +2455,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_v7_encodes_concurrency_cleanup_storage_and_provenance() {
-        assert_eq!(SCHEMA_VERSION, 7);
+    fn schema_v8_encodes_prewarm_concurrency_cleanup_storage_and_provenance() {
+        assert_eq!(SCHEMA_VERSION, 8);
         assert_eq!(
             serde_json::to_value(BatchMethodReport::caller_bounded(4))
                 .expect("serialize caller-bounded method"),
@@ -2300,6 +2503,47 @@ mod tests {
                 "admin_sessions": {
                     "before": 7,
                     "after": 9,
+                    "delta": 2,
+                    "active_after": 4
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(PrewarmedDatabaseQueueOperation {
+                capacity: 4,
+                initial_fill_elapsed_ns: 400_000_000,
+                first_lease_elapsed_ns: 10_000,
+                steady_state_lease_elapsed_ns: vec![8_000, 6_000, 7_000],
+                steady_state_median_elapsed_ns: 7_000,
+                initial_ready_storage_growth_bytes: 32_000_000,
+                refill_elapsed_ns: 200_000_000,
+                refill_databases_per_second: 20.0,
+                ready_after_refill: 4,
+                cleanup_elapsed_ns: 100_000_000,
+                total_elapsed_ns: 700_000_000,
+                admin_sessions: SessionDelta {
+                    before: 9,
+                    after: 11,
+                    delta: 2,
+                    active_after: 4,
+                },
+            })
+            .expect("serialize prewarmed database queue"),
+            serde_json::json!({
+                "capacity": 4,
+                "initial_fill_elapsed_ns": 400_000_000_u128,
+                "first_lease_elapsed_ns": 10_000_u128,
+                "steady_state_lease_elapsed_ns": [8_000_u128, 6_000_u128, 7_000_u128],
+                "steady_state_median_elapsed_ns": 7_000_u128,
+                "initial_ready_storage_growth_bytes": 32_000_000,
+                "refill_elapsed_ns": 200_000_000_u128,
+                "refill_databases_per_second": 20.0,
+                "ready_after_refill": 4,
+                "cleanup_elapsed_ns": 100_000_000_u128,
+                "total_elapsed_ns": 700_000_000_u128,
+                "admin_sessions": {
+                    "before": 9,
+                    "after": 11,
                     "delta": 2,
                     "active_after": 4
                 }

@@ -17,5 +17,6 @@ pub use config::{
 pub use error::{BoxError, DeferredCleanupFailure, Error, Result};
 pub use fingerprint::{FingerprintBuilder, TemplateFingerprint, TemplateSpec};
 pub use harness::{
-    CleanupReport, DatabaseLease, DatabaseTemplate, PostgresHarness, cleanup_stale_databases,
+    CleanupReport, DatabaseLease, DatabaseTemplate, PostgresHarness, PrewarmPoolStatus,
+    PrewarmedDatabasePool, cleanup_stale_databases,
 };

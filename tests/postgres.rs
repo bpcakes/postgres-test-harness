@@ -268,6 +268,269 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
     }
 
     {
+        const PROJECT: &str = "prewarm_it";
+        let prewarm_harness = PostgresHarness::start(
+            HarnessConfig::new(PROJECT)
+                .unwrap()
+                .with_admin_database_url(admin_url.clone())
+                .with_connection_budget(2)
+                .unwrap()
+                .with_connections_per_database(1)
+                .unwrap()
+                .with_cleanup_on_start(false),
+        )
+        .await
+        .expect("start prewarm regression harness");
+        let fingerprint = FingerprintBuilder::new("prewarm-main").finish();
+        let lock_key = advisory_key("template", &format!("{PROJECT}:{}", fingerprint.to_hex()));
+        let template = prewarm_harness
+            .template(TemplateSpec::new(fingerprint), |database_url| async move {
+                execute(database_url, "CREATE TABLE base_marker (value integer)").await
+            })
+            .await
+            .expect("initialize prewarm template");
+        assert!(matches!(
+            template.prewarm(0).await,
+            Err(Error::InvalidPrewarmCapacity {
+                capacity: 0,
+                max_capacity: 2,
+            })
+        ));
+        assert!(matches!(
+            template.prewarm(3).await,
+            Err(Error::InvalidPrewarmCapacity {
+                capacity: 3,
+                max_capacity: 2,
+            })
+        ));
+        let pool = template
+            .prewarm(2)
+            .await
+            .expect("fill two prewarmed database slots");
+        assert_eq!(pool.capacity(), 2);
+        let initial = pool.status();
+        assert_eq!(initial.ready(), 2);
+        assert_eq!(initial.leased(), 0);
+        assert_eq!(initial.occupied_slots(), 2);
+
+        // Idle prewarmed databases do not reserve application permits: the
+        // same two-permit harness can still admit two ordinary databases.
+        let direct_first = prewarm_harness
+            .empty_database()
+            .await
+            .expect("lease first ordinary database beside idle prewarm slots");
+        let direct_second =
+            tokio::time::timeout(Duration::from_secs(5), prewarm_harness.empty_database())
+                .await
+                .expect("idle prewarm slots must not exhaust application admission")
+                .expect("lease second ordinary database beside idle prewarm slots");
+        direct_first.cleanup().await.expect("clean direct database");
+        direct_second
+            .cleanup()
+            .await
+            .expect("clean direct database");
+        assert_eq!(pool.status().ready(), 2);
+
+        let first = pool
+            .database()
+            .await
+            .expect("lease first prewarmed database");
+        let first_name = first.database_name().to_owned();
+        let second = pool
+            .database()
+            .await
+            .expect("lease second prewarmed database");
+        let second_name = second.database_name().to_owned();
+        assert_ne!(first_name, second_name);
+        execute(
+            first.database_url().to_owned(),
+            "CREATE TABLE contaminated (value integer)",
+        )
+        .await
+        .expect("dirty one prewarmed lease");
+
+        let cancelled_pool = pool.clone();
+        let cancelled_waiter = tokio::spawn(async move { cancelled_pool.database().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !cancelled_waiter.is_finished(),
+            "an exhausted queue must wait"
+        );
+        cancelled_waiter.abort();
+        assert!(cancelled_waiter.await.unwrap_err().is_cancelled());
+        assert_eq!(pool.status().leased(), 2);
+        assert_eq!(pool.status().ready(), 0);
+
+        let waiting_pool = pool.clone();
+        let waiting_lease = tokio::spawn(async move { waiting_pool.database().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !waiting_lease.is_finished(),
+            "queue exhaustion must backpressure"
+        );
+        first
+            .defer_cleanup()
+            .await
+            .expect("return dirty lease to background refill");
+        prewarm_harness
+            .drain_deferred_cleanup()
+            .await
+            .expect("drain dirty drop and distinct replacement creation");
+        let replacement = tokio::time::timeout(Duration::from_secs(5), waiting_lease)
+            .await
+            .expect("a completed refill must wake one queue waiter")
+            .expect("queue waiter must not panic")
+            .expect("lease the freshly refilled database");
+        assert_ne!(replacement.database_name(), first_name);
+        assert_ne!(replacement.database_name(), second_name);
+        assert!(
+            !relation_exists(replacement.database_url().to_owned(), "contaminated")
+                .await
+                .expect("inspect replacement database"),
+            "a dirty database must never be reset and reused"
+        );
+        assert!(
+            relation_exists(replacement.database_url().to_owned(), "base_marker")
+                .await
+                .expect("inspect replacement template contents")
+        );
+
+        second
+            .defer_cleanup()
+            .await
+            .expect("return second prewarmed lease");
+        replacement
+            .defer_cleanup()
+            .await
+            .expect("return replacement lease");
+        prewarm_harness
+            .drain_deferred_cleanup()
+            .await
+            .expect("refill both returned slots");
+        let refilled = pool.status();
+        assert_eq!(refilled.ready(), 2);
+        assert_eq!(refilled.leased(), 0);
+        assert_eq!(refilled.creating(), 0);
+        assert_eq!(refilled.deleting(), 0);
+        assert_eq!(refilled.occupied_slots(), 2);
+
+        let other_template = prewarm_harness
+            .template(
+                TemplateSpec::new(FingerprintBuilder::new("prewarm-other").finish()),
+                |database_url| async move {
+                    execute(database_url, "CREATE TABLE other_marker (value integer)").await
+                },
+            )
+            .await
+            .expect("initialize a second prewarm template");
+        let other_pool = other_template
+            .prewarm(1)
+            .await
+            .expect("fill an independent template queue");
+        let other = other_pool
+            .database()
+            .await
+            .expect("lease from second template queue");
+        assert!(
+            relation_exists(other.database_url().to_owned(), "other_marker")
+                .await
+                .expect("inspect second-template lease")
+        );
+        assert!(
+            !relation_exists(other.database_url().to_owned(), "base_marker")
+                .await
+                .expect("inspect second-template isolation")
+        );
+        other
+            .defer_cleanup()
+            .await
+            .expect("return second-template lease");
+        prewarm_harness
+            .drain_deferred_cleanup()
+            .await
+            .expect("refill second-template queue");
+        other_pool
+            .shutdown()
+            .await
+            .expect("drop and drain second-template idle database");
+
+        drop(template);
+        assert!(
+            !advisory_lock_is_acquirable(admin_url.clone(), lock_key)
+                .await
+                .expect("inspect template lock retained by prewarm pool"),
+            "the pool must retain its source template shared lock"
+        );
+        pool.shutdown()
+            .await
+            .expect("drop and drain all idle prewarmed databases");
+        assert_eq!(
+            scalar_i64(
+                admin_url.clone(),
+                "SELECT count(*) FROM pg_database WHERE datname LIKE 'pgh_prewarm_it_test_%'",
+            )
+            .await
+            .expect("count residual prewarm databases"),
+            0
+        );
+        wait_until_advisory_lock_is_acquirable(&admin_url, lock_key).await;
+    }
+
+    {
+        const PROJECT: &str = "prewarmfail";
+        let failure_harness = PostgresHarness::start(
+            HarnessConfig::new(PROJECT)
+                .unwrap()
+                .with_admin_database_url(admin_url.clone())
+                .with_connection_budget(1)
+                .unwrap()
+                .with_connections_per_database(1)
+                .unwrap()
+                .with_cleanup_on_start(false),
+        )
+        .await
+        .expect("start prewarm refill-failure harness");
+        let template = failure_harness
+            .template(
+                TemplateSpec::new(FingerprintBuilder::new("prewarm-failure").finish()),
+                |_| async { Ok(()) },
+            )
+            .await
+            .expect("initialize refill-failure template");
+        let template_name = template.database_name().to_owned();
+        let pool = template
+            .prewarm(1)
+            .await
+            .expect("fill refill-failure queue");
+        let lease = pool
+            .database()
+            .await
+            .expect("lease the only refill-failure slot");
+        execute(
+            admin_url.clone(),
+            format!("DROP DATABASE \"{template_name}\" WITH (FORCE)"),
+        )
+        .await
+        .expect("remove source template to inject a refill failure");
+        lease
+            .defer_cleanup()
+            .await
+            .expect("queue dirty deletion and failing replacement");
+        let error = failure_harness
+            .drain_deferred_cleanup()
+            .await
+            .expect_err("the refill failure must reach the cleanup barrier");
+        assert!(matches!(error, Error::DeferredCleanup { .. }));
+        let failed = pool.status();
+        assert!(failed.is_closed());
+        assert_eq!(failed.ready(), 0);
+        assert_eq!(failed.occupied_slots(), 0);
+        pool.shutdown()
+            .await
+            .expect("a second barrier should find no hidden refill work");
+    }
+
+    {
         const PROJECT: &str = "admin_pool_it";
         const POOL_LIMIT: usize = 4;
         const OPERATIONS: usize = 8;
@@ -1174,6 +1437,17 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         )
         .await
         .expect("start owned-shutdown harness");
+        let shutdown_template = shutdown_harness
+            .template(
+                TemplateSpec::new(FingerprintBuilder::new("shutdown-prewarm").finish()),
+                |_| async { Ok(()) },
+            )
+            .await
+            .expect("initialize owned-shutdown prewarm template");
+        let shutdown_pool = shutdown_template
+            .prewarm(1)
+            .await
+            .expect("fill owned-shutdown prewarm queue");
         shutdown_harness
             .empty_database()
             .await
@@ -1181,12 +1455,14 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
             .defer_cleanup()
             .await
             .expect("queue cleanup before owned shutdown");
-        let active_database = shutdown_harness
-            .empty_database()
+        let active_database = shutdown_pool
+            .database()
             .await
             .expect("saturate owned-shutdown admission");
         let waiting_harness = shutdown_harness.clone();
         let waiter = tokio::spawn(async move { waiting_harness.empty_database().await });
+        let waiting_pool = shutdown_pool.clone();
+        let pool_waiter = tokio::spawn(async move { waiting_pool.database().await });
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let concurrent_harness = shutdown_harness.clone();
@@ -1203,6 +1479,16 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
             Err(error) => error,
         };
         assert!(matches!(waiter_error, Error::ConnectionBudgetClosed));
+        let pool_waiter_error = match tokio::time::timeout(Duration::from_secs(1), pool_waiter)
+            .await
+            .expect("owned shutdown should wake an exhausted prewarm queue")
+            .expect("queued prewarm task should not panic")
+        {
+            Ok(_) => panic!("prewarm admission must not outlive owned shutdown"),
+            Err(error) => error,
+        };
+        assert!(matches!(pool_waiter_error, Error::PrewarmPoolClosed));
+        assert!(shutdown_pool.status().is_closed());
         shutdown_harness
             .shutdown()
             .await

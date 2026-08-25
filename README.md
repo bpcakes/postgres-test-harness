@@ -151,6 +151,11 @@ worker releases its slot. Already-live leases remain cleanable, but callers must
 observe the drain error and recover or replace the harness; repeated failures
 cannot accumulate an unbounded residual set.
 
+An opt-in prewarmed pool adds its declared capacity `N` to that storage bound.
+Each of its slots is exactly one of ready, leased, deleting, or creating, so
+ready and background work cannot multiply the requested storage footprint.
+Multiple pools add their capacities independently.
+
 Call `PostgresHarness::drain_deferred_cleanup` to wait for everything accepted
 before the call. The barrier returns retained failures from explicit deferred
 returns, fallback drops, and cancelled awaited callers exactly once. Owned
@@ -177,6 +182,55 @@ advisory locks. That coordination has a separate 15-minute wait timeout so a
 short administrative-operation timeout does not make a caller fail while a
 real migration suite is still running. Override it with
 `HarnessConfig::with_template_wait_timeout` when needed.
+
+## Prewarmed disposable databases
+
+For suites whose test bodies are shorter than a template clone, call
+`DatabaseTemplate::prewarm` once and share the returned
+`PrewarmedDatabasePool` inside the process:
+
+```rust,no_run
+# use postgres_test_harness::{BoxError, FingerprintBuilder, HarnessConfig, PostgresHarness, TemplateSpec};
+# async fn example() -> Result<(), BoxError> {
+# let harness = PostgresHarness::start(HarnessConfig::new("example")?).await?;
+# let template = harness.template(
+#     TemplateSpec::new(FingerprintBuilder::new("prewarm-example").finish()),
+#     |_| async { Ok(()) },
+# ).await?;
+let pool = template.prewarm(4).await?;
+let database = pool.database().await?;
+let database_url = database.database_url();
+// Run the test, then close every application connection or pool.
+let _ = database_url;
+database.defer_cleanup().await?;
+
+// Wait for the dirty DROP and distinct background replacement before teardown.
+harness.drain_deferred_cleanup().await?;
+assert_eq!(pool.status().ready(), 4);
+pool.shutdown().await?;
+# Ok(())
+# }
+```
+
+Capacity must be positive and no greater than the harness's effective lease
+limit `L`. Initial fill is awaited. Idle databases hold no application permits;
+`database()` reserves a ready token and the full per-database permit allocation
+before atomically removing an idle database. Cancellation or closed application
+admission therefore leaves the ready database untouched. When the queue is
+empty, callers wait for a returned database to be dropped and for a new clone
+with a fresh unique name to become ready.
+
+The pool never truncates or resets a dirty database. `cleanup()` waits for its
+dirty drop and replacement; `defer_cleanup()` and `Drop` hand that work to the
+bounded server lifecycle queue. Refill failures close both the pool and new
+database admission and are reported by the awaited cleanup or the harness drain
+barrier. `status()` exposes the ready, leased, deleting, and creating counts for
+diagnostics. A pool keeps its source template and shared advisory-lock session
+alive. Explicit `shutdown()` closes the pool, removes all idle databases, and
+drains accepted lifecycle work; it does not revoke leases still held by callers.
+Dropping the final pool handle queues the same idle cleanup. Owned harness
+shutdown closes every registered pool before fixing its cleanup barrier and
+removing the container.
 
 ## Environment
 

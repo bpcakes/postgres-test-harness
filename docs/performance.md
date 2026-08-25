@@ -123,6 +123,14 @@ The JSON records these boundaries for every sample and fixture:
   a deliberately full synthetic pool: real pools often establish connections
   lazily, so a configured maximum or idle limit must not be mistaken for an
   eager connection count.
+- `prewarmed_database_queue`: synchronously fills
+  `PTH_PERF_PREWARM_DATABASES` clean slots, then times the first ready-queue
+  lease and every remaining steady-state lease separately. It sums
+  `pg_database_size` for those exact initial clones as their storage growth,
+  defers every dirty return, awaits the refill barrier, requires the queue to
+  be full again, and reports refill throughput. Final pool shutdown and idle
+  deletion are timed separately and included in the phase total. The phase
+  never resets or reuses a leased database.
 - `explicit_cleanup_drain`: creates the configured leases before timing, then
   awaits their explicit cleanups concurrently. Its `method.execution` is
   `caller_bounded` and records the configured drain count as its concurrency.
@@ -173,17 +181,27 @@ successful phase proves that the requested eager downstream connections were
 simultaneously established; it does not claim that a third-party pool with the
 same maximum normally opens them all.
 
+The prewarm storage value is likewise database-scoped: it sums only the exact
+initial queue names after they have been leased. It excludes templates and all
+other databases. A ready lease is an in-process queue operation, so its latency
+does not include a PostgreSQL round trip. Initial fill and refill do include
+full `CREATE DATABASE` work; refill also includes the dirty `DROP`. The phase
+shuts the pool down before moving on, so its idle clones do not overlap later
+fixture phases.
+
 The top-level report also records the source commit and worktree state,
 PostgreSQL version and critical settings, postmaster start, logical CPU count,
 OS, architecture, server mode, image metadata, storage driver, the effective
 owned initdb/storage profile, fixture rows, execution and completion methods,
 concurrency where caller-controlled, sample counts, resolved connection budget,
-per-database permits, effective maximum leases, downstream pool size, timeouts,
-the cleanup barrier guard, and external cleanup retry policy. Schema version 7
-adds the downstream pool-spike measurement, resolved lease capacity, and both
-reserved-connection settings. Schema version 6 replaced catalog-polled deferred
-completion with explicit caller-return and awaited-drain timings. Consumers
-should branch on `schema_version`.
+per-database permits, effective maximum leases, downstream pool size, prewarm
+capacity, timeouts, the cleanup barrier guard, and external cleanup retry
+policy. Schema version 8 adds prewarm fill, ready-lease, exact storage, refill,
+and shutdown measurements. Schema version 7 added the downstream pool-spike
+measurement, resolved lease capacity, and both reserved-connection settings.
+Schema version 6 replaced catalog-polled deferred completion with explicit
+caller-return and awaited-drain timings. Consumers should branch on
+`schema_version`.
 
 ## Configuration
 
@@ -191,6 +209,9 @@ All numeric overrides must be positive. The example resolves the same
 `ConnectionLimits` API used by the running harness and rejects concurrency or
 drain counts above `floor(connection_budget / connections_per_database)`. It
 also rejects a downstream pool size above the per-database reservation.
+Prewarm capacity must be between two and the effective lease limit; the public
+pool API itself also supports capacity one, but the benchmark requires at least
+one additional lease to report a steady-state median.
 When `PTH_PERF_CONNECTIONS_PER_DATABASE` is unset, the benchmark leaves that
 builder override unset too, so the library's default clamps to a smaller budget
 exactly as it does for downstream callers.
@@ -206,6 +227,7 @@ exactly as it does for downstream callers.
 | `PTH_PERF_CONNECTION_BUDGET` | 120 | Total downstream-connection permits (`B`) |
 | `PTH_PERF_CONNECTIONS_PER_DATABASE` | 11 | Permits reserved by each live lease (`P`) |
 | `PTH_PERF_DOWNSTREAM_POOL_SIZE` | 10 | Connections eagerly opened on every lease in the pool spike; must be at most `P` |
+| `PTH_PERF_PREWARM_DATABASES` | 4 | Clean slots in each measured prewarm queue; benchmark range is `2..=L` |
 | `PTH_PERF_OUTPUT` | stdout | JSON output path; use ignored `target/` for clean provenance |
 | `PTH_PERF_OWNED_INITDB_NO_SYNC` | `true` | Whether owned initdb uses `--no-sync` |
 | `PTH_PERF_OWNED_TMPFS_SIZE_BYTES` | `1073741824` | Owned tmpfs byte cap, or `off` for image-default storage |
@@ -250,7 +272,8 @@ The manual `Performance characterization` Actions workflow pre-pulls the owned
 image, runs the same release example, writes a Markdown summary, and uploads
 the complete JSON artifact even if summary rendering fails. Its dispatch inputs
 expose lease concurrency, downstream pool size, budget, per-database permits,
-operation count, and drain count so matrix points do not require source edits.
+prewarm capacity, operation count, and drain count so matrix points do not
+require source edits.
 Its `external` option scopes `POSTGRES_TEST_ADMIN_URL` from an Actions secret to
 the benchmark step. Dispatches are serialized by mode and the job has a
 one-hour ceiling. The workflow is deliberately not a required push or

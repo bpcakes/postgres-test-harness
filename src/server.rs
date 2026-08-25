@@ -26,6 +26,7 @@ use crate::{
     },
     cleanup::DatabaseCleanupQueue,
     config::{ImageReference, OwnedContainerProfile},
+    harness::PrewarmPoolInner,
     name::DatabaseName,
 };
 
@@ -70,6 +71,7 @@ pub(crate) struct ServerInner {
     pub(crate) database_cleanup: Arc<DatabaseCleanupQueue>,
     admin_sessions: Arc<AdminSessionPool>,
     template_cache: Mutex<TemplateCache>,
+    prewarm_pools: Mutex<Vec<Weak<PrewarmPoolInner>>>,
     _owner_lock: Mutex<Option<PersistentClient>>,
     container: Option<Arc<ContainerOwner>>,
 }
@@ -253,6 +255,7 @@ impl ServerInner {
             database_cleanup,
             admin_sessions,
             template_cache: Mutex::new(TemplateCache::default()),
+            prewarm_pools: Mutex::new(Vec::new()),
             _owner_lock: Mutex::new(Some(PersistentClient::new(owner_lock))),
             container,
         }))
@@ -300,6 +303,31 @@ impl ServerInner {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    pub(crate) fn register_prewarm_pool(&self, pool: &Arc<PrewarmPoolInner>) -> Result<()> {
+        let mut pools = self
+            .prewarm_pools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.budget.is_closed() {
+            return Err(Error::ConnectionBudgetClosed);
+        }
+        pools.retain(|pool| pool.strong_count() > 0);
+        pools.push(Arc::downgrade(pool));
+        Ok(())
+    }
+
+    fn close_prewarm_pools(&self) {
+        let pools = std::mem::take(
+            &mut *self
+                .prewarm_pools
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        for pool in pools.into_iter().filter_map(|pool| pool.upgrade()) {
+            pool.close_and_queue_ready();
+        }
+    }
+
     pub(crate) async fn acquire_database_permit(&self) -> Result<OwnedSemaphorePermit> {
         self.budget
             .clone()
@@ -331,6 +359,10 @@ impl ServerInner {
         else {
             return Ok(());
         };
+        // Queue every idle prewarmed database before fixing the cleanup
+        // barrier's target. This also prevents in-flight dirty returns from
+        // creating replacements during terminal shutdown.
+        self.close_prewarm_pools();
         let database_cleanup = self.database_cleanup.clone();
         let admin_sessions = self.admin_sessions.clone();
         // Keep the whole terminal sequence in one blocking task. Cancellation

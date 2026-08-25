@@ -36,6 +36,11 @@ on:
         required: true
         default: "10"
         type: string
+      prewarm_databases:
+        description: Ready databases in each measured prewarm queue
+        required: true
+        default: "4"
+        type: string
       connection_budget:
         description: Harness downstream-connection permits
         required: true
@@ -68,6 +73,7 @@ env:
   PTH_PERF_CONCURRENCY: ${{ inputs.concurrency }}
   PTH_PERF_CONCURRENT_OPERATIONS: ${{ inputs.concurrent_operations }}
   PTH_PERF_DOWNSTREAM_POOL_SIZE: ${{ inputs.downstream_pool_size }}
+  PTH_PERF_PREWARM_DATABASES: ${{ inputs.prewarm_databases }}
   PTH_PERF_CONNECTION_BUDGET: ${{ inputs.connection_budget }}
   PTH_PERF_CONNECTIONS_PER_DATABASE: ${{ inputs.connections_per_database }}
   PTH_PERF_DRAIN_DATABASES: ${{ inputs.drain_databases }}
@@ -121,7 +127,8 @@ jobs:
             "Connection policy: `budget=" + (.configuration.connection_budget | tostring)
               + ", per_database=" + (.configuration.connections_per_database | tostring)
               + ", max_leases=" + (.configuration.max_simultaneous_leases | tostring)
-              + ", downstream_pool_size=" + (.configuration.downstream_pool_size | tostring) + "`  ",
+              + ", downstream_pool_size=" + (.configuration.downstream_pool_size | tostring)
+              + ", prewarm_databases=" + (.configuration.prewarm_databases | tostring) + "`  ",
             "Image content ID: `" + (.environment.image_content_id.value // "not reported") + "`  ",
             "Storage: `" + (.environment.storage_driver.value // "not reported") + "`  ",
             "Owned profile: `" + (

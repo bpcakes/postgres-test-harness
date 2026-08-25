@@ -347,3 +347,40 @@ PostgreSQL's durable defaults (`fsync=on`, `synchronous_commit=on`, and
 `full_page_writes=on`). The raw report is
 `target/performance-external-perf07-low-capacity.json`; the temporary container
 was removed after the run.
+
+## PERF05 prewarmed-queue follow-up
+
+On 2026-08-25, the default owned workload was rerun three times after adding a
+four-slot prewarmed disposable-database queue. The schema-v8 report used base
+commit `025cf6d8d7f54978c23cc02b7737a0b633067c0a` with a dirty worktree
+containing the PERF05 implementation. PostgreSQL 18.1, the cached image content
+ID, 1 GiB tmpfs profile, 64-logical-CPU Linux host, fixture definitions, and
+`B=120`, `P=11`, `L=10` permit policy matched the immediately preceding owned
+characterization.
+
+The phase synchronously fills four clean clones, leases all four without a
+PostgreSQL round trip, measures their exact combined database size, defers all
+dirty returns, awaits the drop-and-replacement barrier, requires four new ready
+clones, and finally shuts the pool down. Median observations were:
+
+| Fixture | Initial fill | First ready lease | Steady ready lease | Initial four-clone storage | Refill | Refill throughput | Final idle cleanup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Small | 76.513 ms | 3.283 us | 1.397 us | 30,935,100 bytes | 34.305 ms | 116.6 databases/s | 6.149 ms |
+| Representative | 141.103 ms | 3.352 us | 1.467 us | 115,738,684 bytes | 105.178 ms | 38.0 databases/s | 11.582 ms |
+
+All six fixture/sample refills ended with exactly four ready databases. The
+reported storage is the sum of `pg_database_size` for the exact initial clone
+names, not a whole-cluster estimate. It quantifies the intentional latency for
+storage trade: ready-queue lease latency is in-process and near zero, while
+initial fill retains roughly four clone sizes and the background refill still
+pays a complete dirty `DROP` plus fresh `CREATE DATABASE` per slot. The phase's
+administrative-session delta was zero in all six observations because the
+earlier phases had already warmed the bounded lifecycle pool.
+
+The ignored PostgreSQL lifecycle regression independently proves that idle
+slots consume no application permits, exhausted callers wait, cancellation
+does not consume a slot, dirty schema state never appears in a replacement,
+distinct templates have independent queues, a pool retains its template lock,
+and an injected missing-template refill failure reaches the drain barrier and
+closes the queue. The raw local report is
+`target/performance-owned-perf05.json`.

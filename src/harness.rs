@@ -1,10 +1,14 @@
 use std::{
+    collections::VecDeque,
     future::Future,
-    sync::Arc,
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
-use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
     BoxError, ConnectionLimits, Error, HarnessConfig, ProjectName, Result, TemplateFingerprint,
@@ -198,6 +202,495 @@ impl DatabaseTemplate {
     pub async fn database(&self) -> Result<DatabaseLease> {
         create_test_database(self.inner.server().clone(), self.inner.name().as_str()).await
     }
+
+    /// Creates and fills an opt-in bounded queue of pristine disposable databases.
+    ///
+    /// Idle databases retain this template's shared lock but consume no
+    /// downstream connection permits. The capacity may not exceed the
+    /// harness's effective simultaneous-lease limit. Every leased database is
+    /// dropped after use; the background lifecycle queue creates a distinct
+    /// replacement rather than reusing dirty state.
+    pub async fn prewarm(&self, capacity: usize) -> Result<PrewarmedDatabasePool> {
+        let max_capacity = self
+            .inner
+            .server()
+            .connection_limits
+            .max_simultaneous_leases();
+        if capacity == 0 || capacity > max_capacity {
+            return Err(Error::InvalidPrewarmCapacity {
+                capacity,
+                max_capacity,
+            });
+        }
+
+        let pool = PrewarmedDatabasePool::new(self.inner.clone(), capacity)?;
+        for _ in 0..capacity {
+            let creation = pool.inner.begin_creation()?;
+            let prepared = create_unpublished_database(
+                self.inner.server().clone(),
+                self.inner.name().as_str().to_owned(),
+            )
+            .await;
+            match prepared {
+                Ok(prepared) => creation.publish(prepared),
+                Err(error) => {
+                    creation.fail();
+                    return Err(error);
+                }
+            }
+        }
+        Ok(pool)
+    }
+}
+
+/// Current resource state of a bounded prewarmed database queue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct PrewarmPoolStatus {
+    capacity: usize,
+    ready: usize,
+    leased: usize,
+    creating: usize,
+    deleting: usize,
+    closed: bool,
+}
+
+impl PrewarmPoolStatus {
+    pub const fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub const fn ready(&self) -> usize {
+        self.ready
+    }
+
+    pub const fn leased(&self) -> usize {
+        self.leased
+    }
+
+    pub const fn creating(&self) -> usize {
+        self.creating
+    }
+
+    pub const fn deleting(&self) -> usize {
+        self.deleting
+    }
+
+    pub const fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Returns the number of capacity slots currently represented by ready,
+    /// leased, creating, or deleting work.
+    pub const fn occupied_slots(&self) -> usize {
+        self.ready + self.leased + self.creating + self.deleting
+    }
+}
+
+/// Opt-in bounded queue of never-used disposable databases cloned from one template.
+pub struct PrewarmedDatabasePool {
+    inner: Arc<PrewarmPoolInner>,
+}
+
+impl PrewarmedDatabasePool {
+    fn new(template: Arc<TemplateInner>, capacity: usize) -> Result<Self> {
+        let inner = Arc::new(PrewarmPoolInner {
+            template,
+            capacity,
+            public_handles: AtomicUsize::new(1),
+            ready_admission: Arc::new(Semaphore::new(0)),
+            state: Mutex::new(PrewarmPoolState::new()),
+        });
+        inner.template.server().register_prewarm_pool(&inner)?;
+        Ok(Self { inner })
+    }
+
+    /// Returns the configured database-slot bound.
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity
+    }
+
+    /// Returns a point-in-time view of the bounded queue state.
+    pub fn status(&self) -> PrewarmPoolStatus {
+        self.inner.status()
+    }
+
+    /// Leases one never-used database from the ready queue.
+    ///
+    /// A ready token is reserved before downstream application capacity. If
+    /// application admission is closed or this future is cancelled, the token
+    /// is returned and the idle database remains in the queue.
+    pub async fn database(&self) -> Result<DatabaseLease> {
+        let ready = self
+            .inner
+            .ready_admission
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::PrewarmPoolClosed)?;
+        let permit = self
+            .inner
+            .template
+            .server()
+            .acquire_database_permit()
+            .await?;
+        let Some(prepared) = self.inner.take_ready() else {
+            return Err(Error::PrewarmPoolClosed);
+        };
+        ready.forget();
+        Ok(prepared.into_lease(permit, Arc::downgrade(&self.inner)))
+    }
+
+    /// Closes this queue, drops all idle databases, and waits for lifecycle
+    /// work accepted before the resulting server-scoped cleanup barrier.
+    ///
+    /// Leases still owned by callers are not revoked. They remain responsible
+    /// for their own cleanup and will not trigger a refill after this call.
+    pub async fn shutdown(self) -> Result<()> {
+        self.inner.close_and_queue_ready();
+        let database_cleanup = self.inner.template.server().database_cleanup.clone();
+        let outcome = run_blocking(move || Ok(database_cleanup.begin_drain())).await?;
+        outcome.finish()
+    }
+}
+
+impl Clone for PrewarmedDatabasePool {
+    fn clone(&self) -> Self {
+        self.inner.public_handles.fetch_add(1, Ordering::Relaxed);
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for PrewarmedDatabasePool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PrewarmedDatabasePool")
+            .field("template", &self.inner.template.name().as_str())
+            .field("status", &self.status())
+            .finish()
+    }
+}
+
+impl Drop for PrewarmedDatabasePool {
+    fn drop(&mut self) {
+        if self.inner.public_handles.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.inner.close_and_queue_ready();
+        }
+    }
+}
+
+pub(crate) struct PrewarmPoolInner {
+    template: Arc<TemplateInner>,
+    capacity: usize,
+    public_handles: AtomicUsize,
+    ready_admission: Arc<Semaphore>,
+    state: Mutex<PrewarmPoolState>,
+}
+
+struct PrewarmPoolState {
+    ready: VecDeque<PreparedDatabase>,
+    leased: usize,
+    creating: usize,
+    deleting: usize,
+    accepting: bool,
+    cleanup_started: bool,
+}
+
+impl PrewarmPoolState {
+    fn new() -> Self {
+        Self {
+            ready: VecDeque::new(),
+            leased: 0,
+            creating: 0,
+            deleting: 0,
+            accepting: true,
+            cleanup_started: false,
+        }
+    }
+
+    fn occupied_slots(&self) -> usize {
+        self.ready.len() + self.leased + self.creating + self.deleting
+    }
+}
+
+impl PrewarmPoolInner {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, PrewarmPoolState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn status(&self) -> PrewarmPoolStatus {
+        let state = self.lock_state();
+        PrewarmPoolStatus {
+            capacity: self.capacity,
+            ready: state.ready.len(),
+            leased: state.leased,
+            creating: state.creating,
+            deleting: state.deleting,
+            closed: !state.accepting,
+        }
+    }
+
+    fn begin_creation(self: &Arc<Self>) -> Result<PrewarmCreation> {
+        let mut state = self.lock_state();
+        if !state.accepting {
+            return Err(Error::PrewarmPoolClosed);
+        }
+        debug_assert!(state.occupied_slots() < self.capacity);
+        if state.occupied_slots() >= self.capacity {
+            return Err(Error::PrewarmPoolClosed);
+        }
+        state.creating += 1;
+        drop(state);
+        Ok(PrewarmCreation {
+            pool: self.clone(),
+            active: true,
+        })
+    }
+
+    fn take_ready(&self) -> Option<PreparedDatabase> {
+        let mut state = self.lock_state();
+        if !state.accepting {
+            return None;
+        }
+        let prepared = state.ready.pop_front()?;
+        state.leased += 1;
+        debug_assert!(state.occupied_slots() <= self.capacity);
+        Some(prepared)
+    }
+
+    fn begin_return(self: &Arc<Self>) -> PrewarmReturn {
+        let mut state = self.lock_state();
+        debug_assert!(state.leased > 0);
+        state.leased = state.leased.saturating_sub(1);
+        state.deleting += 1;
+        debug_assert!(state.occupied_slots() <= self.capacity);
+        drop(state);
+        PrewarmReturn {
+            pool: self.clone(),
+            phase: PrewarmReturnPhase::Deleting,
+        }
+    }
+
+    fn finish_creation(
+        self: &Arc<Self>,
+        prepared: PreparedDatabase,
+    ) -> Option<(PreparedDatabase, ClosedPrewarmDeletion)> {
+        let mut state = self.lock_state();
+        debug_assert!(state.creating > 0);
+        state.creating = state.creating.saturating_sub(1);
+        if state.accepting && !state.cleanup_started {
+            state.ready.push_back(prepared);
+            debug_assert!(state.occupied_slots() <= self.capacity);
+            drop(state);
+            self.ready_admission.add_permits(1);
+            None
+        } else {
+            state.deleting += 1;
+            debug_assert!(state.occupied_slots() <= self.capacity);
+            Some((
+                prepared,
+                ClosedPrewarmDeletion {
+                    pool: self.clone(),
+                    active: true,
+                },
+            ))
+        }
+    }
+
+    fn fail_phase(&self, phase: PrewarmReturnPhase) {
+        let mut state = self.lock_state();
+        match phase {
+            PrewarmReturnPhase::Deleting => {
+                debug_assert!(state.deleting > 0);
+                state.deleting = state.deleting.saturating_sub(1);
+            }
+            PrewarmReturnPhase::Creating => {
+                debug_assert!(state.creating > 0);
+                state.creating = state.creating.saturating_sub(1);
+            }
+            PrewarmReturnPhase::Complete => return,
+        }
+        state.accepting = false;
+        drop(state);
+        self.ready_admission.close();
+    }
+
+    pub(crate) fn close_and_queue_ready(self: &Arc<Self>) {
+        let ready = {
+            let mut state = self.lock_state();
+            state.accepting = false;
+            if state.cleanup_started {
+                return;
+            }
+            state.cleanup_started = true;
+            let ready = std::mem::take(&mut state.ready);
+            state.deleting += ready.len();
+            debug_assert!(state.occupied_slots() <= self.capacity);
+            ready
+        };
+        self.ready_admission.close();
+        for prepared in ready {
+            queue_closed_prepared_database(self.clone(), prepared);
+        }
+    }
+}
+
+struct PreparedDatabase {
+    name: DatabaseName,
+    database_url: String,
+}
+
+impl PreparedDatabase {
+    fn into_lease(
+        self,
+        permit: OwnedSemaphorePermit,
+        prewarm_pool: Weak<PrewarmPoolInner>,
+    ) -> DatabaseLease {
+        DatabaseLease {
+            inner: Some(DatabaseLeaseInner {
+                server: prewarm_pool
+                    .upgrade()
+                    .expect("a leased prewarmed database retains its public pool")
+                    .template
+                    .server()
+                    .clone(),
+                name: self.name,
+                permit,
+                prewarm_pool: Some(prewarm_pool),
+            }),
+            database_url: self.database_url,
+        }
+    }
+}
+
+struct UnpublishedDatabase {
+    server: Arc<ServerInner>,
+    prepared: Option<PreparedDatabase>,
+}
+
+impl UnpublishedDatabase {
+    fn publish(mut self) -> PreparedDatabase {
+        self.prepared
+            .take()
+            .expect("an unpublished database is published at most once")
+    }
+}
+
+impl Drop for UnpublishedDatabase {
+    fn drop(&mut self) {
+        if let Some(prepared) = self.prepared.take() {
+            queue_unpublished_database(self.server.clone(), prepared);
+        }
+    }
+}
+
+struct PrewarmCreation {
+    pool: Arc<PrewarmPoolInner>,
+    active: bool,
+}
+
+impl PrewarmCreation {
+    fn publish(mut self, unpublished: UnpublishedDatabase) {
+        let prepared = unpublished.publish();
+        if let Some((prepared, deletion)) = self.pool.finish_creation(prepared) {
+            queue_counted_prepared_database(
+                self.pool.template.server().clone(),
+                prepared,
+                deletion,
+            );
+        }
+        self.active = false;
+    }
+
+    fn fail(mut self) {
+        self.pool.fail_phase(PrewarmReturnPhase::Creating);
+        self.active = false;
+    }
+}
+
+impl Drop for PrewarmCreation {
+    fn drop(&mut self) {
+        if self.active {
+            self.pool.fail_phase(PrewarmReturnPhase::Creating);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrewarmReturnPhase {
+    Deleting,
+    Creating,
+    Complete,
+}
+
+struct PrewarmReturn {
+    pool: Arc<PrewarmPoolInner>,
+    phase: PrewarmReturnPhase,
+}
+
+impl PrewarmReturn {
+    fn after_drop(&mut self) -> bool {
+        let mut state = self.pool.lock_state();
+        debug_assert_eq!(self.phase, PrewarmReturnPhase::Deleting);
+        debug_assert!(state.deleting > 0);
+        state.deleting = state.deleting.saturating_sub(1);
+        if state.accepting && !state.cleanup_started {
+            state.creating += 1;
+            self.phase = PrewarmReturnPhase::Creating;
+            debug_assert!(state.occupied_slots() <= self.pool.capacity);
+            true
+        } else {
+            self.phase = PrewarmReturnPhase::Complete;
+            false
+        }
+    }
+
+    fn publish(
+        &mut self,
+        prepared: PreparedDatabase,
+    ) -> Option<(PreparedDatabase, ClosedPrewarmDeletion)> {
+        debug_assert_eq!(self.phase, PrewarmReturnPhase::Creating);
+        let unpublished = self.pool.finish_creation(prepared);
+        self.phase = PrewarmReturnPhase::Complete;
+        unpublished
+    }
+}
+
+impl Drop for PrewarmReturn {
+    fn drop(&mut self) {
+        if self.phase != PrewarmReturnPhase::Complete {
+            self.pool.fail_phase(self.phase);
+            self.phase = PrewarmReturnPhase::Complete;
+        }
+    }
+}
+
+struct ClosedPrewarmDeletion {
+    pool: Arc<PrewarmPoolInner>,
+    active: bool,
+}
+
+impl ClosedPrewarmDeletion {
+    fn finish(mut self) {
+        let mut state = self.pool.lock_state();
+        debug_assert!(state.deleting > 0);
+        state.deleting = state.deleting.saturating_sub(1);
+        self.active = false;
+    }
+}
+
+impl Drop for ClosedPrewarmDeletion {
+    fn drop(&mut self) {
+        if self.active {
+            let mut state = self.pool.lock_state();
+            debug_assert!(state.deleting > 0);
+            state.deleting = state.deleting.saturating_sub(1);
+        }
+    }
 }
 
 /// Exclusive ownership of one disposable test database.
@@ -290,6 +783,7 @@ struct DatabaseLeaseInner {
     server: Arc<ServerInner>,
     name: DatabaseName,
     permit: OwnedSemaphorePermit,
+    prewarm_pool: Option<Weak<PrewarmPoolInner>>,
 }
 
 impl DatabaseLeaseInner {
@@ -300,14 +794,18 @@ impl DatabaseLeaseInner {
             server,
             name,
             permit,
+            prewarm_pool,
         } = self;
         let database_name = name.as_str().to_owned();
         let database_cleanup = server.database_cleanup.clone();
-        database_cleanup.submit_awaited(database_name, permit, move || {
-            server.with_lifecycle_admin("connect for disposable database cleanup", |client| {
-                drop_database(client, &name)
-            })
-        })
+        let prewarm_return = prewarm_pool
+            .and_then(|pool| pool.upgrade())
+            .map(|pool| pool.begin_return());
+        database_cleanup.submit_awaited(
+            database_name,
+            permit,
+            database_cleanup_operation(server, name, prewarm_return),
+        )
     }
 
     fn queue_deferred_cleanup(self) -> Result<()> {
@@ -315,14 +813,18 @@ impl DatabaseLeaseInner {
             server,
             name,
             permit,
+            prewarm_pool,
         } = self;
         let database_name = name.as_str().to_owned();
         let database_cleanup = server.database_cleanup.clone();
-        database_cleanup.submit_deferred(database_name, Some(permit), move || {
-            server.with_lifecycle_admin("connect for disposable database cleanup", |client| {
-                drop_database(client, &name)
-            })
-        })
+        let prewarm_return = prewarm_pool
+            .and_then(|pool| pool.upgrade())
+            .map(|pool| pool.begin_return());
+        database_cleanup.submit_deferred(
+            database_name,
+            Some(permit),
+            database_cleanup_operation(server, name, prewarm_return),
+        )
     }
 
     fn queue_fallback_cleanup(self) -> Result<()> {
@@ -330,13 +832,60 @@ impl DatabaseLeaseInner {
             server,
             name,
             permit,
+            prewarm_pool,
         } = self;
         let database_name = name.as_str().to_owned();
         let database_cleanup = server.database_cleanup.clone();
-        database_cleanup.submit_fallback(database_name, permit, move || {
-            server.with_lifecycle_admin("connect for disposable database cleanup", |client| {
-                drop_database(client, &name)
-            })
+        let prewarm_return = prewarm_pool
+            .and_then(|pool| pool.upgrade())
+            .map(|pool| pool.begin_return());
+        database_cleanup.submit_fallback(
+            database_name,
+            permit,
+            database_cleanup_operation(server, name, prewarm_return),
+        )
+    }
+}
+
+fn database_cleanup_operation(
+    server: Arc<ServerInner>,
+    name: DatabaseName,
+    mut prewarm_return: Option<PrewarmReturn>,
+) -> impl FnOnce() -> Result<()> + Send + 'static {
+    move || {
+        let operation_server = server.clone();
+        server.with_lifecycle_admin("connect for disposable database cleanup", move |client| {
+            drop_database(client, &name)?;
+            let Some(ref mut refill) = prewarm_return else {
+                return Ok(());
+            };
+            if !refill.after_drop() {
+                return Ok(());
+            }
+
+            let fresh_name = DatabaseName::test(&operation_server.project);
+            create_managed_database(
+                client,
+                &fresh_name,
+                refill.pool.template.name().as_str(),
+                &ResourceMetadata::test(
+                    operation_server.project.clone(),
+                    operation_server.owner_key,
+                ),
+            )?;
+            let prepared = PreparedDatabase {
+                database_url: operation_server.admin_url.database_url(&fresh_name),
+                name: fresh_name,
+            };
+            if let Some((prepared, deletion)) = refill.publish(prepared) {
+                // The pool closed after reserving this replacement. Remove it
+                // on the same admin session so the enclosing cleanup barrier
+                // still covers the complete slot transition.
+                let result = drop_database(client, &prepared.name);
+                deletion.finish();
+                result?;
+            }
+            Ok(())
         })
     }
 }
@@ -624,11 +1173,77 @@ async fn create_test_database(
                 server,
                 name,
                 permit,
+                prewarm_pool: None,
             }),
             database_url,
         })
     })
     .await
+}
+
+async fn create_unpublished_database(
+    server: Arc<ServerInner>,
+    template_name: String,
+) -> Result<UnpublishedDatabase> {
+    run_blocking(move || {
+        let name = DatabaseName::test(&server.project);
+        let database_url = server.admin_url.database_url(&name);
+        server.with_lifecycle_admin("connect for prewarmed database creation", |client| {
+            create_managed_database(
+                client,
+                &name,
+                &template_name,
+                &ResourceMetadata::test(server.project.clone(), server.owner_key),
+            )
+        })?;
+        Ok(UnpublishedDatabase {
+            server,
+            prepared: Some(PreparedDatabase { name, database_url }),
+        })
+    })
+    .await
+}
+
+fn queue_unpublished_database(server: Arc<ServerInner>, prepared: PreparedDatabase) {
+    let database_name = prepared.name.as_str().to_owned();
+    let database_cleanup = server.database_cleanup.clone();
+    if let Err(error) = database_cleanup.submit_prewarmer(database_name, move || {
+        server.with_lifecycle_admin("connect for unpublished prewarm cleanup", |client| {
+            drop_database(client, &prepared.name)
+        })
+    }) {
+        // Owned shutdown removes the containing server. On an external server,
+        // the tagged residual remains eligible for owner-aware stale cleanup.
+        log_cleanup(format_args!(
+            "unpublished prewarmed database cleanup could not be queued: {error}"
+        ));
+    }
+}
+
+fn queue_closed_prepared_database(pool: Arc<PrewarmPoolInner>, prepared: PreparedDatabase) {
+    let server = pool.template.server().clone();
+    let deletion = ClosedPrewarmDeletion { pool, active: true };
+    queue_counted_prepared_database(server, prepared, deletion);
+}
+
+fn queue_counted_prepared_database(
+    server: Arc<ServerInner>,
+    prepared: PreparedDatabase,
+    deletion: ClosedPrewarmDeletion,
+) {
+    let database_name = prepared.name.as_str().to_owned();
+    let database_cleanup = server.database_cleanup.clone();
+    if let Err(error) = database_cleanup.submit_prewarmer(database_name, move || {
+        let result = server.with_lifecycle_admin("connect for prewarm pool shutdown", |client| {
+            drop_database(client, &prepared.name)
+        });
+        deletion.finish();
+        result
+    }) {
+        log_cleanup(format_args!(
+            "idle prewarmed database cleanup could not be queued: {error}"
+        ));
+    }
 }
 
 /// Counts from an owner-aware stale database cleanup pass.

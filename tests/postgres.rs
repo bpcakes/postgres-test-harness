@@ -1508,6 +1508,64 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
     wait_until_container_is_absent(&container_id).await;
 }
 
+#[tokio::test]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn prewarm_shutdown_wakes_checkout_waiting_for_database_capacity() {
+    let harness = PostgresHarness::start(
+        HarnessConfig::new("prewarm_close_it")
+            .unwrap()
+            .with_connection_budget(1)
+            .unwrap()
+            .with_connections_per_database(1)
+            .unwrap(),
+    )
+    .await
+    .expect("start prewarm-close regression harness");
+    let template = harness
+        .template(
+            TemplateSpec::new(FingerprintBuilder::new("prewarm-close").finish()),
+            |_| async { Ok(()) },
+        )
+        .await
+        .expect("initialize prewarm-close template");
+    let pool = template.prewarm(1).await.expect("fill prewarm-close queue");
+    let active = harness
+        .empty_database()
+        .await
+        .expect("hold all application capacity");
+    let waiting_pool = pool.clone();
+    let (started_sender, started_receiver) = tokio::sync::oneshot::channel();
+    let waiter = tokio::spawn(async move {
+        let _ = started_sender.send(());
+        waiting_pool.database().await
+    });
+    // On this current-thread runtime the spawned task continues after the
+    // signal until its checkout yields on exhausted application capacity.
+    started_receiver
+        .await
+        .expect("prewarm checkout should start");
+    assert!(!waiter.is_finished());
+
+    pool.shutdown()
+        .await
+        .expect("close the pool while capacity is exhausted");
+    let error = tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("pool shutdown should wake the capacity waiter")
+        .expect("capacity waiter should not panic")
+        .expect_err("closed prewarm pool must reject the checkout");
+    assert!(matches!(error, Error::PrewarmPoolClosed));
+
+    active
+        .cleanup()
+        .await
+        .expect("clean capacity-holding database");
+    harness
+        .shutdown()
+        .await
+        .expect("remove prewarm-close regression container");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a local Docker-compatible daemon"]
 async fn process_exit_removes_an_owned_container_with_a_live_lease() {

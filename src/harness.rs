@@ -5,6 +5,7 @@ use std::{
         Arc, Mutex, Weak,
         atomic::{AtomicUsize, Ordering},
     },
+    task::Poll,
     time::{Duration, SystemTime},
 };
 
@@ -303,6 +304,7 @@ impl PrewarmedDatabasePool {
             capacity,
             public_handles: AtomicUsize::new(1),
             ready_admission: Arc::new(Semaphore::new(0)),
+            closed: Arc::new(Semaphore::new(0)),
             state: Mutex::new(PrewarmPoolState::new()),
         });
         inner.template.server().register_prewarm_pool(&inner)?;
@@ -322,8 +324,9 @@ impl PrewarmedDatabasePool {
     /// Leases one never-used database from the ready queue.
     ///
     /// A ready token is reserved before downstream application capacity. If
-    /// application admission is closed or this future is cancelled, the token
-    /// is returned and the idle database remains in the queue.
+    /// application admission or this pool is closed, or if this future is
+    /// cancelled, the token is returned and the idle database remains in the
+    /// queue until pool cleanup consumes it.
     pub async fn database(&self) -> Result<DatabaseLease> {
         let ready = self
             .inner
@@ -332,12 +335,11 @@ impl PrewarmedDatabasePool {
             .acquire_owned()
             .await
             .map_err(|_| Error::PrewarmPoolClosed)?;
-        let permit = self
-            .inner
-            .template
-            .server()
-            .acquire_database_permit()
-            .await?;
+        let permit = acquire_database_permit_or_pool_close(
+            self.inner.template.server().acquire_database_permit(),
+            self.inner.closed.clone(),
+        )
+        .await?;
         let Some(prepared) = self.inner.take_ready() else {
             return Err(Error::PrewarmPoolClosed);
         };
@@ -390,6 +392,7 @@ pub(crate) struct PrewarmPoolInner {
     capacity: usize,
     public_handles: AtomicUsize,
     ready_admission: Arc<Semaphore>,
+    closed: Arc<Semaphore>,
     state: Mutex<PrewarmPoolState>,
 }
 
@@ -521,6 +524,7 @@ impl PrewarmPoolInner {
         state.accepting = false;
         drop(state);
         self.ready_admission.close();
+        self.closed.close();
     }
 
     pub(crate) fn close_and_queue_ready(self: &Arc<Self>) {
@@ -528,19 +532,45 @@ impl PrewarmPoolInner {
             let mut state = self.lock_state();
             state.accepting = false;
             if state.cleanup_started {
-                return;
+                None
+            } else {
+                state.cleanup_started = true;
+                let ready = std::mem::take(&mut state.ready);
+                state.deleting += ready.len();
+                debug_assert!(state.occupied_slots() <= self.capacity);
+                Some(ready)
             }
-            state.cleanup_started = true;
-            let ready = std::mem::take(&mut state.ready);
-            state.deleting += ready.len();
-            debug_assert!(state.occupied_slots() <= self.capacity);
-            ready
         };
         self.ready_admission.close();
+        self.closed.close();
+        let Some(ready) = ready else {
+            return;
+        };
         for prepared in ready {
             queue_closed_prepared_database(self.clone(), prepared);
         }
     }
+}
+
+async fn acquire_database_permit_or_pool_close<F>(
+    database_admission: F,
+    pool_closed: Arc<Semaphore>,
+) -> Result<OwnedSemaphorePermit>
+where
+    F: Future<Output = Result<OwnedSemaphorePermit>>,
+{
+    let mut database_admission = std::pin::pin!(database_admission);
+    let mut pool_closed = std::pin::pin!(pool_closed.acquire_owned());
+    std::future::poll_fn(|context| {
+        if let Poll::Ready(result) = database_admission.as_mut().poll(context) {
+            return Poll::Ready(result);
+        }
+        if pool_closed.as_mut().poll(context).is_ready() {
+            return Poll::Ready(Err(Error::PrewarmPoolClosed));
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 struct PreparedDatabase {
@@ -1482,12 +1512,13 @@ mod tests {
         time::Duration,
     };
 
-    use tokio::sync::oneshot;
+    use tokio::sync::{Semaphore, oneshot};
 
     use super::{
-        CleanupClassification, CleanupReport, classify_cleanup_record, finish_locked_cleanup,
-        recoverable_template_initialization, revalidate_cleanup_candidate, run_blocking,
-        template_coordination_key, template_lock_key, template_record_is_ready,
+        CleanupClassification, CleanupReport, acquire_database_permit_or_pool_close,
+        classify_cleanup_record, finish_locked_cleanup, recoverable_template_initialization,
+        revalidate_cleanup_candidate, run_blocking, template_coordination_key, template_lock_key,
+        template_record_is_ready,
     };
     use crate::{
         Error, FingerprintBuilder, ProjectName,
@@ -1502,6 +1533,39 @@ mod tests {
         fn drop(&mut self) {
             self.0.store(true, Ordering::SeqCst);
         }
+    }
+
+    #[tokio::test]
+    async fn prewarm_close_wakes_database_capacity_wait() {
+        let database_admission = Arc::new(Semaphore::new(0));
+        let pool_closed = Arc::new(Semaphore::new(0));
+        let (started_sender, started_receiver) = oneshot::channel();
+        let waiting_admission = database_admission.clone();
+        let waiting_close = pool_closed.clone();
+        let waiter = tokio::spawn(async move {
+            acquire_database_permit_or_pool_close(
+                async move {
+                    let _ = started_sender.send(());
+                    waiting_admission
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| Error::ConnectionBudgetClosed)
+                },
+                waiting_close,
+            )
+            .await
+        });
+        started_receiver
+            .await
+            .expect("database-capacity wait should start");
+
+        pool_closed.close();
+        let error = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("pool closure should wake the database-capacity wait")
+            .expect("capacity waiter should not panic")
+            .expect_err("a closed prewarm pool must reject the checkout");
+        assert!(matches!(error, Error::PrewarmPoolClosed));
     }
 
     fn test_record(

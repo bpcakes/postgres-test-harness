@@ -256,7 +256,7 @@ compiling Testcontainers and its container-engine/TLS dependency graph:
 
 ```toml
 [dev-dependencies]
-postgres-test-harness = { version = "0.1.1", default-features = false }
+postgres-test-harness = { version = "0.2", default-features = false }
 ```
 
 Without `containers`, starting without an explicit or environment-provided

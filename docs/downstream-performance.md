@@ -166,7 +166,7 @@ container-engine, and container TLS graph:
 
 ```toml
 [dev-dependencies]
-postgres-test-harness = { version = "0.1.1", default-features = false }
+postgres-test-harness = { version = "0.2", default-features = false }
 ```
 
 An external-only build requires `HarnessConfig::with_admin_database_url` or

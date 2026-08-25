@@ -115,6 +115,14 @@ enum TemplateCacheEntry {
     Ready(Weak<TemplateInner>),
 }
 
+impl TemplateCache {
+    fn prune_expired_ready_entries(&mut self) {
+        self.entries.retain(|_, entry| {
+            !matches!(entry, TemplateCacheEntry::Ready(template) if template.strong_count() == 0)
+        });
+    }
+}
+
 struct TemplateFlight {
     completed: watch::Sender<bool>,
     // Registered waiters retain the flight and therefore this successful
@@ -314,6 +322,10 @@ impl ServerInner {
             None => {}
         }
 
+        // Cold acquisitions are the only path that can grow the cache. Prune
+        // dead weak entries here so warm lookups stay O(1) while unique,
+        // short-lived fingerprints cannot accumulate for the server lifetime.
+        cache.prune_expired_ready_entries();
         let flight = Arc::new(TemplateFlight::new());
         cache.entries.insert(
             fingerprint,
@@ -1103,6 +1115,38 @@ fn unix_now() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod template_cache_tests {
+    use std::sync::{Arc, Weak};
+
+    use super::{TemplateCache, TemplateCacheEntry, TemplateFlight};
+    use crate::FingerprintBuilder;
+
+    #[test]
+    fn cold_acquisition_prunes_expired_ready_entries_only() {
+        let mut cache = TemplateCache::default();
+        for index in 0..3 {
+            cache.entries.insert(
+                FingerprintBuilder::new(format!("expired-{index}")).finish(),
+                TemplateCacheEntry::Ready(Weak::new()),
+            );
+        }
+        let initializing = FingerprintBuilder::new("initializing").finish();
+        cache.entries.insert(
+            initializing,
+            TemplateCacheEntry::Initializing(Arc::new(TemplateFlight::new())),
+        );
+
+        cache.prune_expired_ready_entries();
+
+        assert_eq!(cache.entries.len(), 1);
+        assert!(matches!(
+            cache.entries.get(&initializing),
+            Some(TemplateCacheEntry::Initializing(_))
+        ));
+    }
 }
 
 #[cfg(all(test, feature = "containers"))]

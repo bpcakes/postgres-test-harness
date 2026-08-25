@@ -740,7 +740,7 @@ mod tests {
             atomic::{AtomicUsize, Ordering},
             mpsc,
         },
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use super::{CleanupOutcome, DatabaseCleanupQueue};
@@ -1016,6 +1016,10 @@ mod tests {
             "an in-flight failure delivery must retain its queue"
         );
         drop(outcome);
+        let wait_started = Instant::now();
+        while weak_queue.upgrade().is_some() && wait_started.elapsed() < Duration::from_secs(1) {
+            std::thread::yield_now();
+        }
         assert!(
             weak_queue.upgrade().is_none(),
             "queue teardown should finish after restoring and logging the failure"

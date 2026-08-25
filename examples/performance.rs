@@ -1831,8 +1831,8 @@ impl ExternalCleanupReport {
 }
 
 fn benchmark_project() -> String {
-    let token = Uuid::new_v4().simple().to_string();
-    format!("pghp_{}", &token[..11])
+    let token = Uuid::now_v7().simple().to_string();
+    format!("pghp_{}", &token[token.len() - 11..])
 }
 
 fn verify_started_image(
@@ -1883,7 +1883,7 @@ impl ReportOutput {
             ))
         })?;
         let mut temporary_name = file_name.to_os_string();
-        temporary_name.push(format!(".{}.tmp", Uuid::new_v4().simple()));
+        temporary_name.push(format!(".{}.tmp", Uuid::now_v7().simple()));
         let temporary = destination.with_file_name(temporary_name);
         let file = OpenOptions::new()
             .create_new(true)
@@ -2379,7 +2379,7 @@ mod tests {
     fn report_output_is_prepared_before_work_and_published_atomically() {
         let root = std::env::temp_dir().join(format!(
             "postgres-test-harness-performance-{}",
-            Uuid::new_v4().simple()
+            Uuid::now_v7().simple()
         ));
         let destination = root.join("reports/performance.json");
         let output = ReportOutput::prepare(Some(&destination)).expect("prepare report output");
@@ -2442,7 +2442,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_projects_are_random_valid_names() {
+    fn generated_projects_are_unique_valid_names() {
         let projects = (0..64).map(|_| benchmark_project()).collect::<HashSet<_>>();
         assert_eq!(projects.len(), 64);
         assert!(

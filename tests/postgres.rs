@@ -1600,7 +1600,7 @@ async fn process_exit_removes_an_owned_container_with_a_live_lease() {
 
     let marker = std::env::temp_dir().join(format!(
         "postgres-test-harness-process-teardown-{}",
-        uuid::Uuid::new_v4().simple()
+        uuid::Uuid::now_v7().simple()
     ));
     let output = Command::new(std::env::current_exe().expect("resolve integration-test binary"))
         .args([
@@ -1627,7 +1627,7 @@ async fn process_exit_removes_an_owned_container_with_a_live_lease() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a local Docker-compatible daemon and cached postgres:18 image"]
 async fn official_compatible_custom_image_supports_default_and_compatibility_profiles() {
-    let custom_image = format!("pth-perf06-custom:{}", uuid::Uuid::new_v4().simple());
+    let custom_image = format!("pth-perf06-custom:{}", uuid::Uuid::now_v7().simple());
     docker_command(&["image", "tag", "postgres:18", &custom_image]);
     let _image = TemporaryImageTag(custom_image.clone());
 

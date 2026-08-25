@@ -420,6 +420,37 @@ impl PrewarmPoolState {
     fn occupied_slots(&self) -> usize {
         self.ready.len() + self.leased + self.creating + self.deleting
     }
+
+    fn fail_and_begin_cleanup(
+        &mut self,
+        phase: PrewarmReturnPhase,
+        capacity: usize,
+    ) -> Option<VecDeque<PreparedDatabase>> {
+        match phase {
+            PrewarmReturnPhase::Deleting => {
+                debug_assert!(self.deleting > 0);
+                self.deleting = self.deleting.saturating_sub(1);
+            }
+            PrewarmReturnPhase::Creating => {
+                debug_assert!(self.creating > 0);
+                self.creating = self.creating.saturating_sub(1);
+            }
+            PrewarmReturnPhase::Complete => return None,
+        }
+        self.begin_cleanup(capacity)
+    }
+
+    fn begin_cleanup(&mut self, capacity: usize) -> Option<VecDeque<PreparedDatabase>> {
+        self.accepting = false;
+        if self.cleanup_started {
+            return None;
+        }
+        self.cleanup_started = true;
+        let ready = std::mem::take(&mut self.ready);
+        self.deleting += ready.len();
+        debug_assert!(self.occupied_slots() <= capacity);
+        Some(ready)
+    }
 }
 
 impl PrewarmPoolInner {
@@ -508,39 +539,19 @@ impl PrewarmPoolInner {
         }
     }
 
-    fn fail_phase(&self, phase: PrewarmReturnPhase) {
-        let mut state = self.lock_state();
-        match phase {
-            PrewarmReturnPhase::Deleting => {
-                debug_assert!(state.deleting > 0);
-                state.deleting = state.deleting.saturating_sub(1);
-            }
-            PrewarmReturnPhase::Creating => {
-                debug_assert!(state.creating > 0);
-                state.creating = state.creating.saturating_sub(1);
-            }
-            PrewarmReturnPhase::Complete => return,
-        }
-        state.accepting = false;
-        drop(state);
-        self.ready_admission.close();
-        self.closed.close();
+    fn fail_phase(self: &Arc<Self>, phase: PrewarmReturnPhase) {
+        let ready = self
+            .lock_state()
+            .fail_and_begin_cleanup(phase, self.capacity);
+        self.finish_close(ready);
     }
 
     pub(crate) fn close_and_queue_ready(self: &Arc<Self>) {
-        let ready = {
-            let mut state = self.lock_state();
-            state.accepting = false;
-            if state.cleanup_started {
-                None
-            } else {
-                state.cleanup_started = true;
-                let ready = std::mem::take(&mut state.ready);
-                state.deleting += ready.len();
-                debug_assert!(state.occupied_slots() <= self.capacity);
-                Some(ready)
-            }
-        };
+        let ready = self.lock_state().begin_cleanup(self.capacity);
+        self.finish_close(ready);
+    }
+
+    fn finish_close(self: &Arc<Self>, ready: Option<VecDeque<PreparedDatabase>>) {
         self.ready_admission.close();
         self.closed.close();
         let Some(ready) = ready else {
@@ -1515,10 +1526,10 @@ mod tests {
     use tokio::sync::{Semaphore, oneshot};
 
     use super::{
-        CleanupClassification, CleanupReport, acquire_database_permit_or_pool_close,
-        classify_cleanup_record, finish_locked_cleanup, recoverable_template_initialization,
-        revalidate_cleanup_candidate, run_blocking, template_coordination_key, template_lock_key,
-        template_record_is_ready,
+        CleanupClassification, CleanupReport, PreparedDatabase, PrewarmPoolState,
+        PrewarmReturnPhase, acquire_database_permit_or_pool_close, classify_cleanup_record,
+        finish_locked_cleanup, recoverable_template_initialization, revalidate_cleanup_candidate,
+        run_blocking, template_coordination_key, template_lock_key, template_record_is_ready,
     };
     use crate::{
         Error, FingerprintBuilder, ProjectName,
@@ -1566,6 +1577,33 @@ mod tests {
             .expect("capacity waiter should not panic")
             .expect_err("a closed prewarm pool must reject the checkout");
         assert!(matches!(error, Error::PrewarmPoolClosed));
+    }
+
+    #[test]
+    fn failed_prewarm_phase_begins_cleanup_for_every_ready_database() {
+        let project = ProjectName::new("prewarm_failure").unwrap();
+        let mut state = PrewarmPoolState::new();
+        state.ready.extend((0..2).map(|_| {
+            let name = DatabaseName::test(&project);
+            PreparedDatabase {
+                database_url: format!("postgres://localhost/{}", name.as_str()),
+                name,
+            }
+        }));
+        state.creating = 1;
+
+        let ready = state
+            .fail_and_begin_cleanup(PrewarmReturnPhase::Creating, 3)
+            .expect("the first failure starts terminal cleanup");
+
+        assert_eq!(ready.len(), 2);
+        assert!(state.ready.is_empty());
+        assert_eq!(state.creating, 0);
+        assert_eq!(state.deleting, 2);
+        assert_eq!(state.occupied_slots(), 2);
+        assert!(!state.accepting);
+        assert!(state.cleanup_started);
+        assert!(state.begin_cleanup(3).is_none());
     }
 
     fn test_record(

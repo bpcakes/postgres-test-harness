@@ -902,9 +902,7 @@ fn database_cleanup_operation(
         let operation_server = server.clone();
         let outcome =
             server.with_lifecycle_admin("connect for disposable database cleanup", move |client| {
-                if let Err(error) = drop_database(client, &name) {
-                    return Ok(CleanupOutcome::residual_possible(error));
-                }
+                drop_database(client, &name)?;
                 let Some(ref mut refill) = prewarm_return else {
                     return Ok(CleanupOutcome::succeeded());
                 };
@@ -927,7 +925,7 @@ fn database_cleanup_operation(
                             CleanupOutcome::no_residual(error)
                         }
                         ManagedDatabaseCreationFailure::ResidualPossible(error) => {
-                            CleanupOutcome::residual_possible(error)
+                            return Err(error);
                         }
                     });
                 }
@@ -941,9 +939,7 @@ fn database_cleanup_operation(
                     // still covers the complete slot transition.
                     let result = drop_database(client, &prepared.name);
                     deletion.finish();
-                    if let Err(error) = result {
-                        return Ok(CleanupOutcome::residual_possible(error));
-                    }
+                    result?;
                 }
                 Ok(CleanupOutcome::succeeded())
             });

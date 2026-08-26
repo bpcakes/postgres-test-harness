@@ -1,373 +1,254 @@
 # postgres-test-harness
 
-`postgres-test-harness` gives Rust integration tests one PostgreSQL 18 server,
-one immutable migrated template, and one isolated database per test. Its
-default `containers` feature starts PostgreSQL with Testcontainers; every build
-can instead use an externally managed admin database.
+`postgres-test-harness` starts or connects to one PostgreSQL 18 server, caches
+immutable migrated templates by fingerprint, and clones a fresh isolated
+database for each Rust test. The public API is independent of SQLx, Diesel, and
+`tokio-postgres`, so applications use their normal database client and
+migration entry points.
 
-The public API is deliberately independent of SQLx, Diesel, or
-`tokio-postgres`. A project supplies an async initializer that receives a
-database URL and may use its own database client and migration version.
+[crates.io](https://crates.io/crates/postgres-test-harness/0.2.0) ·
+[API documentation](https://docs.rs/postgres-test-harness/0.2.0/postgres_test_harness/) ·
+[CI](https://github.com/bpcakes/postgres-test-harness/actions/workflows/ci.yml) ·
+[reference adapter](examples/downstream_adapter.rs) ·
+[contributing](CONTRIBUTING.md)
 
-```rust,no_run
-use postgres_test_harness::{
-    BoxError, FingerprintBuilder, HarnessConfig, PostgresHarness, TemplateSpec,
-};
+The harness is designed for integration suites that need real PostgreSQL
+semantics without rerunning every migration for every test:
 
-# async fn example() -> Result<(), BoxError> {
-let harness = PostgresHarness::start(HarnessConfig::new("example")?).await?;
-let fingerprint = FingerprintBuilder::new("example-schema")
-    .add(
-        "migration-1",
-        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md")),
-    )
-    .finish();
-let template = harness
-    .template(TemplateSpec::new(fingerprint), |database_url| async move {
-        // Connect with the application's own database client and migrate here.
-        // Close every initializer connection or pool before returning. The
-        // harness also terminates stragglers before making the template ready.
-        let _ = database_url;
-        Ok(())
-    })
-    .await?;
+- initialize each distinct schema template once;
+- give concurrent tests separate databases cloned from that template;
+- bound application connections and database lifecycle work;
+- clean up owned containers and tagged disposable databases safely; and
+- use an existing PostgreSQL server in environments where containers are
+  unavailable.
 
-let database = template.database().await?;
-let database_url = database.database_url();
-// Run the test with database_url, close the application pool, then clean up.
-let _ = database_url;
-database.cleanup().await?;
-# Ok(())
-# }
+## Requirements
+
+- Rust 1.88 or newer;
+- PostgreSQL 18; and
+- either a Testcontainers-compatible Docker daemon or an externally managed
+  PostgreSQL admin database.
+
+The external admin role must be allowed to create and drop databases. The
+current admin client is intended for local and CI endpoints that do not require
+TLS.
+
+## Installation
+
+Add the harness as a development dependency. The extra dependencies below are
+used only by the runnable example:
+
+```toml
+[dev-dependencies]
+postgres-test-harness = "0.2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-postgres = "0.7"
 ```
 
-## Consumer adapter contract
-
-For a complete process-caching adapter, connection-budget worksheet,
-prewarming/cleanup policy, and one-service-per-CI-job example, see the
-[downstream performance guide](https://github.com/bpcakes/postgres-test-harness/blob/master/docs/downstream-performance.md).
-
-Each project should keep a small test-support adapter that owns only
-project-specific policy:
-
-1. Choose one stable, lowercase project namespace.
-2. Build a `TemplateSpec` from every migration bundle applied by the
-   initializer, including embedded migrations from dependent crates.
-3. Initialize the template with the project's normal database client and
-   migration entry points.
-4. Close every initializer connection or pool before returning from the
-   initializer. The harness defensively terminates stragglers before cloning.
-5. Preserve a separate empty-database constructor for migration-order tests.
-6. Close application pools before calling `DatabaseLease::cleanup` or
-   `DatabaseLease::defer_cleanup`.
-
-Server startup, PostgreSQL version validation, template coordination, database
-names, connection permits, container ownership, and stale cleanup belong in
-this crate. Consumer adapters should not enable Testcontainers reuse, issue
-Docker CLI cleanup commands, or delete databases by a name prefix.
-
-Each harness's default connection budget (`B`) is 120 permits and each live
-database lease reserves 11 (`P`). The effective simultaneous lease limit is
-`L = floor(B / P)`, so the defaults admit ten leases and leave ten permits
-unused. `HarnessConfig::connection_limits()` exposes the resolved values before
-startup, and `PostgresHarness::connection_limits()` returns the exact same
-read-only `ConnectionLimits` used by admission control after startup.
-
-Projects with different pool geometry can override both inputs on
-`HarnessConfig`. `P` must cover the sum of the maximum sizes of every
-application pool plus standalone connections that one test can open. For
-example, separate pools capped at ten and five connections plus one standalone
-client require at least 16 permits. Pool maximums are capacity, not an eager
-connection count: many pools start empty and connect lazily, while a minimum or
-idle limit describes how many already-open sessions they establish or retain.
-Budgeting the maximum still prevents a simultaneous checkout spike from
-overcommitting the harness.
-
-Connection-limit setters are order-independent and the last override for each
-value wins. With no explicit per-database override, its default is clamped to a
-smaller budget and returns to 11 if that budget is raised again. Zero and
-out-of-range values fail at their setter; an explicit per-database value larger
-than the final budget is rejected by `connection_limits()` and by
-`PostgresHarness::start` after the complete configuration is known.
-
-Disposable `CREATE`/metadata and `DROP` work reuses a lazy pool of administrative
-sessions owned by each harness. Each pool's limit is the smaller of the
-effective lease concurrency (`connection_budget / connections_per_database`)
-and one quarter of PostgreSQL's non-reserved connection slots, with a minimum
-of one. The quarter-share cap preserves headroom when one harness targets a
-server. Separate harnesses and processes do not coordinate this limit, so users
-of a shared external server must budget their aggregate connection capacity.
-If `R` is PostgreSQL's non-reserved capacity
-(`max_connections - reserved_connections - superuser_reserved_connections`),
-the lifecycle pool limit is `A = max(1, min(L, floor(R / 4)))`. Sessions are
-created lazily, so `A` is not an eager connection count. Sessions are checked
-out exclusively; independent lifecycle operations can progress concurrently
-without holding the pool lock during SQL. A reused session is reset and has the
-configured operation and lock timeouts restored before work. Waiting for a
-session is also bounded by the configured operation timeout. Failed or
-uncertain sessions are evicted and reconnected lazily.
-
-Managed creation failures that may have taken effect without a response close
-new database admission before returning, so repeated ambiguous attempts cannot
-grow an untracked residual set. A PostgreSQL error that proves creation did not
-occur is returned without closing admission.
-
-The application permit budget does not include harness administration. One
-owner-lock session lives for the server, each distinct live template retains
-one shared-lock session, and lifecycle create/cleanup work uses up to `A`
-pooled sessions. The owned server keeps `max_connections=300`; the default
-PostgreSQL 18 reservation settings leave 297 regular slots. With the default
-policy, at most `L * P = 110` application sessions, ten lifecycle sessions,
-and one owner session leave 176 regular slots for live templates, observers,
-short overlap, and safety headroom. Actual use is normally lower because the
-application and lifecycle pools are lazy.
-
-`max_connections` remains fixed rather than being derived from `B`: the
-characterization has not shown a robust benefit from changing it, live-template
-count is intentionally not capped, and pool limits do not imply eager sessions.
-Configurations whose potential application spike exceeds the server's capacity
-remain observable through `ConnectionLimits`, but cannot make PostgreSQL accept
-that spike. Size them against the whole formula. On external servers, include
-ambient sessions and the limits of every harness/process; those budgets are not
-coordinated globally.
-
-Database cleanup has two explicit completion contracts. `DatabaseLease::cleanup`
-uses the server's bounded workers, retains the lease's connection-budget permit,
-and returns only after `DROP DATABASE ... WITH (FORCE)` succeeds or fails.
-`DatabaseLease::defer_cleanup` returns after a bounded server-scoped queue
-accepts the database. It applies backpressure when that queue is full and
-releases the permit only after acceptance. The ordinary `Drop` implementation
-never waits for queue capacity: it enqueues a fallback and retains the lease's
-permit until cleanup finishes. This keeps destructor latency independent of
-database I/O and transfers saturation backpressure to the next database
-acquisition. Code that wants to release capacity after an explicit async
-backpressure point should call `defer_cleanup`.
-
-Each server reserves at least half of a multi-session lifecycle pool for creates
-and other lifecycle work, and caps cleanup at four worker threads. A one-session
-pool necessarily shares that session with its single cleanup worker. The
-explicit waiting queue has one slot per worker. Cleanup is therefore concurrent
-across servers without allowing a cleanup burst to occupy the entire lifecycle
-pool or multiplying the default thread count by the full pool size. If `L` is
-the effective live lease limit, `W` the cleanup worker count, and `Q` the waiting
-capacity, at most `L + W + Q` disposable databases can be live, running cleanup,
-or waiting for cleanup in one server. Awaited and fallback jobs retain their
-lease permits, so this formula is a conservative mixed-workload bound. Every
-later lease is created under a fresh unique name from `template0` or the
-immutable project template; a returned database is never reset or reused. A
-cleanup failure that may leave a residual database closes new database admission
-for that harness before the worker releases its slot. Already-live leases remain
-cleanable, but callers must observe the drain error and recover or replace the
-harness; repeated ambiguous failures cannot accumulate an unbounded residual
-set.
-
-An opt-in prewarmed pool adds its declared capacity `N` to that storage bound.
-Each of its slots is exactly one of ready, leased, deleting, or creating, so
-ready and background work cannot multiply the requested storage footprint.
-Multiple pools add their capacities independently.
-
-Call `PostgresHarness::drain_deferred_cleanup` to wait for everything accepted
-before the call. The barrier returns retained failures from explicit deferred
-returns, fallback drops, and cancelled awaited callers exactly once. Owned
-`shutdown` closes admission, closes the cleanup queue, drains it, reports any
-failure, then closes the lifecycle pool and removes the container. It is safe
-to cancel the async shutdown caller after the terminal sequence starts because
-the sequence continues in its blocking worker. External `shutdown` remains a
-no-op so an external server stays usable; external users must call the drain
-barrier before teardown. If the process is terminated before a drain, owned
-container cleanup removes the whole server and tagged external databases remain
-eligible for the next owner-aware stale sweep.
-
-Calls for the same live template on clones of one `PostgresHarness` are
-single-flighted and cached by fingerprint. They return handles backed by one
-template allocation and one retained shared-lock session; waiting callers do
-not run their initializers. The cache keeps only a weak reference, so dropping
-the final `DatabaseTemplate` releases that session. An initializer error or
-cancelled caller clears its flight and lets a waiting or later caller retry
-with its own initializer.
-
-Distinct `PostgresHarness::start` calls and separate processes deliberately do
-not share this in-memory cache. They continue to coordinate through PostgreSQL
-advisory locks. That coordination has a separate 15-minute wait timeout so a
-short administrative-operation timeout does not make a caller fail while a
-real migration suite is still running. Override it with
-`HarnessConfig::with_template_wait_timeout` when needed.
-
-## Prewarmed disposable databases
-
-For suites whose test bodies are shorter than a template clone, call
-`DatabaseTemplate::prewarm` once and share the returned
-`PrewarmedDatabasePool` inside the process:
-
-```rust,no_run
-# use postgres_test_harness::{BoxError, FingerprintBuilder, HarnessConfig, PostgresHarness, TemplateSpec};
-# async fn example() -> Result<(), BoxError> {
-# let harness = PostgresHarness::start(HarnessConfig::new("example")?).await?;
-# let template = harness.template(
-#     TemplateSpec::new(FingerprintBuilder::new("prewarm-example").finish()),
-#     |_| async { Ok(()) },
-# ).await?;
-let pool = template.prewarm(4).await?;
-let database = pool.database().await?;
-let database_url = database.database_url();
-// Run the test, then close every application connection or pool.
-let _ = database_url;
-database.defer_cleanup().await?;
-
-// Wait for the dirty DROP and distinct background replacement before teardown.
-harness.drain_deferred_cleanup().await?;
-assert_eq!(pool.status().ready(), 4);
-pool.shutdown().await?;
-# Ok(())
-# }
-```
-
-Capacity must be positive and no greater than the harness's effective lease
-limit `L`. Initial fill is awaited. Idle databases hold no application permits;
-`database()` reserves a ready token and the full per-database permit allocation
-before atomically removing an idle database. Cancellation or closed application
-admission therefore leaves the ready database untouched. When the queue is
-empty, callers wait for a returned database to be dropped and for a new clone
-with a fresh unique name to become ready.
-
-The pool never truncates or resets a dirty database. `cleanup()` waits for its
-dirty drop and replacement; `defer_cleanup()` and `Drop` hand that work to the
-bounded server lifecycle queue. Refill failures close the pool and are reported
-by the awaited cleanup or the harness drain barrier. They close harness-wide
-database admission only when the failure may have left a replacement database
-behind. `status()` exposes the ready, leased, deleting, and creating counts for
-diagnostics. A pool keeps its source template and shared advisory-lock session
-alive. Explicit `shutdown()` closes the pool, removes all idle databases, and
-drains accepted lifecycle work; it does not revoke leases still held by callers.
-Dropping the final pool handle queues the same idle cleanup. Owned harness
-shutdown closes every registered pool before fixing its cleanup barrier and
-removing the container.
-
-## Environment
-
-- `POSTGRES_TEST_ADMIN_URL` uses an existing PostgreSQL 18 server instead of
-  starting a container. The URL must identify an administrative database and a
-  role allowed to create and drop disposable databases. The current admin
-  client expects a local or CI endpoint that does not require TLS. External-only
-  builds require this variable or `HarnessConfig::with_admin_database_url`.
-- `POSTGRES_TEST_IMAGE` overrides the default `postgres:18` image when the
-  `containers` feature is enabled.
-
-## Cargo features
-
-The default `containers` feature preserves the owned-container behavior and
-API. Consumers that always provide an external PostgreSQL server can avoid
-compiling Testcontainers and its container-engine/TLS dependency graph:
+The default `containers` feature starts `postgres:18`. To compile without
+Testcontainers and always use an external server:
 
 ```toml
 [dev-dependencies]
 postgres-test-harness = { version = "0.2", default-features = false }
 ```
 
-Without `containers`, starting without an explicit or environment-provided
-admin URL returns `Error::ExternalAdminUrlRequired`. `HarnessConfig::with_image`
-and `OwnedContainerProfile` remain available so shared configuration code stays
-source-compatible; their settings are validated but ignored in external mode.
-`PostgresHarness::container_id` always returns `None`, and `shutdown` retains
-its external-server no-op behavior.
+## Quick start
 
-`Error` is non-exhaustive. Its owned-container variants, including variants
-whose sources use Testcontainers types, exist only with `containers` enabled;
-`ExternalAdminUrlRequired` exists only when that feature is disabled. Default
-builds therefore retain the prior public Rust API without exposing an optional
-dependency from external-only builds.
+This test creates one content-addressed template, applies a real migration, and
+leases a fresh clone for the test body:
 
-## Owned-container performance profile
+```rust,no_run
+use postgres_test_harness::{
+    BoxError, FingerprintBuilder, HarnessConfig, PostgresHarness, TemplateSpec,
+};
+use tokio_postgres::NoTls;
 
-Owned containers use `OwnedContainerProfile::performance()` by default. The
-profile passes exactly `--no-sync` through `POSTGRES_INITDB_ARGS` and mounts
-`/var/lib/postgresql` on tmpfs with a 1 GiB size cap. `--no-sync` shortens
-disposable cluster initialization; tmpfs improves database clone and cleanup
-I/O. Neither setting makes test data persistent or crash-safe. The harness's
-existing `fsync=off`, `synchronous_commit=off`, and `full_page_writes=off`
-runtime settings have the same disposable-data premise.
+const MIGRATION: &str = r#"
+    CREATE TABLE widgets (
+        id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        name text NOT NULL
+    );
+"#;
 
-Increase the cap for larger templates, or opt out when the Docker daemon does
-not support tmpfs or memory-backed storage is inappropriate:
+#[tokio::test]
+async fn widgets_use_a_migrated_isolated_database() -> Result<(), BoxError> {
+    let harness = PostgresHarness::start(HarnessConfig::new("readme_example")?).await?;
+    let fingerprint = FingerprintBuilder::new("readme-schema-v1")
+        .add("0001_create_widgets.sql", MIGRATION)
+        .finish();
 
-```rust
-use postgres_test_harness::{HarnessConfig, OwnedContainerProfile};
+    let template = harness
+        .template(TemplateSpec::new(fingerprint), |database_url| async move {
+            let (client, connection) =
+                tokio_postgres::connect(&database_url, NoTls).await?;
+            let connection = tokio::spawn(connection);
 
-# fn config() -> postgres_test_harness::Result<HarnessConfig> {
-let larger = OwnedContainerProfile::performance()
-    .with_tmpfs_size_bytes(2 * 1024 * 1024 * 1024)?;
-let config = HarnessConfig::new("example")?.with_owned_container_profile(larger);
+            let migration_result = client.batch_execute(MIGRATION).await;
+            drop(client);
+            let connection_result = connection.await?;
+            migration_result?;
+            connection_result?;
+            Ok(())
+        })
+        .await?;
 
-let image_default_storage = OwnedContainerProfile::performance().without_tmpfs();
-let config = config.with_owned_container_profile(image_default_storage);
-# Ok(config)
-# }
+    let database = template.database().await?;
+    let (client, connection) =
+        tokio_postgres::connect(database.database_url(), NoTls).await?;
+    let connection = tokio::spawn(connection);
+
+    let test_result = async {
+        client
+            .execute("INSERT INTO widgets (name) VALUES ($1)", &[&"first"])
+            .await?;
+        let row = client.query_one("SELECT count(*) FROM widgets", &[]).await?;
+        Ok::<i64, tokio_postgres::Error>(row.get(0))
+    }
+    .await;
+
+    // Close every application connection or pool before returning the lease.
+    drop(client);
+    let connection_result = connection.await?;
+    let count = test_result?;
+    connection_result?;
+    assert_eq!(count, 1);
+
+    database.cleanup().await?;
+    harness.shutdown().await?;
+    Ok(())
+}
 ```
 
-A full compatibility opt-out for an official-compatible custom image is
-`OwnedContainerProfile::performance().with_initdb_no_sync(false).without_tmpfs()`.
-Custom images used with the optimizations must honor the Docker Official
-PostgreSQL 18 contracts: `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`,
-and `POSTGRES_INITDB_ARGS`; PostgreSQL data beneath `/var/lib/postgresql`; port
-5432; and the `postgres -c name=value` command shape. All images must still
-provide PostgreSQL 18 with `uuidv7()` and accept password authentication over
-the mapped TCP port. An unsupported tmpfs mount retains the Docker daemon's
-error and names the opt-out. If the cap is exhausted during startup, the error
-reports the cap and the recognized storage-exhaustion evidence. Recognized
-allocation failures and exit status 137 are reported separately as possible
-Docker/host memory exhaustion, with guidance to reduce pressure, increase the
-daemon allowance, or disable tmpfs.
+In a real suite, cache the harness and template once per test process rather
+than starting them in every test. The
+[reference adapter](examples/downstream_adapter.rs) shows that complete shape,
+including error-preserving teardown and an empty-database path for migration
+tests.
 
-The profile deliberately does not add `--no-data-checksums`,
-`wal_level=minimal`, reusable containers, or host `trust` authentication.
-Settings that change database semantics belong in separate, explicit profiles
-backed by representative compatibility measurements.
+## How it works
 
-For an owned container, the harness requests Testcontainers' IPv4 port mapping
-and therefore uses an IPv4 loopback literal when Testcontainers reports
-`localhost`; this prevents the operating system from selecting an unrelated
-IPv6 listener for an IPv4-mapped port. The Docker Official image's temporary
-initdb server listens only on a Unix socket, so log output is not treated as
-readiness. Owned startup instead retries authenticated connections through the
-mapped TCP port within `with_startup_timeout`; the successful connection is
-then used for PostgreSQL 18 validation and the owner lock. Cleanup after an
-expired startup deadline is awaited before the error returns, so the deadline
-does not abandon a partially created container. If that cleanup also fails,
-the returned error preserves both the startup failure and the cleanup failure.
-Other administrative connections have a ten-second connection deadline. Query
-and lock deadlines remain governed separately by the configured
-administrative-operation and template-wait timeouts.
+1. `PostgresHarness::start` starts an owned PostgreSQL container, unless an
+   external admin URL is configured.
+2. `template` identifies a migrated schema from every ordered input added to
+   its fingerprint. Calls with the same fingerprint are single-flighted within
+   a harness and coordinated across processes with PostgreSQL advisory locks.
+3. `DatabaseTemplate::database` clones a uniquely named database from the
+   immutable template.
+4. The test uses its normal client and pool against
+   `DatabaseLease::database_url`.
+5. After all application connections close, `cleanup` or `defer_cleanup`
+   drops the disposable database. `drain_deferred_cleanup` provides a
+   suite-level barrier.
 
-The harness never enables Testcontainers' reusable-container mode. Reuse is
-bounded by the owner process, and ordinary process exit removes an owned
-container. Tagged database metadata and PostgreSQL advisory locks allow a later
-process to clean resources left by an abnormal exit without deleting active or
-unrecognized databases.
+One harness can hold multiple templates with different fingerprints. Preserve a
+separate `PostgresHarness::empty_database` path for tests that need to exercise
+migration order from PostgreSQL's built-in `template0`.
 
-Owned containers are removed on explicit shutdown, Rust drop, ordinary process
-exit, and catchable termination signals. No in-process implementation can react
-to `SIGKILL` or a host crash; containers carry
-`org.postgres-test-harness.managed=true`, project, run, and creation-time labels
-so operators can identify those exceptional leftovers without relying on a
-name prefix. The harness deliberately does not auto-delete an old running
-container because Docker labels alone cannot prove that its owning process is
-dead.
+## Test-suite adapter
 
-On a shared external server, startup performs an age-bounded stale-database
-sweep by default. Cleanup requires valid harness metadata and an available
-owner or template advisory lock, so active, fresh, untagged, and foreign
-databases are skipped.
+Most consumers should keep a small test-support module that owns only
+application-specific policy:
+
+1. Choose one stable lowercase project namespace of at most 16 ASCII
+   characters.
+2. Fingerprint every ordered migration bundle used by the initializer,
+   including migrations embedded by dependent crates.
+3. Apply migrations through the application's normal client and migration
+   entry points.
+4. Close initializer and test-body connections or pools before returning a
+   lease.
+5. Cache one harness and each commonly used template per test process.
+6. Size the harness connection limits from actual application pool capacity.
+
+Server startup, version validation, template coordination, database names,
+connection admission, stale cleanup, and container ownership belong to the
+harness. Consumer adapters should not enable Testcontainers reuse, issue Docker
+CLI cleanup commands, or delete databases by a name prefix.
+
+The [downstream performance guide](docs/downstream-performance.md) contains a
+connection-budget worksheet, process-caching patterns, prewarming policy, and a
+one-service-per-CI-job example.
+
+## Server modes
+
+### Owned container
+
+With default features, `PostgresHarness::start` launches `postgres:18`.
+`POSTGRES_TEST_IMAGE` selects an official-compatible PostgreSQL 18 image.
+
+Owned containers use a disposable-data performance profile by default:
+`initdb --no-sync`, a 1 GiB tmpfs mount beneath `/var/lib/postgresql`, and
+non-durable PostgreSQL runtime settings. Increase the tmpfs cap for larger
+templates or select image-default storage when memory-backed storage is
+inappropriate.
+
+The harness does not enable reusable-container mode. Explicit shutdown,
+ordinary process exit, Rust drop, and catchable termination signals remove an
+owned container. No process can react to `SIGKILL` or a host crash; identifying
+labels remain on exceptional leftovers.
+
+### External PostgreSQL
+
+Set an admin URL in configuration or the environment:
+
+```console
+export POSTGRES_TEST_ADMIN_URL=\
+'postgres://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable'
+cargo test
+```
+
+External startup validates PostgreSQL 18 and performs an owner-aware,
+age-bounded stale-database sweep by default. Active, fresh, untagged, and foreign
+databases are skipped. External `shutdown` is intentionally a no-op; call
+`drain_deferred_cleanup` before tearing down the server.
+
+Without the `containers` feature, an absent admin URL returns
+`Error::ExternalAdminUrlRequired`. Configuration types shared with container
+mode remain available, while container-only error variants and dependencies are
+omitted.
+
+## Connection limits and cleanup
+
+The default application budget is 120 connection permits, with 11 reserved by
+each live database lease. That admits ten simultaneous leases. Override both
+values when one test can open a different maximum number of pooled and
+standalone connections. Harness administration uses a separate bounded,
+lazy session pool.
+
+Choose cleanup based on when the caller needs completion:
+
+- `DatabaseLease::cleanup` waits for the database drop to finish.
+- `DatabaseLease::defer_cleanup` applies bounded queue backpressure, then
+  returns after the cleanup is accepted.
+- `Drop` submits a non-blocking fallback and retains the lease permit until
+  cleanup finishes.
+- `PostgresHarness::drain_deferred_cleanup` waits for previously accepted work
+  and reports retained failures.
+
+If test bodies are shorter than a template clone, an opt-in
+`DatabaseTemplate::prewarm` pool can keep a bounded number of pristine clones
+ready. Dirty databases are always dropped and replaced; they are never reset or
+reused.
+
+See [operations and resource lifecycle](docs/operations.md) for capacity
+formulas, cleanup failure behavior, template coordination, prewarming state, and
+owned-container compatibility details.
 
 ## Performance characterization
 
 The checked-in performance example measures owned or external server startup,
 template acquisition, disposable database throughput, cleanup drain time, and
-administrative connection churn. It emits versioned JSON observations and
-never applies machine-specific latency thresholds. See
-[the performance workflow](https://github.com/bpcakes/postgres-test-harness/blob/master/docs/performance.md)
-for local commands, CI usage,
+administrative connection churn. It emits versioned JSON observations and does
+not apply machine-specific latency thresholds. See the
+[performance workflow](docs/performance.md) for local commands, CI usage,
 measurement boundaries, and the recorded baseline.
+
+## Development and contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites, the default and
+external-server test commands, and the format and lint checks used by CI.
 
 ## License
 
-Licensed under MIT.
+Licensed under the [MIT License](LICENSE-MIT).

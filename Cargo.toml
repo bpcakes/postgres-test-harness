@@ -12,6 +12,15 @@ keywords = ["postgres", "testing", "testcontainers", "database"]
 categories = ["development-tools::testing", "database"]
 exclude = ["/.beads/**", "/.github/**", "/AGENTS.md"]
 
+[workspace]
+
+[workspace.lints.clippy]
+cognitive_complexity = "warn"
+too_many_lines = "warn"
+
+[lints]
+workspace = true
+
 [features]
 default = ["containers"]
 containers = ["dep:libc", "dep:testcontainers"]

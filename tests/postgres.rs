@@ -20,52 +20,90 @@ use postgres_test_harness::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+struct OwnedHarnessFixture {
+    harness: PostgresHarness,
+    admin_url: String,
+    container_id: String,
+}
+
+impl OwnedHarnessFixture {
+    async fn start() -> Self {
+        let harness = PostgresHarness::start(
+            HarnessConfig::new("harness_it")
+                .unwrap()
+                .with_cleanup_on_start(false),
+        )
+        .await
+        .expect("start owned PostgreSQL 18 harness");
+        let admin_url = harness.admin_database_url().to_owned();
+        let container_id = harness
+            .container_id()
+            .expect("owned harness exposes its container ID")
+            .to_owned();
+        Self {
+            harness,
+            admin_url,
+            container_id,
+        }
+    }
+
+    async fn shutdown(self) {
+        self.harness
+            .shutdown()
+            .await
+            .expect("remove owned PostgreSQL container");
+        wait_until_container_is_absent(&self.container_id).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a local Docker-compatible daemon"]
-async fn postgres_lifecycle_regressions_work_end_to_end() {
-    let harness = PostgresHarness::start(
-        HarnessConfig::new("harness_it")
-            .unwrap()
-            .with_cleanup_on_start(false),
-    )
-    .await
-    .expect("start owned PostgreSQL 18 harness");
-    assert!(!harness.is_external());
-    let limits = harness.connection_limits();
+async fn owned_startup_uses_expected_profile_and_stable_postmaster() {
+    let fixture = OwnedHarnessFixture::start().await;
+    assert!(!fixture.harness.is_external());
+    let limits = fixture.harness.connection_limits();
     assert_eq!(limits.connection_budget(), 120);
     assert_eq!(limits.connections_per_database(), 11);
     assert_eq!(limits.max_simultaneous_leases(), 10);
-    let container_id = harness
-        .container_id()
-        .expect("owned harness exposes its container ID")
-        .to_owned();
-    let admin_url = harness.admin_database_url().to_owned();
-    assert_default_owned_profile(&container_id);
+    assert_default_owned_profile(&fixture.container_id);
     assert_eq!(
-        scalar_string(admin_url.clone(), "SHOW data_checksums")
+        scalar_string(fixture.admin_url.clone(), "SHOW data_checksums")
             .await
             .expect("read data-checksum setting"),
         "on"
     );
     assert_eq!(
-        scalar_string(admin_url.clone(), "SHOW wal_level")
+        scalar_string(fixture.admin_url.clone(), "SHOW wal_level")
             .await
             .expect("read WAL level"),
         "replica"
     );
-    let postmaster_started_at =
-        scalar_string(admin_url.clone(), "SELECT pg_postmaster_start_time()::text")
-            .await
-            .expect("read final postmaster start time");
+    let postmaster_started_at = scalar_string(
+        fixture.admin_url.clone(),
+        "SELECT pg_postmaster_start_time()::text",
+    )
+    .await
+    .expect("read final postmaster start time");
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
-        scalar_string(admin_url.clone(), "SELECT pg_postmaster_start_time()::text")
-            .await
-            .expect("re-read final postmaster start time"),
+        scalar_string(
+            fixture.admin_url.clone(),
+            "SELECT pg_postmaster_start_time()::text",
+        )
+        .await
+        .expect("re-read final postmaster start time"),
         postmaster_started_at,
         "owned startup must retain the same final TCP postmaster"
     );
+    fixture.shutdown().await;
+}
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn lifecycle_admin_pool_reuses_and_replaces_sessions() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let harness = &fixture.harness;
+    let admin_url = &fixture.admin_url;
     {
         let first = harness
             .empty_database()
@@ -101,7 +139,7 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
                 .await
                 .expect("terminate the idle lifecycle admin backend")
         );
-        wait_until_lifecycle_admin_session_count(&admin_url, "harness_it", 0).await;
+        wait_until_lifecycle_admin_session_count(admin_url, "harness_it", 0).await;
 
         let reconnected = harness
             .empty_database()
@@ -117,7 +155,15 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         assert_eq!(replacement_pids.len(), 1);
         assert_ne!(replacement_pids, first_pids);
     }
+    fixture.shutdown().await;
+}
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn stale_cleanup_preserves_active_and_untagged_databases() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let harness = &fixture.harness;
+    let admin_url = &fixture.admin_url;
     {
         let cleanup_spec = TemplateSpec::new(FingerprintBuilder::new("cleanup-schema").finish());
         let cleanup_template = harness
@@ -132,7 +178,7 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         let untagged_database =
             TemporaryDatabase::create(admin_url.clone(), UNTAGGED_DATABASE.to_owned()).await;
 
-        let report = cleanup_stale_databases(&admin_url, "harness_it", Duration::ZERO)
+        let report = cleanup_stale_databases(admin_url, "harness_it", Duration::ZERO)
             .await
             .expect("run owner-aware cleanup");
         assert_eq!(report.dropped_test_databases, 0);
@@ -159,8 +205,8 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         .await
         .expect("tag stale database for concurrent cleanup");
         let (left_report, right_report) = tokio::join!(
-            cleanup_stale_databases(&admin_url, "harness_it", Duration::ZERO),
-            cleanup_stale_databases(&admin_url, "harness_it", Duration::ZERO),
+            cleanup_stale_databases(admin_url, "harness_it", Duration::ZERO),
+            cleanup_stale_databases(admin_url, "harness_it", Duration::ZERO),
         );
         let left_report = left_report.expect("run first concurrent cleanup");
         let right_report = right_report.expect("run second concurrent cleanup");
@@ -183,7 +229,15 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
             .await
             .expect("clean active cleanup database");
     }
+    fixture.shutdown().await;
+}
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn dropping_template_releases_its_retained_advisory_lock() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let harness = &fixture.harness;
+    let admin_url = &fixture.admin_url;
     {
         let fingerprint = FingerprintBuilder::new("drop-lock-regression").finish();
         let lock_key = advisory_key("template", &format!("harness_it:{}", fingerprint.to_hex()));
@@ -200,9 +254,17 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
 
         drop(template);
 
-        wait_until_advisory_lock_is_acquirable(&admin_url, lock_key).await;
+        wait_until_advisory_lock_is_acquirable(admin_url, lock_key).await;
     }
+    fixture.shutdown().await;
+}
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn many_live_templates_retain_separate_lock_sessions() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let harness = &fixture.harness;
+    let admin_url = &fixture.admin_url;
     {
         const LIVE_TEMPLATES: usize = 16;
         let shared_locks_before = advisory_lock_count(admin_url.clone(), "ShareLock")
@@ -228,9 +290,16 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
             "every distinct live template retains one separate PostgreSQL session"
         );
         drop(templates);
-        wait_until_advisory_lock_count(&admin_url, "ShareLock", shared_locks_before).await;
+        wait_until_advisory_lock_count(admin_url, "ShareLock", shared_locks_before).await;
     }
+    fixture.shutdown().await;
+}
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn connection_budget_backpressures_and_recovers() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let admin_url = &fixture.admin_url;
     {
         let limited_harness = PostgresHarness::start(
             HarnessConfig::new("limits_it")
@@ -268,216 +337,14 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
             .await
             .expect("clean the connection-limit regression database");
     }
+    fixture.shutdown().await;
+}
 
-    {
-        const PROJECT: &str = "prewarm_it";
-        let prewarm_harness = PostgresHarness::start(
-            HarnessConfig::new(PROJECT)
-                .unwrap()
-                .with_admin_database_url(admin_url.clone())
-                .with_connection_budget(2)
-                .unwrap()
-                .with_connections_per_database(1)
-                .unwrap()
-                .with_cleanup_on_start(false),
-        )
-        .await
-        .expect("start prewarm regression harness");
-        let fingerprint = FingerprintBuilder::new("prewarm-main").finish();
-        let lock_key = advisory_key("template", &format!("{PROJECT}:{}", fingerprint.to_hex()));
-        let template = prewarm_harness
-            .template(TemplateSpec::new(fingerprint), |database_url| async move {
-                execute(database_url, "CREATE TABLE base_marker (value integer)").await
-            })
-            .await
-            .expect("initialize prewarm template");
-        assert!(matches!(
-            template.prewarm(0).await,
-            Err(Error::InvalidPrewarmCapacity {
-                capacity: 0,
-                max_capacity: 2,
-            })
-        ));
-        assert!(matches!(
-            template.prewarm(3).await,
-            Err(Error::InvalidPrewarmCapacity {
-                capacity: 3,
-                max_capacity: 2,
-            })
-        ));
-        let pool = template
-            .prewarm(2)
-            .await
-            .expect("fill two prewarmed database slots");
-        assert_eq!(pool.capacity(), 2);
-        let initial = pool.status();
-        assert_eq!(initial.ready(), 2);
-        assert_eq!(initial.leased(), 0);
-        assert_eq!(initial.occupied_slots(), 2);
-
-        // Idle prewarmed databases do not reserve application permits: the
-        // same two-permit harness can still admit two ordinary databases.
-        let direct_first = prewarm_harness
-            .empty_database()
-            .await
-            .expect("lease first ordinary database beside idle prewarm slots");
-        let direct_second =
-            tokio::time::timeout(Duration::from_secs(5), prewarm_harness.empty_database())
-                .await
-                .expect("idle prewarm slots must not exhaust application admission")
-                .expect("lease second ordinary database beside idle prewarm slots");
-        direct_first.cleanup().await.expect("clean direct database");
-        direct_second
-            .cleanup()
-            .await
-            .expect("clean direct database");
-        assert_eq!(pool.status().ready(), 2);
-
-        let first = pool
-            .database()
-            .await
-            .expect("lease first prewarmed database");
-        let first_name = first.database_name().to_owned();
-        let second = pool
-            .database()
-            .await
-            .expect("lease second prewarmed database");
-        let second_name = second.database_name().to_owned();
-        assert_ne!(first_name, second_name);
-        execute(
-            first.database_url().to_owned(),
-            "CREATE TABLE contaminated (value integer)",
-        )
-        .await
-        .expect("dirty one prewarmed lease");
-
-        let cancelled_pool = pool.clone();
-        let cancelled_waiter = tokio::spawn(async move { cancelled_pool.database().await });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            !cancelled_waiter.is_finished(),
-            "an exhausted queue must wait"
-        );
-        cancelled_waiter.abort();
-        assert!(cancelled_waiter.await.unwrap_err().is_cancelled());
-        assert_eq!(pool.status().leased(), 2);
-        assert_eq!(pool.status().ready(), 0);
-
-        let waiting_pool = pool.clone();
-        let waiting_lease = tokio::spawn(async move { waiting_pool.database().await });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            !waiting_lease.is_finished(),
-            "queue exhaustion must backpressure"
-        );
-        first
-            .defer_cleanup()
-            .await
-            .expect("return dirty lease to background refill");
-        prewarm_harness
-            .drain_deferred_cleanup()
-            .await
-            .expect("drain dirty drop and distinct replacement creation");
-        let replacement = tokio::time::timeout(Duration::from_secs(5), waiting_lease)
-            .await
-            .expect("a completed refill must wake one queue waiter")
-            .expect("queue waiter must not panic")
-            .expect("lease the freshly refilled database");
-        assert_ne!(replacement.database_name(), first_name);
-        assert_ne!(replacement.database_name(), second_name);
-        assert!(
-            !relation_exists(replacement.database_url().to_owned(), "contaminated")
-                .await
-                .expect("inspect replacement database"),
-            "a dirty database must never be reset and reused"
-        );
-        assert!(
-            relation_exists(replacement.database_url().to_owned(), "base_marker")
-                .await
-                .expect("inspect replacement template contents")
-        );
-
-        second
-            .defer_cleanup()
-            .await
-            .expect("return second prewarmed lease");
-        replacement
-            .defer_cleanup()
-            .await
-            .expect("return replacement lease");
-        prewarm_harness
-            .drain_deferred_cleanup()
-            .await
-            .expect("refill both returned slots");
-        let refilled = pool.status();
-        assert_eq!(refilled.ready(), 2);
-        assert_eq!(refilled.leased(), 0);
-        assert_eq!(refilled.creating(), 0);
-        assert_eq!(refilled.deleting(), 0);
-        assert_eq!(refilled.occupied_slots(), 2);
-
-        let other_template = prewarm_harness
-            .template(
-                TemplateSpec::new(FingerprintBuilder::new("prewarm-other").finish()),
-                |database_url| async move {
-                    execute(database_url, "CREATE TABLE other_marker (value integer)").await
-                },
-            )
-            .await
-            .expect("initialize a second prewarm template");
-        let other_pool = other_template
-            .prewarm(1)
-            .await
-            .expect("fill an independent template queue");
-        let other = other_pool
-            .database()
-            .await
-            .expect("lease from second template queue");
-        assert!(
-            relation_exists(other.database_url().to_owned(), "other_marker")
-                .await
-                .expect("inspect second-template lease")
-        );
-        assert!(
-            !relation_exists(other.database_url().to_owned(), "base_marker")
-                .await
-                .expect("inspect second-template isolation")
-        );
-        other
-            .defer_cleanup()
-            .await
-            .expect("return second-template lease");
-        prewarm_harness
-            .drain_deferred_cleanup()
-            .await
-            .expect("refill second-template queue");
-        other_pool
-            .shutdown()
-            .await
-            .expect("drop and drain second-template idle database");
-
-        drop(template);
-        assert!(
-            !advisory_lock_is_acquirable(admin_url.clone(), lock_key)
-                .await
-                .expect("inspect template lock retained by prewarm pool"),
-            "the pool must retain its source template shared lock"
-        );
-        pool.shutdown()
-            .await
-            .expect("drop and drain all idle prewarmed databases");
-        assert_eq!(
-            scalar_i64(
-                admin_url.clone(),
-                "SELECT count(*) FROM pg_database WHERE datname LIKE 'pgh_prewarm_it_test_%'",
-            )
-            .await
-            .expect("count residual prewarm databases"),
-            0
-        );
-        wait_until_advisory_lock_is_acquirable(&admin_url, lock_key).await;
-    }
-
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn prewarm_refill_failure_closes_only_the_pool() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let admin_url = &fixture.admin_url;
     {
         const PROJECT: &str = "prewarmfail";
         let failure_harness = PostgresHarness::start(
@@ -538,7 +405,14 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
             .await
             .expect("clean up the post-refill admission probe");
     }
+    fixture.shutdown().await;
+}
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn admin_pool_is_bounded_under_concurrent_lifecycle_work() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let admin_url = &fixture.admin_url;
     {
         const PROJECT: &str = "admin_pool_it";
         const POOL_LIMIT: usize = 4;
@@ -565,7 +439,7 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
             });
         }
 
-        wait_until_lifecycle_admin_session_count(&admin_url, PROJECT, POOL_LIMIT).await;
+        wait_until_lifecycle_admin_session_count(admin_url, PROJECT, POOL_LIMIT).await;
         assert_eq!(
             lifecycle_admin_pids(admin_url.clone(), PROJECT)
                 .await
@@ -594,103 +468,15 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
             "the lazy pool must retain no more sessions than its bound"
         );
     }
+    fixture.shutdown().await;
+}
 
-    {
-        let spec = TemplateSpec::new(
-            FingerprintBuilder::new("integration-schema")
-                .add(
-                    "0001-create-marker",
-                    "CREATE TABLE harness_marker (value text NOT NULL)",
-                )
-                .finish(),
-        );
-        let template = harness
-            .template(spec, |database_url| async move {
-                execute(
-                    database_url,
-                    "CREATE TABLE harness_marker (value text NOT NULL)",
-                )
-                .await
-            })
-            .await
-            .expect("initialize template");
-        let reused = harness
-            .template(spec, |_| async move {
-                Err(std::io::Error::other("ready template initializer must not run").into())
-            })
-            .await
-            .expect("reuse ready template");
-        assert_eq!(template.database_name(), reused.database_name());
-
-        for iteration in 0..16 {
-            let database = template.database().await.unwrap_or_else(|error| {
-                panic!("create repeated disposable database {iteration}: {error}")
-            });
-            assert!(
-                relation_exists(database.database_url().to_owned(), "harness_marker")
-                    .await
-                    .unwrap_or_else(|error| {
-                        panic!("query repeated disposable database {iteration}: {error}")
-                    })
-            );
-            database.cleanup().await.unwrap_or_else(|error| {
-                panic!("clean repeated disposable database {iteration}: {error}")
-            });
-        }
-
-        let first = template.database().await.expect("clone first database");
-        let second = template.database().await.expect("clone second database");
-        execute(
-            first.database_url().to_owned(),
-            "INSERT INTO harness_marker (value) VALUES ('first')",
-        )
-        .await
-        .expect("insert isolated row");
-        assert_eq!(
-            scalar_i64(
-                second.database_url().to_owned(),
-                "SELECT count(*) FROM harness_marker",
-            )
-            .await
-            .expect("count rows in second database"),
-            0
-        );
-
-        let empty = harness
-            .empty_database()
-            .await
-            .expect("create empty database");
-        assert!(
-            !relation_exists(empty.database_url().to_owned(), "harness_marker")
-                .await
-                .expect("check marker in empty database")
-        );
-
-        let first_name = first.database_name().to_owned();
-        first
-            .cleanup()
-            .await
-            .expect("explicitly clean first database");
-        assert!(
-            !database_exists(admin_url.clone(), first_name)
-                .await
-                .expect("check explicit cleanup")
-        );
-
-        let second_name = second.database_name().to_owned();
-        drop(second);
-        harness
-            .drain_deferred_cleanup()
-            .await
-            .expect("drain Drop fallback cleanup");
-        assert!(
-            !database_exists(admin_url.clone(), second_name)
-                .await
-                .expect("check Drop fallback cleanup")
-        );
-        empty.cleanup().await.expect("clean empty database");
-    }
-
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn deferred_cleanup_terminates_active_clients_and_never_reuses_databases() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let harness = &fixture.harness;
+    let admin_url = &fixture.admin_url;
     {
         let deferred = harness
             .empty_database()
@@ -724,7 +510,15 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         );
         recreated.cleanup().await.expect("clean fresh database");
     }
+    fixture.shutdown().await;
+}
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn concurrent_template_cold_start_initializes_once() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let harness = &fixture.harness;
+    let admin_url = &fixture.admin_url;
     {
         let concurrent_spec = TemplateSpec::new(
             FingerprintBuilder::new("concurrent-schema")
@@ -788,9 +582,17 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         );
 
         drop(templates);
-        wait_until_advisory_lock_count(&admin_url, "ShareLock", shared_locks_before).await;
+        wait_until_advisory_lock_count(admin_url, "ShareLock", shared_locks_before).await;
     }
+    fixture.shutdown().await;
+}
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn template_clones_retain_locks_and_stale_cache_entries_reacquire() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let harness = &fixture.harness;
+    let admin_url = &fixture.admin_url;
     {
         let clone_fingerprint = FingerprintBuilder::new("template-clone-lock").finish();
         let clone_lock_key = advisory_key(
@@ -810,7 +612,7 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
                 .expect("check lock retained by template clone")
         );
         drop(template_clone);
-        wait_until_advisory_lock_is_acquirable(&admin_url, clone_lock_key).await;
+        wait_until_advisory_lock_is_acquirable(admin_url, clone_lock_key).await;
 
         let reacquired = tokio::time::timeout(
             Duration::from_secs(5),
@@ -827,9 +629,17 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
                 .expect("check lock retained by the reacquired template")
         );
         drop(reacquired);
-        wait_until_advisory_lock_is_acquirable(&admin_url, clone_lock_key).await;
+        wait_until_advisory_lock_is_acquirable(admin_url, clone_lock_key).await;
     }
+    fixture.shutdown().await;
+}
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn warm_template_cache_bypasses_queued_exclusive_lock() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let harness = &fixture.harness;
+    let admin_url = &fixture.admin_url;
     {
         let queued_fingerprint = FingerprintBuilder::new("queued-exclusive").finish();
         let queued_spec = TemplateSpec::new(queued_fingerprint);
@@ -904,7 +714,14 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
             .expect("reuse template after queued exclusive lock");
         drop(waiting_template);
     }
+    fixture.shutdown().await;
+}
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn initializer_failure_wakes_waiter_and_allows_recovery() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let harness = &fixture.harness;
     {
         let error_fingerprint = FingerprintBuilder::new("initializer-error-recovery").finish();
         let error_spec = TemplateSpec::new(error_fingerprint);
@@ -961,7 +778,14 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         assert_eq!(recovery_initializations.load(Ordering::SeqCst), 1);
         drop(recovered);
     }
+    fixture.shutdown().await;
+}
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn initializer_cancellation_wakes_waiter_and_allows_recovery() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let harness = &fixture.harness;
     {
         let cancellation_fingerprint =
             FingerprintBuilder::new("initializer-cancellation-recovery").finish();
@@ -1008,7 +832,14 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
             .expect("recover initializing template after cancellation");
         drop(recovered);
     }
+    fixture.shutdown().await;
+}
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn template_wait_timeout_is_separate_from_operation_timeout() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let harness = &fixture.harness;
     {
         let slow_harness = PostgresHarness::start(
             HarnessConfig::new("slow_it")
@@ -1075,7 +906,14 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         assert_eq!(first_slow.database_name(), second_slow.database_name());
         assert_eq!(slow_initializations.load(Ordering::SeqCst), 1);
     }
+    fixture.shutdown().await;
+}
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn template_finalization_terminates_lingering_initializer_connections() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let harness = &fixture.harness;
     {
         let held_client = Arc::new(Mutex::new(None));
         let held_client_for_initializer = held_client.clone();
@@ -1129,7 +967,15 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         );
         connection_clone.cleanup().await.unwrap();
     }
+    fixture.shutdown().await;
+}
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn unrecognized_deterministic_template_is_preserved() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let harness = &fixture.harness;
+    let admin_url = &fixture.admin_url;
     {
         let unknown_fingerprint = FingerprintBuilder::new("unknown-template").finish();
         let unknown_name = format!(
@@ -1156,7 +1002,14 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         );
         unknown_database.remove().await;
     }
+    fixture.shutdown().await;
+}
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn metadata_write_failure_compensates_and_evicts_poisoned_session() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let admin_url = &fixture.admin_url;
     {
         let compensation_harness = PostgresHarness::start(
             HarnessConfig::new("tag_fail_it")
@@ -1185,7 +1038,7 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         let creation_harness = compensation_harness.clone();
         let creation = tokio::spawn(async move { creation_harness.empty_database().await });
         let database_name =
-            wait_until_database_with_prefix(&admin_url, "pgh_tag_fail_it_test_").await;
+            wait_until_database_with_prefix(admin_url, "pgh_tag_fail_it_test_").await;
         let failed_session = lifecycle_admin_pids(admin_url.clone(), "tag_fail_it")
             .await
             .expect("inspect the session running the forced metadata failure");
@@ -1193,7 +1046,7 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
             failed_session, warm_session,
             "the forced timeout should run on the reused session"
         );
-        wait_until_database_statement(&admin_url, &database_name, "DROP DATABASE").await;
+        wait_until_database_statement(admin_url, &database_name, "DROP DATABASE").await;
         drop(catalog_lock);
 
         let error = creation
@@ -1212,7 +1065,7 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
                 .await
                 .expect("verify metadata compensation removed the database")
         );
-        wait_until_lifecycle_admin_session_count(&admin_url, "tag_fail_it", 0).await;
+        wait_until_lifecycle_admin_session_count(admin_url, "tag_fail_it", 0).await;
         let recovered = compensation_harness
             .empty_database()
             .await
@@ -1227,7 +1080,14 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         assert_eq!(replacement_session.len(), 1);
         assert_ne!(replacement_session, failed_session);
     }
+    fixture.shutdown().await;
+}
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn cancelled_lease_creation_removes_its_database() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let admin_url = &fixture.admin_url;
     {
         let cancellation_harness = PostgresHarness::start(
             HarnessConfig::new("cancel_lease_it")
@@ -1241,7 +1101,7 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         let creation_harness = cancellation_harness.clone();
         let creation = tokio::spawn(async move { creation_harness.empty_database().await });
         let database_name =
-            wait_until_database_with_prefix(&admin_url, "pgh_cancel_lease_it_test_").await;
+            wait_until_database_with_prefix(admin_url, "pgh_cancel_lease_it_test_").await;
 
         creation.abort();
         let join_error = creation
@@ -1249,111 +1109,16 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
             .expect_err("cancelled lease creation should not return a result");
         assert!(join_error.is_cancelled());
         drop(catalog_lock);
-        wait_until_database_is_absent(&admin_url, &database_name).await;
+        wait_until_database_is_absent(admin_url, &database_name).await;
     }
+    fixture.shutdown().await;
+}
 
-    {
-        let failure_harness = PostgresHarness::start(
-            HarnessConfig::new("cleanup_fail_it")
-                .unwrap()
-                .with_admin_database_url(admin_url.clone())
-                .with_operation_timeout(Duration::from_millis(100))
-                .unwrap()
-                .with_cleanup_on_start(false),
-        )
-        .await
-        .expect("start deferred-cleanup failure harness");
-
-        let awaited_database = failure_harness
-            .empty_database()
-            .await
-            .expect("create awaited-cleanup failure database");
-        let awaited_database_name = awaited_database.database_name().to_owned();
-        let database = failure_harness
-            .empty_database()
-            .await
-            .expect("create deferred-cleanup failure database before admission closes");
-        let database_name = database.database_name().to_owned();
-        let catalog_lock = CatalogLock::acquire(admin_url.clone()).await;
-        let error = awaited_database
-            .cleanup()
-            .await
-            .expect_err("the catalog lock should make awaited DROP time out");
-        assert!(matches!(
-            error,
-            Error::Postgres {
-                operation: "drop disposable PostgreSQL database",
-                ..
-            }
-        ));
-        wait_until_lifecycle_admin_session_count(&admin_url, "cleanup_fail_it", 0).await;
-        failure_harness
-            .drain_deferred_cleanup()
-            .await
-            .expect("a delivered awaited failure must not be repeated by drain");
-        assert!(matches!(
-            failure_harness.empty_database().await,
-            Err(Error::ConnectionBudgetClosed)
-        ));
-        drop(catalog_lock);
-        execute(
-            admin_url.clone(),
-            format!("DROP DATABASE IF EXISTS \"{awaited_database_name}\" WITH (FORCE)"),
-        )
-        .await
-        .expect("remove injected awaited-cleanup residual");
-        let template_after_terminal_admission = failure_harness
-            .template(
-                TemplateSpec::new(
-                    FingerprintBuilder::new("template-after-terminal-admission").finish(),
-                ),
-                |_| async { Ok::<_, BoxError>(()) },
-            )
-            .await;
-        assert!(matches!(
-            template_after_terminal_admission,
-            Err(Error::ConnectionBudgetClosed)
-        ));
-
-        let catalog_lock = CatalogLock::acquire(admin_url.clone()).await;
-        database
-            .defer_cleanup()
-            .await
-            .expect("admit cleanup before its injected PostgreSQL failure");
-        // The held catalog lock is the synchronization condition: the drain
-        // cannot complete successfully before PostgreSQL's statement timeout.
-        let error = tokio::time::timeout(
-            Duration::from_secs(2),
-            failure_harness.drain_deferred_cleanup(),
-        )
-        .await
-        .expect("deferred failure drain should remain bounded")
-        .expect_err("the catalog lock should make deferred DROP time out");
-        let Error::DeferredCleanup { failures, .. } = error else {
-            panic!("unexpected deferred failure: {error:?}");
-        };
-        assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].database_name(), database_name);
-        assert!(matches!(
-            failures[0].source_error(),
-            Error::Postgres {
-                operation: "drop disposable PostgreSQL database",
-                ..
-            }
-        ));
-        failure_harness
-            .drain_deferred_cleanup()
-            .await
-            .expect("a deferred failure is reported exactly once");
-        drop(catalog_lock);
-        execute(
-            admin_url.clone(),
-            format!("DROP DATABASE IF EXISTS \"{database_name}\" WITH (FORCE)"),
-        )
-        .await
-        .expect("remove injected deferred-cleanup residual");
-    }
-
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn cancelled_awaited_cleanup_finishes_in_worker() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let admin_url = &fixture.admin_url;
     {
         let cancellation_harness = PostgresHarness::start(
             HarnessConfig::new("cancel_clean_it")
@@ -1370,7 +1135,7 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
         let database_name = database.database_name().to_owned();
         let catalog_lock = CatalogLock::acquire(admin_url.clone()).await;
         let cleanup = tokio::spawn(async move { database.cleanup().await });
-        wait_until_database_statement(&admin_url, &database_name, "DROP DATABASE").await;
+        wait_until_database_statement(admin_url, &database_name, "DROP DATABASE").await;
         cleanup.abort();
         assert!(
             cleanup
@@ -1392,7 +1157,14 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
                 .expect("check cancelled awaited cleanup")
         );
     }
+    fixture.shutdown().await;
+}
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn external_harness_ignores_owned_settings_and_cleans_up_on_drop() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let admin_url = &fixture.admin_url;
     {
         let external = PostgresHarness::start(
             HarnessConfig::new("external_it")
@@ -1440,9 +1212,622 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
             .await
             .expect("defer external lifetime cleanup");
         drop(external);
-        wait_until_database_is_absent(&admin_url, &lifetime_database_name).await;
+        wait_until_database_is_absent(admin_url, &lifetime_database_name).await;
     }
+    fixture.shutdown().await;
+}
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn prewarm_validates_capacity_without_reserving_application_permits() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let admin_url = &fixture.admin_url;
+    {
+        const PROJECT: &str = "prewarm_it";
+        let prewarm_harness = PostgresHarness::start(
+            HarnessConfig::new(PROJECT)
+                .unwrap()
+                .with_admin_database_url(admin_url.clone())
+                .with_connection_budget(2)
+                .unwrap()
+                .with_connections_per_database(1)
+                .unwrap()
+                .with_cleanup_on_start(false),
+        )
+        .await
+        .expect("start prewarm regression harness");
+        let fingerprint = FingerprintBuilder::new("prewarm-main").finish();
+        let template = prewarm_harness
+            .template(TemplateSpec::new(fingerprint), |database_url| async move {
+                execute(database_url, "CREATE TABLE base_marker (value integer)").await
+            })
+            .await
+            .expect("initialize prewarm template");
+        assert!(matches!(
+            template.prewarm(0).await,
+            Err(Error::InvalidPrewarmCapacity {
+                capacity: 0,
+                max_capacity: 2,
+            })
+        ));
+        assert!(matches!(
+            template.prewarm(3).await,
+            Err(Error::InvalidPrewarmCapacity {
+                capacity: 3,
+                max_capacity: 2,
+            })
+        ));
+        let pool = template
+            .prewarm(2)
+            .await
+            .expect("fill two prewarmed database slots");
+        assert_eq!(pool.capacity(), 2);
+        let initial = pool.status();
+        assert_eq!(initial.ready(), 2);
+        assert_eq!(initial.leased(), 0);
+        assert_eq!(initial.occupied_slots(), 2);
+
+        // Idle prewarmed databases do not reserve application permits: the
+        // same two-permit harness can still admit two ordinary databases.
+        let direct_first = prewarm_harness
+            .empty_database()
+            .await
+            .expect("lease first ordinary database beside idle prewarm slots");
+        let direct_second =
+            tokio::time::timeout(Duration::from_secs(5), prewarm_harness.empty_database())
+                .await
+                .expect("idle prewarm slots must not exhaust application admission")
+                .expect("lease second ordinary database beside idle prewarm slots");
+        direct_first.cleanup().await.expect("clean direct database");
+        direct_second
+            .cleanup()
+            .await
+            .expect("clean direct database");
+        assert_eq!(pool.status().ready(), 2);
+
+        pool.shutdown()
+            .await
+            .expect("drop idle prewarmed databases");
+    }
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn prewarm_exhaustion_backpressures_and_cancelled_waiters_release_cleanly() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let admin_url = &fixture.admin_url;
+    {
+        const PROJECT: &str = "prewarm_it";
+        let prewarm_harness = PostgresHarness::start(
+            HarnessConfig::new(PROJECT)
+                .unwrap()
+                .with_admin_database_url(admin_url.clone())
+                .with_connection_budget(2)
+                .unwrap()
+                .with_connections_per_database(1)
+                .unwrap()
+                .with_cleanup_on_start(false),
+        )
+        .await
+        .expect("start prewarm regression harness");
+        let fingerprint = FingerprintBuilder::new("prewarm-main").finish();
+        let template = prewarm_harness
+            .template(TemplateSpec::new(fingerprint), |database_url| async move {
+                execute(database_url, "CREATE TABLE base_marker (value integer)").await
+            })
+            .await
+            .expect("initialize prewarm template");
+        let pool = template
+            .prewarm(2)
+            .await
+            .expect("fill two prewarmed database slots");
+        let first = pool
+            .database()
+            .await
+            .expect("lease first prewarmed database");
+        let first_name = first.database_name().to_owned();
+        let second = pool
+            .database()
+            .await
+            .expect("lease second prewarmed database");
+        let second_name = second.database_name().to_owned();
+        assert_ne!(first_name, second_name);
+        execute(
+            first.database_url().to_owned(),
+            "CREATE TABLE contaminated (value integer)",
+        )
+        .await
+        .expect("dirty one prewarmed lease");
+
+        let cancelled_pool = pool.clone();
+        let cancelled_waiter = tokio::spawn(async move { cancelled_pool.database().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !cancelled_waiter.is_finished(),
+            "an exhausted queue must wait"
+        );
+        cancelled_waiter.abort();
+        assert!(cancelled_waiter.await.unwrap_err().is_cancelled());
+        assert_eq!(pool.status().leased(), 2);
+        assert_eq!(pool.status().ready(), 0);
+
+        first.defer_cleanup().await.expect("return first lease");
+        second.defer_cleanup().await.expect("return second lease");
+        prewarm_harness
+            .drain_deferred_cleanup()
+            .await
+            .expect("refill returned slots");
+        pool.shutdown().await.expect("drop refilled databases");
+    }
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn prewarm_dirty_return_refills_with_a_fresh_database_and_wakes_waiter() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let admin_url = &fixture.admin_url;
+    {
+        const PROJECT: &str = "prewarm_it";
+        let prewarm_harness = PostgresHarness::start(
+            HarnessConfig::new(PROJECT)
+                .unwrap()
+                .with_admin_database_url(admin_url.clone())
+                .with_connection_budget(2)
+                .unwrap()
+                .with_connections_per_database(1)
+                .unwrap()
+                .with_cleanup_on_start(false),
+        )
+        .await
+        .expect("start prewarm regression harness");
+        let fingerprint = FingerprintBuilder::new("prewarm-main").finish();
+        let template = prewarm_harness
+            .template(TemplateSpec::new(fingerprint), |database_url| async move {
+                execute(database_url, "CREATE TABLE base_marker (value integer)").await
+            })
+            .await
+            .expect("initialize prewarm template");
+        let pool = template
+            .prewarm(2)
+            .await
+            .expect("fill two prewarmed database slots");
+        let first = pool
+            .database()
+            .await
+            .expect("lease first prewarmed database");
+        let first_name = first.database_name().to_owned();
+        let second = pool
+            .database()
+            .await
+            .expect("lease second prewarmed database");
+        let second_name = second.database_name().to_owned();
+        assert_ne!(first_name, second_name);
+        execute(
+            first.database_url().to_owned(),
+            "CREATE TABLE contaminated (value integer)",
+        )
+        .await
+        .expect("dirty one prewarmed lease");
+
+        let waiting_pool = pool.clone();
+        let waiting_lease = tokio::spawn(async move { waiting_pool.database().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !waiting_lease.is_finished(),
+            "queue exhaustion must backpressure"
+        );
+        first
+            .defer_cleanup()
+            .await
+            .expect("return dirty lease to background refill");
+        prewarm_harness
+            .drain_deferred_cleanup()
+            .await
+            .expect("drain dirty drop and distinct replacement creation");
+        let replacement = tokio::time::timeout(Duration::from_secs(5), waiting_lease)
+            .await
+            .expect("a completed refill must wake one queue waiter")
+            .expect("queue waiter must not panic")
+            .expect("lease the freshly refilled database");
+        assert_ne!(replacement.database_name(), first_name);
+        assert_ne!(replacement.database_name(), second_name);
+        assert!(
+            !relation_exists(replacement.database_url().to_owned(), "contaminated")
+                .await
+                .expect("inspect replacement database"),
+            "a dirty database must never be reset and reused"
+        );
+        assert!(
+            relation_exists(replacement.database_url().to_owned(), "base_marker")
+                .await
+                .expect("inspect replacement template contents")
+        );
+
+        second
+            .defer_cleanup()
+            .await
+            .expect("return second prewarmed lease");
+        replacement
+            .defer_cleanup()
+            .await
+            .expect("return replacement lease");
+        prewarm_harness
+            .drain_deferred_cleanup()
+            .await
+            .expect("refill both returned slots");
+        let refilled = pool.status();
+        assert_eq!(refilled.ready(), 2);
+        assert_eq!(refilled.leased(), 0);
+        assert_eq!(refilled.creating(), 0);
+        assert_eq!(refilled.deleting(), 0);
+        assert_eq!(refilled.occupied_slots(), 2);
+        pool.shutdown().await.expect("drop refilled databases");
+    }
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn prewarm_pools_are_template_isolated_and_retain_the_source_lock() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let admin_url = &fixture.admin_url;
+    {
+        const PROJECT: &str = "prewarm_it";
+        let prewarm_harness = PostgresHarness::start(
+            HarnessConfig::new(PROJECT)
+                .unwrap()
+                .with_admin_database_url(admin_url.clone())
+                .with_connection_budget(2)
+                .unwrap()
+                .with_connections_per_database(1)
+                .unwrap()
+                .with_cleanup_on_start(false),
+        )
+        .await
+        .expect("start prewarm regression harness");
+        let fingerprint = FingerprintBuilder::new("prewarm-main").finish();
+        let lock_key = advisory_key("template", &format!("{PROJECT}:{}", fingerprint.to_hex()));
+        let template = prewarm_harness
+            .template(TemplateSpec::new(fingerprint), |database_url| async move {
+                execute(database_url, "CREATE TABLE base_marker (value integer)").await
+            })
+            .await
+            .expect("initialize prewarm template");
+        let pool = template
+            .prewarm(2)
+            .await
+            .expect("fill two prewarmed database slots");
+        let other_template = prewarm_harness
+            .template(
+                TemplateSpec::new(FingerprintBuilder::new("prewarm-other").finish()),
+                |database_url| async move {
+                    execute(database_url, "CREATE TABLE other_marker (value integer)").await
+                },
+            )
+            .await
+            .expect("initialize a second prewarm template");
+        let other_pool = other_template
+            .prewarm(1)
+            .await
+            .expect("fill an independent template queue");
+        let other = other_pool
+            .database()
+            .await
+            .expect("lease from second template queue");
+        assert!(
+            relation_exists(other.database_url().to_owned(), "other_marker")
+                .await
+                .expect("inspect second-template lease")
+        );
+        assert!(
+            !relation_exists(other.database_url().to_owned(), "base_marker")
+                .await
+                .expect("inspect second-template isolation")
+        );
+        other
+            .defer_cleanup()
+            .await
+            .expect("return second-template lease");
+        prewarm_harness
+            .drain_deferred_cleanup()
+            .await
+            .expect("refill second-template queue");
+        other_pool
+            .shutdown()
+            .await
+            .expect("drop and drain second-template idle database");
+
+        drop(template);
+        assert!(
+            !advisory_lock_is_acquirable(admin_url.clone(), lock_key)
+                .await
+                .expect("inspect template lock retained by prewarm pool"),
+            "the pool must retain its source template shared lock"
+        );
+        pool.shutdown()
+            .await
+            .expect("drop and drain all idle prewarmed databases");
+        assert_eq!(
+            scalar_i64(
+                admin_url.clone(),
+                "SELECT count(*) FROM pg_database WHERE datname LIKE 'pgh_prewarm_it_test_%'",
+            )
+            .await
+            .expect("count residual prewarm databases"),
+            0
+        );
+        wait_until_advisory_lock_is_acquirable(admin_url, lock_key).await;
+    }
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn ready_templates_are_reused_and_support_repeated_disposable_databases() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let harness = &fixture.harness;
+    {
+        let spec = TemplateSpec::new(
+            FingerprintBuilder::new("integration-schema")
+                .add(
+                    "0001-create-marker",
+                    "CREATE TABLE harness_marker (value text NOT NULL)",
+                )
+                .finish(),
+        );
+        let template = harness
+            .template(spec, |database_url| async move {
+                execute(
+                    database_url,
+                    "CREATE TABLE harness_marker (value text NOT NULL)",
+                )
+                .await
+            })
+            .await
+            .expect("initialize template");
+        let reused = harness
+            .template(spec, |_| async move {
+                Err(std::io::Error::other("ready template initializer must not run").into())
+            })
+            .await
+            .expect("reuse ready template");
+        assert_eq!(template.database_name(), reused.database_name());
+
+        for iteration in 0..16 {
+            let database = template.database().await.unwrap_or_else(|error| {
+                panic!("create repeated disposable database {iteration}: {error}")
+            });
+            assert!(
+                relation_exists(database.database_url().to_owned(), "harness_marker")
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("query repeated disposable database {iteration}: {error}")
+                    })
+            );
+            database.cleanup().await.unwrap_or_else(|error| {
+                panic!("clean repeated disposable database {iteration}: {error}")
+            });
+        }
+        drop(reused);
+        drop(template);
+    }
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn template_clones_are_isolated_and_support_explicit_and_deferred_cleanup() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let harness = &fixture.harness;
+    let admin_url = &fixture.admin_url;
+    {
+        let spec = TemplateSpec::new(
+            FingerprintBuilder::new("integration-schema")
+                .add(
+                    "0001-create-marker",
+                    "CREATE TABLE harness_marker (value text NOT NULL)",
+                )
+                .finish(),
+        );
+        let template = harness
+            .template(spec, |database_url| async move {
+                execute(
+                    database_url,
+                    "CREATE TABLE harness_marker (value text NOT NULL)",
+                )
+                .await
+            })
+            .await
+            .expect("initialize template");
+        let first = template.database().await.expect("clone first database");
+        let second = template.database().await.expect("clone second database");
+        execute(
+            first.database_url().to_owned(),
+            "INSERT INTO harness_marker (value) VALUES ('first')",
+        )
+        .await
+        .expect("insert isolated row");
+        assert_eq!(
+            scalar_i64(
+                second.database_url().to_owned(),
+                "SELECT count(*) FROM harness_marker",
+            )
+            .await
+            .expect("count rows in second database"),
+            0
+        );
+
+        let empty = harness
+            .empty_database()
+            .await
+            .expect("create empty database");
+        assert!(
+            !relation_exists(empty.database_url().to_owned(), "harness_marker")
+                .await
+                .expect("check marker in empty database")
+        );
+
+        let first_name = first.database_name().to_owned();
+        first
+            .cleanup()
+            .await
+            .expect("explicitly clean first database");
+        assert!(
+            !database_exists(admin_url.clone(), first_name)
+                .await
+                .expect("check explicit cleanup")
+        );
+
+        let second_name = second.database_name().to_owned();
+        drop(second);
+        harness
+            .drain_deferred_cleanup()
+            .await
+            .expect("drain Drop fallback cleanup");
+        assert!(
+            !database_exists(admin_url.clone(), second_name)
+                .await
+                .expect("check Drop fallback cleanup")
+        );
+        empty.cleanup().await.expect("clean empty database");
+        drop(template);
+    }
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn awaited_cleanup_failure_closes_admission_and_is_reported_once() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let admin_url = &fixture.admin_url;
+    {
+        let failure_harness = PostgresHarness::start(
+            HarnessConfig::new("cleanup_fail_it")
+                .unwrap()
+                .with_admin_database_url(admin_url.clone())
+                .with_operation_timeout(Duration::from_millis(100))
+                .unwrap()
+                .with_cleanup_on_start(false),
+        )
+        .await
+        .expect("start deferred-cleanup failure harness");
+
+        let awaited_database = failure_harness
+            .empty_database()
+            .await
+            .expect("create awaited-cleanup failure database");
+        let awaited_database_name = awaited_database.database_name().to_owned();
+        let catalog_lock = CatalogLock::acquire(admin_url.clone()).await;
+        let error = awaited_database
+            .cleanup()
+            .await
+            .expect_err("the catalog lock should make awaited DROP time out");
+        assert!(matches!(
+            error,
+            Error::Postgres {
+                operation: "drop disposable PostgreSQL database",
+                ..
+            }
+        ));
+        wait_until_lifecycle_admin_session_count(admin_url, "cleanup_fail_it", 0).await;
+        failure_harness
+            .drain_deferred_cleanup()
+            .await
+            .expect("a delivered awaited failure must not be repeated by drain");
+        assert!(matches!(
+            failure_harness.empty_database().await,
+            Err(Error::ConnectionBudgetClosed)
+        ));
+        drop(catalog_lock);
+        execute(
+            admin_url.clone(),
+            format!("DROP DATABASE IF EXISTS \"{awaited_database_name}\" WITH (FORCE)"),
+        )
+        .await
+        .expect("remove injected awaited-cleanup residual");
+        let template_after_terminal_admission = failure_harness
+            .template(
+                TemplateSpec::new(
+                    FingerprintBuilder::new("template-after-terminal-admission").finish(),
+                ),
+                |_| async { Ok::<_, BoxError>(()) },
+            )
+            .await;
+        assert!(matches!(
+            template_after_terminal_admission,
+            Err(Error::ConnectionBudgetClosed)
+        ));
+    }
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn deferred_cleanup_failure_is_bounded_and_reported_once() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let admin_url = &fixture.admin_url;
+    {
+        let failure_harness = PostgresHarness::start(
+            HarnessConfig::new("cleanup_fail_it")
+                .unwrap()
+                .with_admin_database_url(admin_url.clone())
+                .with_operation_timeout(Duration::from_millis(100))
+                .unwrap()
+                .with_cleanup_on_start(false),
+        )
+        .await
+        .expect("start deferred-cleanup failure harness");
+        let database = failure_harness
+            .empty_database()
+            .await
+            .expect("create deferred-cleanup failure database before admission closes");
+        let database_name = database.database_name().to_owned();
+        let catalog_lock = CatalogLock::acquire(admin_url.clone()).await;
+        database
+            .defer_cleanup()
+            .await
+            .expect("admit cleanup before its injected PostgreSQL failure");
+        // The held catalog lock is the synchronization condition: the drain
+        // cannot complete successfully before PostgreSQL's statement timeout.
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            failure_harness.drain_deferred_cleanup(),
+        )
+        .await
+        .expect("deferred failure drain should remain bounded")
+        .expect_err("the catalog lock should make deferred DROP time out");
+        let Error::DeferredCleanup { failures, .. } = error else {
+            panic!("unexpected deferred failure: {error:?}");
+        };
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].database_name(), database_name);
+        assert!(matches!(
+            failures[0].source_error(),
+            Error::Postgres {
+                operation: "drop disposable PostgreSQL database",
+                ..
+            }
+        ));
+        failure_harness
+            .drain_deferred_cleanup()
+            .await
+            .expect("a deferred failure is reported exactly once");
+        drop(catalog_lock);
+        execute(
+            admin_url.clone(),
+            format!("DROP DATABASE IF EXISTS \"{database_name}\" WITH (FORCE)"),
+        )
+        .await
+        .expect("remove injected deferred-cleanup residual");
+    }
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
+async fn owned_shutdown_is_idempotent_and_wakes_all_waiters() {
     {
         let shutdown_harness = PostgresHarness::start(
             HarnessConfig::new("shutdown_it")
@@ -1516,12 +1901,6 @@ async fn postgres_lifecycle_regressions_work_end_to_end() {
             Err(Error::CleanupQueueClosed)
         ));
     }
-
-    harness
-        .shutdown()
-        .await
-        .expect("remove owned PostgreSQL container");
-    wait_until_container_is_absent(&container_id).await;
 }
 
 #[tokio::test]

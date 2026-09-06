@@ -84,6 +84,30 @@ adapter has a golden fingerprint test so reordering or changing a listed input
 is visible. Completeness review must also add every newly introduced migration
 or schema-shaping input to that explicit list.
 
+## Reuse a small set of scenarios
+
+Cache frequently used populated templates alongside the migrated root in the
+suite adapter. For example, derive an organization-and-users fixture once,
+branch into active and cancelled subscriptions, and derive an overdue case
+from the active branch. Each test leases a fresh clone of its selected leaf.
+The [scenario example](../examples/derived_scenarios.rs) implements this with
+fixed inputs and the public API in both feature modes.
+
+A child's local spec hashes only its actual setup inputs; `derive` composes it
+with the parent automatically. Keep SQL/data inputs stable and include a setup
+revision when Rust logic changes the output. A changed migration then
+invalidates downstream scenarios naturally. Cache-hit callbacks are skipped,
+and interrupted initialization can retry, so per-test work belongs in a lease.
+
+Choose scenarios reused by many tests. Per-test IDs, timestamps, or random
+fingerprints produce extra full database copies and lock sessions without
+amortizing construction. Shared fixtures can save repeated setup across
+branches, but extra intermediate copies may cost more than a cheap SQL seed.
+Count every intermediate template's storage and measure construction plus test
+lifecycles and final drain, alongside warm acquisition. Database settings,
+database-level grants, cluster roles, and external side effects are not a
+portable inherited fixture payload.
+
 ## Size permits from real application capacity
 
 Let:

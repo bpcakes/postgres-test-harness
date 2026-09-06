@@ -147,6 +147,43 @@ administrative-operation timeout does not make a caller fail while a real
 migration suite is still running. Override it with
 `HarnessConfig::with_template_wait_timeout` when needed.
 
+### Derived scenario templates
+
+`DatabaseTemplate::derive(step_spec, initializer)` copies the parent's sealed
+database, applies the local setup step, then seals and caches the child. The
+step spec describes only the local inputs. The returned `fingerprint()` is the
+complete composed identity, including every ancestor. Changing a parent's
+inputs therefore changes its descendants without callers restating ancestry.
+
+Schema, table data, sequences, and other database-local objects are copied.
+Database-level grants and settings are not inherited as scenario payload;
+cluster-wide roles and external side effects are outside this mechanism. Every
+child consumes full database storage. Count intermediate templates as well as
+leaves when sizing disk or tmpfs capacity. Each live template adds one retained
+shared-lock session outside the application connection budget; cold setup also
+needs temporary administration and initializer connections.
+
+The parent stays protected while child preparation copies and tags its source,
+even if the awaiting caller is cancelled and its blocking worker continues.
+Ordinary leases and initial prewarm copies have the same source protection.
+After creation, the child, lease, or pool needs no ancestor chain: a completed
+child remains usable after stale cleanup removes an unused parent. A prewarm
+pool retains its own child source and refills dirty slots from that scenario.
+
+A cache hit skips the initializer. An error, panic, or cancellation can require
+a later attempt to run it again from a fresh parent copy; setup must tolerate
+retries and must close its application connections before returning. Failed
+abort cleanup preserves both the initializer error and the cleanup error.
+Interrupted work may leave a tagged initializing template for a later retry or
+stale sweep. `drain_deferred_cleanup` covers disposable lifecycle work, not
+these interrupted templates. A child already published as ready in PostgreSQL
+can be reused even if the caller never received the completed handle.
+
+Terminal admission closure rejects cold derived creation and new disposable
+leases. A warm cached template handle can still be returned under the existing
+cache contract. External `shutdown` remains a no-op; drain disposables before
+tearing down an externally managed server.
+
 ## Prewarmed disposable databases
 
 For suites whose test bodies are shorter than a template clone, call

@@ -126,6 +126,48 @@ than starting them in every test. The
 including error-preserving teardown and an empty-database path for migration
 tests.
 
+## Cached scenarios
+
+Derive a populated template from another immutable template. The local step
+spec fingerprints the setup SQL; `derive` incorporates the parent's complete
+identity automatically:
+
+```rust,no_run
+# use postgres_test_harness::{BoxError, DatabaseTemplate, FingerprintBuilder, TemplateSpec};
+# async fn seeded_widgets(root: &DatabaseTemplate) -> Result<DatabaseTemplate, BoxError> {
+const SEED: &str = "INSERT INTO widgets (name) VALUES ('example')";
+let step = TemplateSpec::new(
+    FingerprintBuilder::new("widgets-fixture-v1").add("seed.sql", SEED).finish(),
+);
+let seeded = root.derive(step, |url| async move {
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
+    let connection = tokio::spawn(connection);
+    let setup = client.batch_execute(SEED).await;
+    drop(client);
+    let closed = connection.await;
+    setup?;
+    closed??;
+    Ok(())
+}).await?;
+let database = seeded.database().await?;
+// Use the populated clone, then close application clients before cleanup.
+database.cleanup().await?;
+# Ok(seeded)
+# }
+```
+
+The [runnable scenario example](examples/derived_scenarios.rs) builds an
+organization fixture, active/cancelled subscription branches, and an overdue
+descendant. It checks exact data, demonstrates clone isolation, and preserves
+errors during teardown. Run `cargo run --example derived_scenarios`, or set
+`POSTGRES_TEST_ADMIN_URL` and add `--no-default-features`.
+
+Cache hits skip setup. Failed attempts may run setup again. Hash every input
+that shapes it, including a revision for Rust setup behavior that SQL bytes do
+not describe; closures are not automatically fingerprinted. Each derived
+template is a full PostgreSQL database copy and each live template holds a lock
+session. Reuse a small set of stable scenarios across tests.
+
 ## How it works
 
 1. `PostgresHarness::start` starts an owned PostgreSQL container, unless an

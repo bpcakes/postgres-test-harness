@@ -1,6 +1,9 @@
 use super::*;
 use postgres_test_harness::DatabaseTemplate;
 
+#[path = "derived/recovery.rs"]
+mod recovery;
+
 const PARENT_SQL: &str = "CREATE TABLE scenario (id integer PRIMARY KEY, value text NOT NULL); \
     INSERT INTO scenario VALUES (1, 'organization'), (2, 'active'), (3, 'invoice')";
 const CHILD_SQL: &str = "UPDATE scenario SET value = 'cancelled' WHERE id = 2; \

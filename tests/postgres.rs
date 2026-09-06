@@ -2298,6 +2298,7 @@ impl HeldClient {
 }
 
 struct CatalogLock {
+    pid: i32,
     release: Option<Sender<()>>,
     worker: Option<JoinHandle<()>>,
 }
@@ -2396,17 +2397,18 @@ impl CatalogLock {
         let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
         let (release_sender, release_receiver) = mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let result = (|| -> Result<Client, postgres::Error> {
+            let result = (|| -> Result<(Client, i32), postgres::Error> {
                 let mut client = Client::connect(&admin_url, NoTls)?;
                 client.batch_execute(
                     "BEGIN; \
                      LOCK TABLE pg_catalog.pg_shdescription IN ACCESS EXCLUSIVE MODE",
                 )?;
-                Ok(client)
+                let pid = client.query_one("SELECT pg_backend_pid()", &[])?.get(0);
+                Ok((client, pid))
             })();
             match result {
-                Ok(mut client) => {
-                    let _ = ready_sender.send(Ok(()));
+                Ok((mut client, pid)) => {
+                    let _ = ready_sender.send(Ok(pid));
                     let _ = release_receiver.recv();
                     let _ = client.batch_execute("ROLLBACK");
                 }
@@ -2415,11 +2417,12 @@ impl CatalogLock {
                 }
             }
         });
-        ready_receiver
+        let pid = ready_receiver
             .await
             .expect("catalog-lock worker stopped before ready")
             .expect("lock shared-description catalog");
         Self {
+            pid,
             release: Some(release_sender),
             worker: Some(worker),
         }

@@ -90,3 +90,60 @@ async fn external_only_lifecycle_works_end_to_end() {
         .await
         .expect("drain external-server cleanup");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires POSTGRES_TEST_ADMIN_URL for a PostgreSQL 18 admin database"]
+async fn external_only_derived_scenario_survives_no_op_shutdown() {
+    let harness = PostgresHarness::start(
+        HarnessConfig::new("external_derived")
+            .unwrap()
+            .with_cleanup_on_start(false),
+    )
+    .await
+    .expect("attach the configured external PostgreSQL server");
+    let root_sql = "CREATE TABLE scenario (id integer PRIMARY KEY, state text NOT NULL); \
+                    INSERT INTO scenario VALUES (1, 'active')";
+    let child_sql = "UPDATE scenario SET state = 'cancelled' WHERE id = 1";
+    let spec = |sql| {
+        TemplateSpec::new(
+            FingerprintBuilder::new("external-derived-v1")
+                .add("setup.sql", sql)
+                .finish(),
+        )
+    };
+    let root = harness
+        .template(spec(root_sql), |url| external_execute(url, root_sql))
+        .await
+        .unwrap();
+    let child = root
+        .derive(spec(child_sql), |url| external_execute(url, child_sql))
+        .await
+        .unwrap();
+    for after_shutdown in [false, true] {
+        if after_shutdown {
+            harness.shutdown().await.unwrap();
+        }
+        let database = child.database().await.unwrap();
+        let url = database.database_url().to_owned();
+        let rows = tokio::task::spawn_blocking(move || {
+            let mut client = postgres::Client::connect(&url, postgres::NoTls)?;
+            client.query("SELECT id, state FROM scenario ORDER BY id", &[])
+        })
+        .await
+        .unwrap();
+        database.cleanup().await.unwrap();
+        let rows = rows.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<_, i32>(0), 1);
+        assert_eq!(rows[0].get::<_, String>(1), "cancelled");
+    }
+    harness.drain_deferred_cleanup().await.unwrap();
+}
+
+async fn external_execute(url: String, sql: &'static str) -> Result<(), BoxError> {
+    tokio::task::spawn_blocking(move || {
+        postgres::Client::connect(&url, postgres::NoTls)?.batch_execute(sql)
+    })
+    .await??;
+    Ok(())
+}

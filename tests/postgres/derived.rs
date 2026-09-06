@@ -1,6 +1,10 @@
+use std::future::Future;
+
 use super::*;
 use postgres_test_harness::DatabaseTemplate;
 
+#[path = "derived/lifetime.rs"]
+mod lifetime;
 #[path = "derived/recovery.rs"]
 mod recovery;
 
@@ -182,4 +186,40 @@ async fn derived_warm_acquisition_skips_database_work_and_initializer() {
     exclusive.wait_until_acquired().await;
     exclusive.release();
     fixture.shutdown().await;
+}
+
+async fn bounded<F: Future>(future: F) -> F::Output {
+    tokio::time::timeout(Duration::from_secs(10), future)
+        .await
+        .expect("derived lifecycle operation should finish within its test deadline")
+}
+
+async fn wait_for_lock_blocker(admin_url: &str, blocker: i32, comment: Option<(&str, &str)>) {
+    let child = comment.map(|(name, _)| name.to_owned());
+    let marker = comment.map(|(_, marker)| marker.to_owned());
+    bounded(async {
+        loop {
+            let child = child.clone();
+            let marker = marker.clone();
+            let waiting = with_client(admin_url.to_owned(), move |client| {
+                Ok(client
+                    .query_one(
+                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
+                     WHERE state = 'active' AND wait_event_type = 'Lock' \
+                     AND $1 = ANY(pg_blocking_pids(pid)) \
+                     AND ($2::text IS NULL OR (query LIKE 'COMMENT ON DATABASE %' \
+                     AND strpos(query, $2) > 0 AND strpos(query, $3) > 0)))",
+                        &[&blocker, &child, &marker],
+                    )?
+                    .get::<_, bool>(0))
+            })
+            .await
+            .unwrap();
+            if waiting {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
 }

@@ -3,12 +3,6 @@ use std::future::{Future, poll_fn};
 use super::*;
 use tokio::{sync::oneshot, task::JoinHandle as Task};
 
-async fn bounded<F: Future>(future: F) -> F::Output {
-    tokio::time::timeout(Duration::from_secs(10), future)
-        .await
-        .expect("derived lifecycle operation should finish within its test deadline")
-}
-
 fn registered_waiter<F>(future: F) -> (Task<F::Output>, oneshot::Receiver<()>)
 where
     F: Future + Send + 'static,
@@ -272,34 +266,6 @@ async fn derived_cancelled_waiter_leaves_winning_initializer_running() {
     fixture.shutdown().await;
 }
 
-async fn wait_for_lock_blocker(admin_url: &str, blocker: i32, ready_child: Option<&str>) {
-    let child = ready_child.map(str::to_owned);
-    bounded(async {
-        loop {
-            let child = child.clone();
-            let waiting = with_client(admin_url.to_owned(), move |client| {
-                Ok(client
-                    .query_one(
-                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
-                     WHERE state = 'active' AND wait_event_type = 'Lock' \
-                     AND $1 = ANY(pg_blocking_pids(pid)) \
-                     AND ($2::text IS NULL OR (query LIKE 'COMMENT ON DATABASE %' \
-                     AND strpos(query, $2) > 0 AND strpos(query, 'state=ready') > 0)))",
-                        &[&blocker, &child],
-                    )?
-                    .get::<_, bool>(0))
-            })
-            .await
-            .unwrap();
-            if waiting {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await;
-}
-
 async fn child_metadata(admin_url: &str, name: &str) -> Option<(bool, String)> {
     let name = name.to_owned();
     with_client(admin_url.to_owned(), move |client| {
@@ -440,7 +406,12 @@ async fn derived_abandoned_finalization_reuses_catalog_ready_child() {
     let (task, release) = gated_build(parent.clone(), spec).await;
     let catalog = CatalogLock::acquire(fixture.admin_url.clone()).await;
     release.send(BuildAction::Complete).ok().unwrap();
-    wait_for_lock_blocker(&fixture.admin_url, catalog.pid, Some(&name)).await;
+    wait_for_lock_blocker(
+        &fixture.admin_url,
+        catalog.pid,
+        Some((&name, "state=ready")),
+    )
+    .await;
     task.abort();
     assert!(bounded(task).await.err().unwrap().is_cancelled());
     drop(catalog);

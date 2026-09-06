@@ -111,7 +111,7 @@ impl PostgresHarness {
 
     /// Creates a pristine database from PostgreSQL's built-in `template0`.
     pub async fn empty_database(&self) -> Result<DatabaseLease> {
-        create_test_database(self.server.clone(), "template0").await
+        create_test_database(self.server.clone(), TemplateSource::Empty).await
     }
 
     /// Gets or initializes one immutable, content-addressed template database.
@@ -202,7 +202,11 @@ impl DatabaseTemplate {
     }
 
     pub async fn database(&self) -> Result<DatabaseLease> {
-        create_test_database(self.inner.server().clone(), self.inner.name().as_str()).await
+        create_test_database(
+            self.inner.server().clone(),
+            TemplateSource::Template(self.inner.clone()),
+        )
+        .await
     }
 
     /// Creates and fills an opt-in bounded queue of pristine disposable databases.
@@ -230,7 +234,7 @@ impl DatabaseTemplate {
             let creation = pool.inner.begin_creation()?;
             let prepared = create_unpublished_database(
                 self.inner.server().clone(),
-                self.inner.name().as_str().to_owned(),
+                TemplateSource::Template(self.inner.clone()),
             )
             .await;
             match prepared {
@@ -1312,10 +1316,9 @@ fn template_record_is_ready(
 
 async fn create_test_database(
     server: Arc<ServerInner>,
-    template_name: &str,
+    source: TemplateSource,
 ) -> Result<DatabaseLease> {
     let permit = server.acquire_database_permit().await?;
-    let template_name = template_name.to_owned();
     let name = DatabaseName::test(&server.project);
     let database_url = server.admin_url.database_url(&name);
     run_blocking(move || {
@@ -1324,11 +1327,12 @@ async fn create_test_database(
                 .create_managed_database_classified(
                     client,
                     &name,
-                    &template_name,
+                    source.name(),
                     &ResourceMetadata::test(server.project.clone(), server.owner_key),
                 )
                 .map_err(ManagedDatabaseCreationFailure::into_error)
         })?;
+        drop(source);
         Ok(DatabaseLease {
             inner: Some(DatabaseLeaseInner {
                 server,
@@ -1344,7 +1348,7 @@ async fn create_test_database(
 
 async fn create_unpublished_database(
     server: Arc<ServerInner>,
-    template_name: String,
+    source: TemplateSource,
 ) -> Result<UnpublishedDatabase> {
     run_blocking(move || {
         let name = DatabaseName::test(&server.project);
@@ -1354,11 +1358,12 @@ async fn create_unpublished_database(
                 .create_managed_database_classified(
                     client,
                     &name,
-                    &template_name,
+                    source.name(),
                     &ResourceMetadata::test(server.project.clone(), server.owner_key),
                 )
                 .map_err(ManagedDatabaseCreationFailure::into_error)
         })?;
+        drop(source);
         Ok(UnpublishedDatabase {
             server,
             prepared: Some(PreparedDatabase { name, database_url }),

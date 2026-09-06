@@ -1,5 +1,8 @@
 # Performance baseline
 
+The latest scenario reuse comparison is the [schema-v9 measurement below](#derived-scenarios-schema-v9-2026-09-06). Earlier sections preserve historical
+workloads and are not directly comparable to that run.
+
 This baseline characterizes the production library at commit
 `667557a5bd7ba58dd51a05535552bd3c6a961fc7`. The schema-v3 naming and
 documentation changes were uncommitted when it ran, so the JSON correctly
@@ -417,3 +420,90 @@ The ignored external-only lifecycle test also attached to a separately started
 PostgreSQL 18.1 container, created a template and disposable databases, cleaned
 them, and confirmed external `shutdown` remained a no-op; the temporary
 container was removed after validation.
+
+## Derived scenarios: schema v9 (2026-09-06)
+
+Three release-mode samples ran in each server mode with 50,000 shared rows,
+two branches, and four test lifecycles per branch. A second three-sample owned
+run used one shared row to expose the cost of caching cheap setup. Every sample
+validated all branch rows and actual setup counts. Strategy order rotated
+across the three samples. There were no latency thresholds.
+
+All reports identify base revision
+`c0b1bffbdc84f35a92fe935590d987de6620569d` and
+`git_worktree_dirty: true`: the DT6 benchmark/report changes recorded with this
+section were uncommitted during measurement. Production `src/` matched that
+revision. The benchmark source was unchanged across these runs.
+
+| Property | Value |
+| --- | --- |
+| PostgreSQL | 18.6, Debian `18.6-1.pgdg13+2` (`180006`) |
+| Image | `postgres:18`, content ID `sha256:a6638641707cdf047e5d5c2781f437e2e809323cab22c70b280be8389fbb7878` |
+| Host | Linux x86-64, 64 logical CPUs; shared development host |
+| Data storage | 1 GiB tmpfs under `/var/lib/postgresql` in both modes; Docker daemon uses `overlay2` |
+| Initialization | `POSTGRES_INITDB_ARGS=--no-sync` in both modes |
+| Runtime settings | `fsync=off`, `synchronous_commit=off`, `full_page_writes=off`, checksums on, `wal_level=replica` |
+| Capacity | `max_connections=300`, zero reserved and three superuser-reserved slots; harness budget 120, reservation 11, maximum ten leases |
+| Other benchmark phases | Default settings: four sequential operations, eight concurrent operations at four, four drain databases, ten eager application connections per pool, four prewarm slots |
+| Projects | Owned `pghp_41bb23242df`; external `pghp_1212f1951bc`; one-row owned `pghp_8710fd9955f` |
+
+The external endpoint was a separate task-owned container provisioned with the
+same image, tmpfs, initialization option, and runtime settings as the owned
+profile. External-mode configuration correctly reports no harness-applied owned
+profile; its storage field records the operator-supplied tmpfs provenance.
+The containers were run sequentially for these measurements. Ambient host load
+was not controlled, so small differences require additional trials.
+
+Cold-to-finished totals below include template construction, eight complete
+test lifecycles, and final disposable drain. Construction is a subset of the
+total. Warm acquisitions and storage observations are excluded diagnostics.
+
+| Mode / rows | Strategy | Construction median ms | Total min ms | Total median ms | Total mean ms | Total max ms | Template bytes |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Owned / 50,000 | `per_test` | 51.998 | 1608.855 | 1680.765 | 1671.858 | 1725.955 | 7,886,527 |
+| Owned / 50,000 | `flat_cached` | 428.265 | 862.810 | 862.942 | 868.723 | 880.416 | 33,484,158 |
+| Owned / 50,000 | `derived` | 371.235 | 796.670 | 835.169 | 847.900 | 911.861 | 58,112,764 |
+| External / 50,000 | `per_test` | 45.168 | 1669.905 | 1674.435 | 1673.230 | 1675.350 | 7,886,527 |
+| External / 50,000 | `flat_cached` | 411.727 | 840.049 | 843.209 | 844.823 | 851.212 | 33,484,158 |
+| External / 50,000 | `derived` | 357.434 | 803.339 | 812.010 | 812.237 | 821.362 | 58,112,764 |
+| Owned / 1 | `per_test` | 45.593 | 280.484 | 290.386 | 288.203 | 293.740 | 7,886,527 |
+| Owned / 1 | `flat_cached` | 91.278 | 330.607 | 334.850 | 337.496 | 347.031 | 15,822,206 |
+| Owned / 1 | `derived` | 183.717 | 441.857 | 441.965 | 446.191 | 454.752 | 31,619,836 |
+
+For the 50,000-row workload, caching cut roughly half the repeated-setup total.
+Derived construction executed the shared fixture once; flat caching executed it
+twice; per-test setup executed it eight times. Every strategy applied exactly
+the expected branch deltas. The derived median improved only about 3–4% over
+flat caching, with overlapping owned ranges: one owned derived sample took
+911.861 ms versus 880.416 ms for flat caching in that sample. These observations
+do not establish a reliable advantage over flat caching on this host.
+
+The derived inventory occupied 58,112,764 bytes (root, shared parent, and two
+leaves), compared with 33,484,158 for the two flat templates and 7,886,527 for
+the per-test root. The one-row run shows the negative case clearly: derived
+scenarios took 441.965 ms at the median, versus 334.850 ms for flat caching and
+290.386 ms for per-test setup. The extra copies outweighed the saved SQL work.
+Choose derived scenarios when meaningful shared preparation is reused; depth
+and branching alone do not guarantee a speedup.
+
+Each successful external sample's ownership-aware sweep removed exactly nine
+templates and zero disposable leftovers. This count came from the complete
+exact-name inventory: two existing benchmark fixtures plus the templates
+actually returned by all three strategies. Raw reports retain those names,
+per-node sizes, initializer counts, all timing observations, and cleanup
+attempts. Their summary min/median/mean/max values and storage sums were checked
+against the raw samples independently after the runs.
+
+The complete, unmodified JSON artifacts are checked in:
+
+- [Owned, 50,000 rows](performance-samples/derived-2026-09-06-owned.json)
+- [External, 50,000 rows](performance-samples/derived-2026-09-06-external.json)
+- [Owned, one row](performance-samples/derived-2026-09-06-owned-small.json)
+
+The local originals remain at `target/derived-performance-owned.json`,
+`target/derived-performance-external.json`, and
+`target/derived-performance-owned-small.json`. Reproduce the first two with the
+release commands in [the workflow guide](performance.md), leaving all workload
+overrides unset and provisioning an external server as described above. For
+the cheap-fixture comparison, add `PTH_PERF_REPRESENTATIVE_ROWS=1` to the owned
+command. Reports contain no admin URL or credentials.

@@ -6,7 +6,7 @@
 //! JSON document to stdout and progress plus a compact summary to stderr.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     error::Error as StdError,
     fmt,
@@ -32,7 +32,10 @@ use tokio::{sync::Semaphore, task::JoinSet};
 use tokio_postgres::{Client, NoTls};
 use uuid::Uuid;
 
-const SCHEMA_VERSION: u32 = 8;
+#[path = "performance/scenarios.rs"]
+mod scenarios;
+
+const SCHEMA_VERSION: u32 = 9;
 const DEFAULT_IMAGE: &str = "postgres:18";
 const OUTPUT_ENV: &str = "PTH_PERF_OUTPUT";
 const OWNED_INITDB_NO_SYNC_ENV: &str = "PTH_PERF_OWNED_INITDB_NO_SYNC";
@@ -448,7 +451,23 @@ struct SampleReport {
     server_startup: StartupReport,
     readiness: ReadinessReport,
     fixtures: Vec<FixtureReport>,
+    scenario_reuse: scenarios::ScenarioReuseReport,
     external_stale_cleanup: Option<ExternalCleanupReport>,
+}
+
+impl SampleReport {
+    fn template_names(&self) -> BTreeSet<&str> {
+        self.fixtures
+            .iter()
+            .map(|fixture| fixture.template_name.as_str())
+            .chain(self.scenario_reuse.strategies.iter().flat_map(|strategy| {
+                strategy
+                    .templates
+                    .iter()
+                    .map(|template| template.database_name.as_str())
+            }))
+            .collect()
+    }
 }
 
 #[derive(Serialize)]
@@ -468,6 +487,7 @@ struct ReadinessReport {
 
 #[derive(Serialize)]
 struct FixtureReport {
+    template_name: String,
     name: &'static str,
     requested_rows: usize,
     template_size_bytes: i64,
@@ -1003,6 +1023,7 @@ async fn main() -> AnyResult<()> {
             "The drain barrier reports worker failures; one post-barrier catalog query verifies that every exact lease name is absent.",
             "The downstream pool spike eagerly opens its configured maximum on every measured lease and verifies the exact peak in pg_stat_activity; ordinary application pools may establish fewer physical connections lazily.",
             "The prewarm phase reports synchronous initial fill, first and steady-state ready-queue lease latency, exact initial clone storage, background dirty-drop/refill throughput, and final idle-pool cleanup; dirty databases are never reused.",
+            "Scenario strategies validate identical rows; totals include complete cold construction, all test lifecycles and final drain. Warm acquisition and exact template storage queries are excluded diagnostics.",
             "Connection permits reserve downstream application capacity only; owner, template-lock, lifecycle-pool, observer, and ambient external-server sessions are separate PostgreSQL connections.",
             "Run both modes under comparable load and compare the versioned JSON output; URLs and credentials are never recorded.",
         ],
@@ -1039,7 +1060,7 @@ async fn run_sample(
     };
     let validation = match &measurements {
         Ok(measurements) => ExternalCleanupValidation::CompletedSample {
-            expected_templates: measurements.report.fixtures.len(),
+            expected_templates: measurements.report.template_names().len(),
         },
         Err(_) => ExternalCleanupValidation::FailedSample,
     };
@@ -1110,6 +1131,8 @@ async fn measure_with_observer(
             .push(run_fixture(config, harness, observer, fixture, invocation, sample).await?);
     }
 
+    let scenario_reuse = scenarios::run(config, harness, observer, invocation, sample).await?;
+
     Ok(SampleMeasurements {
         report: SampleReport {
             sample,
@@ -1125,6 +1148,7 @@ async fn measure_with_observer(
                 postgres_settings: server_metadata.settings.clone(),
             },
             fixtures: fixture_reports,
+            scenario_reuse,
             external_stale_cleanup: None,
         },
         server_metadata,
@@ -1235,9 +1259,11 @@ async fn run_fixture(
     let deferred_cleanup =
         run_deferred_cleanup(harness, &template, observer, config.drain_databases).await?;
 
+    let template_name = template.database_name().to_owned();
     drop(warm_template);
     drop(template);
     Ok(FixtureReport {
+        template_name,
         name: fixture.name,
         requested_rows: fixture.requested_rows,
         template_size_bytes,
@@ -2122,6 +2148,11 @@ fn summarize(samples: &[SampleReport]) -> Vec<SummaryReport> {
             .entry(("server_startup".to_owned(), None))
             .or_default()
             .push(sample.server_startup.elapsed_ns);
+        for strategy in &sample.scenario_reuse.strategies {
+            for (metric, value) in strategy.metrics() {
+                observations.entry((metric, None)).or_default().push(value);
+            }
+        }
         for fixture in &sample.fixtures {
             let metrics = [
                 (
@@ -2455,8 +2486,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_v8_encodes_prewarm_concurrency_cleanup_storage_and_provenance() {
-        assert_eq!(SCHEMA_VERSION, 8);
+    fn schema_v9_preserves_prewarm_concurrency_cleanup_storage_and_provenance() {
+        assert_eq!(SCHEMA_VERSION, 9);
         assert_eq!(
             serde_json::to_value(BatchMethodReport::caller_bounded(4))
                 .expect("serialize caller-bounded method"),

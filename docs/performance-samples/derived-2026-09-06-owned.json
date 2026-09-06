@@ -1,0 +1,2051 @@
+{
+  "schema_version": 9,
+  "generated_at_unix_ms": 1788693820517,
+  "source": {
+    "git_commit": "c0b1bffbdc84f35a92fe935590d987de6620569d",
+    "git_worktree_dirty": true
+  },
+  "environment": {
+    "mode": "owned",
+    "image_reference": "postgres:18",
+    "image_content_id": {
+      "value": "sha256:a6638641707cdf047e5d5c2781f437e2e809323cab22c70b280be8389fbb7878",
+      "source": "docker_image_inspect_id"
+    },
+    "storage_driver": {
+      "value": "overlay2",
+      "source": "docker_info"
+    },
+    "postgres_version": "18.6 (Debian 18.6-1.pgdg13+2)",
+    "postgres_version_num": 180006,
+    "postgres_settings": {
+      "fsync": false,
+      "synchronous_commit": "off",
+      "full_page_writes": false,
+      "data_checksums": true,
+      "wal_level": "replica",
+      "max_connections": 300,
+      "reserved_connections": 0,
+      "superuser_reserved_connections": 3
+    },
+    "cpu_count": 64,
+    "operating_system": "linux",
+    "architecture": "x86_64",
+    "readiness_contract": "PostgresHarness::start authenticated through the mapped TCP port within the owned startup deadline and validated PostgreSQL 18; the image's socket-only temporary initdb server cannot satisfy this probe, and the observer then retained the final-server TCP session across a follow-up probe",
+    "admin_session_counter_scope": "pg_stat_database.sessions for the administrative database; the startup snapshot is taken after the persistent observer connects, phase deltas retain that same observer at both endpoints, and shared external servers may include ambient traffic"
+  },
+  "configuration": {
+    "project": "pghp_41bb23242df",
+    "samples": 3,
+    "sequential_operations": 4,
+    "concurrency": 4,
+    "concurrent_operations": 8,
+    "drain_databases": 4,
+    "representative_rows": 50000,
+    "startup_timeout_ms": 120000,
+    "operation_timeout_ms": 90000,
+    "template_wait_timeout_ms": 900000,
+    "deferred_drain_timeout_ms": 120000,
+    "external_cleanup_retry_window_ms": 120000,
+    "external_cleanup_initial_retry_interval_ms": 25,
+    "external_cleanup_max_retry_interval_ms": 1000,
+    "connection_budget": 120,
+    "connections_per_database": 11,
+    "max_simultaneous_leases": 10,
+    "downstream_pool_size": 10,
+    "prewarm_databases": 4,
+    "cleanup_on_start": false,
+    "owned_container_profile": {
+      "initdb_no_sync": true,
+      "storage": {
+        "kind": "tmpfs",
+        "size_bytes": 1073741824
+      }
+    }
+  },
+  "samples": [
+    {
+      "sample": 1,
+      "server_startup": {
+        "elapsed_ns": 1248568506,
+        "admin_sessions_after_observer_connect": {
+          "cumulative": 3,
+          "active": 2
+        }
+      },
+      "readiness": {
+        "postmaster_started_at": "2026-09-06 11:23:41.840011+00",
+        "container_image_content_id": "sha256:a6638641707cdf047e5d5c2781f437e2e809323cab22c70b280be8389fbb7878",
+        "postgres_version": "18.6 (Debian 18.6-1.pgdg13+2)",
+        "postgres_version_num": 180006,
+        "postgres_settings": {
+          "fsync": false,
+          "synchronous_commit": "off",
+          "full_page_writes": false,
+          "data_checksums": true,
+          "wal_level": "replica",
+          "max_connections": 300,
+          "reserved_connections": 0,
+          "superuser_reserved_connections": 3
+        }
+      },
+      "fixtures": [
+        {
+          "template_name": "pgh_pghp_41bb23242df_template_8c4b2ac51e597994f5691111",
+          "name": "small",
+          "requested_rows": 1,
+          "template_size_bytes": 7894719,
+          "cold_template_acquisition": {
+            "elapsed_ns": 59264880,
+            "admin_sessions": {
+              "before": 3,
+              "after": 4,
+              "delta": 1,
+              "active_after": 3
+            }
+          },
+          "warm_template_acquisition": {
+            "elapsed_ns": 2794,
+            "admin_sessions": {
+              "before": 4,
+              "after": 4,
+              "delta": 0,
+              "active_after": 3
+            }
+          },
+          "sequential_clone_cleanup": {
+            "operations": 4,
+            "method": {
+              "execution": {
+                "kind": "caller_bounded",
+                "concurrency": 1
+              },
+              "completion": {
+                "kind": "operation_return"
+              }
+            },
+            "elapsed_ns": 111960155,
+            "operations_per_second": 35.72699591207247,
+            "individual_elapsed_ns": [
+              51638802,
+              20460556,
+              19922542,
+              19930155
+            ],
+            "admin_sessions": {
+              "before": 4,
+              "after": 5,
+              "delta": 1,
+              "active_after": 4
+            }
+          },
+          "bounded_concurrent_clone_cleanup": {
+            "operations": 8,
+            "method": {
+              "execution": {
+                "kind": "caller_bounded",
+                "concurrency": 4
+              },
+              "completion": {
+                "kind": "operation_return"
+              }
+            },
+            "elapsed_ns": 78198139,
+            "operations_per_second": 102.30422491256473,
+            "individual_elapsed_ns": [
+              41060731,
+              44235948,
+              44293291,
+              44287982,
+              34009058,
+              33522169,
+              33584121,
+              33849532
+            ],
+            "admin_sessions": {
+              "before": 5,
+              "after": 8,
+              "delta": 3,
+              "active_after": 7
+            }
+          },
+          "downstream_pool_checkout_spike": {
+            "leases": 4,
+            "eager_connections_per_lease": 10,
+            "eager_connections_total": 40,
+            "lease_and_connection_checkout_elapsed_ns": 54630815,
+            "eager_connections_per_second": 732.1875026026978,
+            "observed_application_sessions_at_peak": 40,
+            "cleanup_elapsed_ns": 38202891,
+            "total_elapsed_ns": 94819045,
+            "admin_sessions": {
+              "before": 8,
+              "after": 8,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "prewarmed_database_queue": {
+            "capacity": 4,
+            "initial_fill_elapsed_ns": 75334151,
+            "first_lease_elapsed_ns": 3842,
+            "steady_state_lease_elapsed_ns": [
+              1327,
+              1396,
+              1467
+            ],
+            "steady_state_median_elapsed_ns": 1396,
+            "initial_ready_storage_growth_bytes": 30935100,
+            "refill_elapsed_ns": 34507610,
+            "refill_databases_per_second": 115.91646016632274,
+            "ready_after_refill": 4,
+            "cleanup_elapsed_ns": 7934583,
+            "total_elapsed_ns": 122885983,
+            "admin_sessions": {
+              "before": 8,
+              "after": 8,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "explicit_cleanup_drain": {
+            "operations": 4,
+            "method": {
+              "execution": {
+                "kind": "caller_bounded",
+                "concurrency": 4
+              },
+              "completion": {
+                "kind": "operation_return"
+              }
+            },
+            "elapsed_ns": 5880656,
+            "operations_per_second": 680.1962230064129,
+            "individual_elapsed_ns": [
+              5814373,
+              5829529,
+              5824361,
+              5828621
+            ],
+            "admin_sessions": {
+              "before": 8,
+              "after": 8,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "deferred_cleanup": {
+            "operations": 4,
+            "method": {
+              "execution": {
+                "kind": "implementation_managed"
+              },
+              "completion": {
+                "kind": "awaited_drain_barrier"
+              }
+            },
+            "caller_return_elapsed_ns": 181667,
+            "caller_returns_per_second": 22018.308223287666,
+            "individual_caller_return_elapsed_ns": [
+              43932,
+              38834,
+              37856,
+              51965
+            ],
+            "final_drain_elapsed_ns": 5551408,
+            "total_elapsed_ns": 5737334,
+            "admin_sessions": {
+              "before": 8,
+              "after": 8,
+              "delta": 0,
+              "active_after": 7
+            }
+          }
+        },
+        {
+          "template_name": "pgh_pghp_41bb23242df_template_1d3f2900c662fbed11dafecc",
+          "name": "representative",
+          "requested_rows": 50000,
+          "template_size_bytes": 29095615,
+          "cold_template_acquisition": {
+            "elapsed_ns": 427008770,
+            "admin_sessions": {
+              "before": 8,
+              "after": 9,
+              "delta": 1,
+              "active_after": 7
+            }
+          },
+          "warm_template_acquisition": {
+            "elapsed_ns": 1886,
+            "admin_sessions": {
+              "before": 9,
+              "after": 9,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "sequential_clone_cleanup": {
+            "operations": 4,
+            "method": {
+              "execution": {
+                "kind": "caller_bounded",
+                "concurrency": 1
+              },
+              "completion": {
+                "kind": "operation_return"
+              }
+            },
+            "elapsed_ns": 186734221,
+            "operations_per_second": 21.420819272328234,
+            "individual_elapsed_ns": [
+              75617651,
+              35462110,
+              38367095,
+              37278494
+            ],
+            "admin_sessions": {
+              "before": 9,
+              "after": 9,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "bounded_concurrent_clone_cleanup": {
+            "operations": 8,
+            "method": {
+              "execution": {
+                "kind": "caller_bounded",
+                "concurrency": 4
+              },
+              "completion": {
+                "kind": "operation_return"
+              }
+            },
+            "elapsed_ns": 233410129,
+            "operations_per_second": 34.27443373719227,
+            "individual_elapsed_ns": [
+              128227716,
+              128437879,
+              132937354,
+              133061328,
+              99795140,
+              99508008,
+              99676405,
+              104920843
+            ],
+            "admin_sessions": {
+              "before": 9,
+              "after": 9,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "downstream_pool_checkout_spike": {
+            "leases": 4,
+            "eager_connections_per_lease": 10,
+            "eager_connections_total": 40,
+            "lease_and_connection_checkout_elapsed_ns": 116977808,
+            "eager_connections_per_second": 341.9452004092947,
+            "observed_application_sessions_at_peak": 40,
+            "cleanup_elapsed_ns": 14804172,
+            "total_elapsed_ns": 132881128,
+            "admin_sessions": {
+              "before": 9,
+              "after": 9,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "prewarmed_database_queue": {
+            "capacity": 4,
+            "initial_fill_elapsed_ns": 147476115,
+            "first_lease_elapsed_ns": 3772,
+            "steady_state_lease_elapsed_ns": [
+              1467,
+              1885,
+              1886
+            ],
+            "steady_state_median_elapsed_ns": 1885,
+            "initial_ready_storage_growth_bytes": 115738684,
+            "refill_elapsed_ns": 103552933,
+            "refill_databases_per_second": 38.62758768986292,
+            "ready_after_refill": 4,
+            "cleanup_elapsed_ns": 7611900,
+            "total_elapsed_ns": 263273406,
+            "admin_sessions": {
+              "before": 9,
+              "after": 9,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "explicit_cleanup_drain": {
+            "operations": 4,
+            "method": {
+              "execution": {
+                "kind": "caller_bounded",
+                "concurrency": 4
+              },
+              "completion": {
+                "kind": "operation_return"
+              }
+            },
+            "elapsed_ns": 12681099,
+            "operations_per_second": 315.43007431769126,
+            "individual_elapsed_ns": [
+              8966959,
+              11504422,
+              11751533,
+              12634721
+            ],
+            "admin_sessions": {
+              "before": 9,
+              "after": 9,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "deferred_cleanup": {
+            "operations": 4,
+            "method": {
+              "execution": {
+                "kind": "implementation_managed"
+              },
+              "completion": {
+                "kind": "awaited_drain_barrier"
+              }
+            },
+            "caller_return_elapsed_ns": 173146,
+            "caller_returns_per_second": 23101.89088976933,
+            "individual_caller_return_elapsed_ns": [
+              48752,
+              45399,
+              34503,
+              36948
+            ],
+            "final_drain_elapsed_ns": 11198363,
+            "total_elapsed_ns": 11376677,
+            "admin_sessions": {
+              "before": 9,
+              "after": 9,
+              "delta": 0,
+              "active_after": 7
+            }
+          }
+        }
+      ],
+      "scenario_reuse": {
+        "branch_count": 2,
+        "tests_per_branch": 4,
+        "shared_rows": 50000,
+        "test_lifecycles_per_strategy": 8,
+        "strategies": [
+          {
+            "strategy": "per_test",
+            "construction_ns": 56088687,
+            "root_acquisition_ns": 56085334,
+            "warm_acquisition_ns": 3212,
+            "lease_acquisition_ns": 126561497,
+            "repeated_test_setup_ns": 1255001007,
+            "test_lifecycles_ns": 1624635246,
+            "cleanup_ns": 68554172,
+            "drain_ns": 36878,
+            "total_ns": 1680764652,
+            "initializer_counts": {
+              "root_migrations": 1,
+              "shared_fixtures": 8,
+              "branch_steps": [
+                4,
+                4
+              ]
+            },
+            "templates": [
+              {
+                "database_name": "pgh_pghp_41bb23242df_template_002875b0dc318f259fa04439",
+                "role": "root",
+                "size_bytes": 7886527
+              }
+            ],
+            "template_storage_bytes": 7886527
+          },
+          {
+            "strategy": "flat_cached",
+            "construction_ns": 421033334,
+            "root_acquisition_ns": null,
+            "warm_acquisition_ns": 2374,
+            "lease_acquisition_ns": 180292151,
+            "repeated_test_setup_ns": 0,
+            "test_lifecycles_ns": 441741840,
+            "cleanup_ns": 74843562,
+            "drain_ns": 29754,
+            "total_ns": 862810236,
+            "initializer_counts": {
+              "root_migrations": 2,
+              "shared_fixtures": 2,
+              "branch_steps": [
+                1,
+                1
+              ]
+            },
+            "templates": [
+              {
+                "database_name": "pgh_pghp_41bb23242df_template_836dbac66654270bb601f40f",
+                "role": "active",
+                "size_bytes": 16742079
+              },
+              {
+                "database_name": "pgh_pghp_41bb23242df_template_546c8513b73a0f476866abae",
+                "role": "cancelled",
+                "size_bytes": 16742079
+              }
+            ],
+            "template_storage_bytes": 33484158
+          },
+          {
+            "strategy": "derived",
+            "construction_ns": 352671374,
+            "root_acquisition_ns": 46735625,
+            "warm_acquisition_ns": 6146,
+            "lease_acquisition_ns": 173128589,
+            "repeated_test_setup_ns": 0,
+            "test_lifecycles_ns": 443949006,
+            "cleanup_ns": 93280921,
+            "drain_ns": 44002,
+            "total_ns": 796670110,
+            "initializer_counts": {
+              "root_migrations": 1,
+              "shared_fixtures": 1,
+              "branch_steps": [
+                1,
+                1
+              ]
+            },
+            "templates": [
+              {
+                "database_name": "pgh_pghp_41bb23242df_template_1025ae95066c654b982fa215",
+                "role": "root",
+                "size_bytes": 7886527
+              },
+              {
+                "database_name": "pgh_pghp_41bb23242df_template_fce71feee1942599ab3cc70b",
+                "role": "shared",
+                "size_bytes": 16742079
+              },
+              {
+                "database_name": "pgh_pghp_41bb23242df_template_36a6dc202ecbe946085f8a0d",
+                "role": "active",
+                "size_bytes": 16742079
+              },
+              {
+                "database_name": "pgh_pghp_41bb23242df_template_c65583694e6b4cd272a59f2c",
+                "role": "cancelled",
+                "size_bytes": 16742079
+              }
+            ],
+            "template_storage_bytes": 58112764
+          }
+        ]
+      },
+      "external_stale_cleanup": null
+    },
+    {
+      "sample": 2,
+      "server_startup": {
+        "elapsed_ns": 1325549669,
+        "admin_sessions_after_observer_connect": {
+          "cumulative": 3,
+          "active": 2
+        }
+      },
+      "readiness": {
+        "postmaster_started_at": "2026-09-06 11:23:49.336063+00",
+        "container_image_content_id": "sha256:a6638641707cdf047e5d5c2781f437e2e809323cab22c70b280be8389fbb7878",
+        "postgres_version": "18.6 (Debian 18.6-1.pgdg13+2)",
+        "postgres_version_num": 180006,
+        "postgres_settings": {
+          "fsync": false,
+          "synchronous_commit": "off",
+          "full_page_writes": false,
+          "data_checksums": true,
+          "wal_level": "replica",
+          "max_connections": 300,
+          "reserved_connections": 0,
+          "superuser_reserved_connections": 3
+        }
+      },
+      "fixtures": [
+        {
+          "template_name": "pgh_pghp_41bb23242df_template_a37838df6daa5a725fbde1e6",
+          "name": "small",
+          "requested_rows": 1,
+          "template_size_bytes": 7894719,
+          "cold_template_acquisition": {
+            "elapsed_ns": 67333356,
+            "admin_sessions": {
+              "before": 3,
+              "after": 4,
+              "delta": 1,
+              "active_after": 3
+            }
+          },
+          "warm_template_acquisition": {
+            "elapsed_ns": 1467,
+            "admin_sessions": {
+              "before": 4,
+              "after": 4,
+              "delta": 0,
+              "active_after": 3
+            }
+          },
+          "sequential_clone_cleanup": {
+            "operations": 4,
+            "method": {
+              "execution": {
+                "kind": "caller_bounded",
+                "concurrency": 1
+              },
+              "completion": {
+                "kind": "operation_return"
+              }
+            },
+            "elapsed_ns": 107161116,
+            "operations_per_second": 37.326972220035486,
+            "individual_elapsed_ns": [
+              46704823,
+              21199165,
+              19508152,
+              19740944
+            ],
+            "admin_sessions": {
+              "before": 4,
+              "after": 5,
+              "delta": 1,
+              "active_after": 4
+            }
+          },
+          "bounded_concurrent_clone_cleanup": {
+            "operations": 8,
+            "method": {
+              "execution": {
+                "kind": "caller_bounded",
+                "concurrency": 4
+              },
+              "completion": {
+                "kind": "operation_return"
+              }
+            },
+            "elapsed_ns": 77981480,
+            "operations_per_second": 102.58846074734667,
+            "individual_elapsed_ns": [
+              40769269,
+              44128597,
+              44233573,
+              44296015,
+              33569873,
+              33092484,
+              33020124,
+              33793307
+            ],
+            "admin_sessions": {
+              "before": 5,
+              "after": 8,
+              "delta": 3,
+              "active_after": 7
+            }
+          },
+          "downstream_pool_checkout_spike": {
+            "leases": 4,
+            "eager_connections_per_lease": 10,
+            "eager_connections_total": 40,
+            "lease_and_connection_checkout_elapsed_ns": 46920155,
+            "eager_connections_per_second": 852.5121027413486,
+            "observed_application_sessions_at_peak": 40,
+            "cleanup_elapsed_ns": 25666999,
+            "total_elapsed_ns": 73815934,
+            "admin_sessions": {
+              "before": 8,
+              "after": 8,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "prewarmed_database_queue": {
+            "capacity": 4,
+            "initial_fill_elapsed_ns": 69863624,
+            "first_lease_elapsed_ns": 5658,
+            "steady_state_lease_elapsed_ns": [
+              1397,
+              1466,
+              1956
+            ],
+            "steady_state_median_elapsed_ns": 1466,
+            "initial_ready_storage_growth_bytes": 30935100,
+            "refill_elapsed_ns": 33166729,
+            "refill_databases_per_second": 120.60278841485997,
+            "ready_after_refill": 4,
+            "cleanup_elapsed_ns": 5850832,
+            "total_elapsed_ns": 112951882,
+            "admin_sessions": {
+              "before": 8,
+              "after": 8,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "explicit_cleanup_drain": {
+            "operations": 4,
+            "method": {
+              "execution": {
+                "kind": "caller_bounded",
+                "concurrency": 4
+              },
+              "completion": {
+                "kind": "operation_return"
+              }
+            },
+            "elapsed_ns": 5986121,
+            "operations_per_second": 668.2123532083632,
+            "individual_elapsed_ns": [
+              5618529,
+              5675800,
+              5936532,
+              5942678
+            ],
+            "admin_sessions": {
+              "before": 8,
+              "after": 8,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "deferred_cleanup": {
+            "operations": 4,
+            "method": {
+              "execution": {
+                "kind": "implementation_managed"
+              },
+              "completion": {
+                "kind": "awaited_drain_barrier"
+              }
+            },
+            "caller_return_elapsed_ns": 135779,
+            "caller_returns_per_second": 29459.63661538235,
+            "individual_caller_return_elapsed_ns": [
+              39742,
+              34503,
+              33106,
+              21233
+            ],
+            "final_drain_elapsed_ns": 5591569,
+            "total_elapsed_ns": 5731676,
+            "admin_sessions": {
+              "before": 8,
+              "after": 8,
+              "delta": 0,
+              "active_after": 7
+            }
+          }
+        },
+        {
+          "template_name": "pgh_pghp_41bb23242df_template_42d3b7fb93657426115be287",
+          "name": "representative",
+          "requested_rows": 50000,
+          "template_size_bytes": 29095615,
+          "cold_template_acquisition": {
+            "elapsed_ns": 435164342,
+            "admin_sessions": {
+              "before": 8,
+              "after": 9,
+              "delta": 1,
+              "active_after": 7
+            }
+          },
+          "warm_template_acquisition": {
+            "elapsed_ns": 3213,
+            "admin_sessions": {
+              "before": 9,
+              "after": 9,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "sequential_clone_cleanup": {
+            "operations": 4,
+            "method": {
+              "execution": {
+                "kind": "caller_bounded",
+                "concurrency": 1
+              },
+              "completion": {
+                "kind": "operation_return"
+              }
+            },
+            "elapsed_ns": 181758614,
+            "operations_per_second": 22.00721006818417,
+            "individual_elapsed_ns": [
+              77293997,
+              35259979,
+              34260709,
+              34935899
+            ],
+            "admin_sessions": {
+              "before": 9,
+              "after": 9,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "bounded_concurrent_clone_cleanup": {
+            "operations": 8,
+            "method": {
+              "execution": {
+                "kind": "caller_bounded",
+                "concurrency": 4
+              },
+              "completion": {
+                "kind": "operation_return"
+              }
+            },
+            "elapsed_ns": 231990253,
+            "operations_per_second": 34.48420740331707,
+            "individual_elapsed_ns": [
+              125807732,
+              130253356,
+              130413650,
+              130499768,
+              102466077,
+              101068971,
+              101667401,
+              101513254
+            ],
+            "admin_sessions": {
+              "before": 9,
+              "after": 9,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "downstream_pool_checkout_spike": {
+            "leases": 4,
+            "eager_connections_per_lease": 10,
+            "eager_connections_total": 40,
+            "lease_and_connection_checkout_elapsed_ns": 115641258,
+            "eager_connections_per_second": 345.89730941875433,
+            "observed_application_sessions_at_peak": 40,
+            "cleanup_elapsed_ns": 17430547,
+            "total_elapsed_ns": 134099013,
+            "admin_sessions": {
+              "before": 9,
+              "after": 9,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "prewarmed_database_queue": {
+            "capacity": 4,
+            "initial_fill_elapsed_ns": 146691199,
+            "first_lease_elapsed_ns": 4190,
+            "steady_state_lease_elapsed_ns": [
+              1397,
+              1467,
+              1885
+            ],
+            "steady_state_median_elapsed_ns": 1467,
+            "initial_ready_storage_growth_bytes": 115738684,
+            "refill_elapsed_ns": 98685656,
+            "refill_databases_per_second": 40.53273963138068,
+            "ready_after_refill": 4,
+            "cleanup_elapsed_ns": 10706724,
+            "total_elapsed_ns": 261511499,
+            "admin_sessions": {
+              "before": 9,
+              "after": 9,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "explicit_cleanup_drain": {
+            "operations": 4,
+            "method": {
+              "execution": {
+                "kind": "caller_bounded",
+                "concurrency": 4
+              },
+              "completion": {
+                "kind": "operation_return"
+              }
+            },
+            "elapsed_ns": 11935924,
+            "operations_per_second": 335.1227772562895,
+            "individual_elapsed_ns": [
+              8114364,
+              8535946,
+              9245641,
+              11884867
+            ],
+            "admin_sessions": {
+              "before": 9,
+              "after": 9,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "deferred_cleanup": {
+            "operations": 4,
+            "method": {
+              "execution": {
+                "kind": "implementation_managed"
+              },
+              "completion": {
+                "kind": "awaited_drain_barrier"
+              }
+            },
+            "caller_return_elapsed_ns": 170352,
+            "caller_returns_per_second": 23480.792711561942,
+            "individual_caller_return_elapsed_ns": [
+              35411,
+              30732,
+              56364,
+              40161
+            ],
+            "final_drain_elapsed_ns": 11341753,
+            "total_elapsed_ns": 11517692,
+            "admin_sessions": {
+              "before": 9,
+              "after": 9,
+              "delta": 0,
+              "active_after": 7
+            }
+          }
+        }
+      ],
+      "scenario_reuse": {
+        "branch_count": 2,
+        "tests_per_branch": 4,
+        "shared_rows": 50000,
+        "test_lifecycles_per_strategy": 8,
+        "strategies": [
+          {
+            "strategy": "flat_cached",
+            "construction_ns": 428265348,
+            "root_acquisition_ns": null,
+            "warm_acquisition_ns": 2864,
+            "lease_acquisition_ns": 173142137,
+            "repeated_test_setup_ns": 0,
+            "test_lifecycles_ns": 434631915,
+            "cleanup_ns": 70903404,
+            "drain_ns": 40230,
+            "total_ns": 862941824,
+            "initializer_counts": {
+              "root_migrations": 2,
+              "shared_fixtures": 2,
+              "branch_steps": [
+                1,
+                1
+              ]
+            },
+            "templates": [
+              {
+                "database_name": "pgh_pghp_41bb23242df_template_a63b91ccd4cf71793ff8d4a4",
+                "role": "active",
+                "size_bytes": 16742079
+              },
+              {
+                "database_name": "pgh_pghp_41bb23242df_template_350ea7aecea935d43e7c7dc8",
+                "role": "cancelled",
+                "size_bytes": 16742079
+              }
+            ],
+            "template_storage_bytes": 33484158
+          },
+          {
+            "strategy": "derived",
+            "construction_ns": 371234735,
+            "root_acquisition_ns": 44902617,
+            "warm_acquisition_ns": 5658,
+            "lease_acquisition_ns": 176755000,
+            "repeated_test_setup_ns": 0,
+            "test_lifecycles_ns": 463890126,
+            "cleanup_ns": 97294067,
+            "drain_ns": 39742,
+            "total_ns": 835169352,
+            "initializer_counts": {
+              "root_migrations": 1,
+              "shared_fixtures": 1,
+              "branch_steps": [
+                1,
+                1
+              ]
+            },
+            "templates": [
+              {
+                "database_name": "pgh_pghp_41bb23242df_template_4436123b74d53d7710a16384",
+                "role": "root",
+                "size_bytes": 7886527
+              },
+              {
+                "database_name": "pgh_pghp_41bb23242df_template_3fc55f92e908a7e8f55e842c",
+                "role": "shared",
+                "size_bytes": 16742079
+              },
+              {
+                "database_name": "pgh_pghp_41bb23242df_template_3326dc84e79677e6898e567c",
+                "role": "active",
+                "size_bytes": 16742079
+              },
+              {
+                "database_name": "pgh_pghp_41bb23242df_template_f27d68422cf494402ed7d338",
+                "role": "cancelled",
+                "size_bytes": 16742079
+              }
+            ],
+            "template_storage_bytes": 58112764
+          },
+          {
+            "strategy": "per_test",
+            "construction_ns": 47687540,
+            "root_acquisition_ns": 47684746,
+            "warm_acquisition_ns": 3353,
+            "lease_acquisition_ns": 121076583,
+            "repeated_test_setup_ns": 1203806347,
+            "test_lifecycles_ns": 1561122543,
+            "cleanup_ns": 66791081,
+            "drain_ns": 39812,
+            "total_ns": 1608854643,
+            "initializer_counts": {
+              "root_migrations": 1,
+              "shared_fixtures": 8,
+              "branch_steps": [
+                4,
+                4
+              ]
+            },
+            "templates": [
+              {
+                "database_name": "pgh_pghp_41bb23242df_template_c27c07f3179b94ccb31b76d1",
+                "role": "root",
+                "size_bytes": 7886527
+              }
+            ],
+            "template_storage_bytes": 7886527
+          }
+        ]
+      },
+      "external_stale_cleanup": null
+    },
+    {
+      "sample": 3,
+      "server_startup": {
+        "elapsed_ns": 1283912717,
+        "admin_sessions_after_observer_connect": {
+          "cumulative": 3,
+          "active": 2
+        }
+      },
+      "readiness": {
+        "postmaster_started_at": "2026-09-06 11:23:56.711175+00",
+        "container_image_content_id": "sha256:a6638641707cdf047e5d5c2781f437e2e809323cab22c70b280be8389fbb7878",
+        "postgres_version": "18.6 (Debian 18.6-1.pgdg13+2)",
+        "postgres_version_num": 180006,
+        "postgres_settings": {
+          "fsync": false,
+          "synchronous_commit": "off",
+          "full_page_writes": false,
+          "data_checksums": true,
+          "wal_level": "replica",
+          "max_connections": 300,
+          "reserved_connections": 0,
+          "superuser_reserved_connections": 3
+        }
+      },
+      "fixtures": [
+        {
+          "template_name": "pgh_pghp_41bb23242df_template_0d3f0cb36f5a66153e7e16f3",
+          "name": "small",
+          "requested_rows": 1,
+          "template_size_bytes": 7894719,
+          "cold_template_acquisition": {
+            "elapsed_ns": 112033562,
+            "admin_sessions": {
+              "before": 3,
+              "after": 4,
+              "delta": 1,
+              "active_after": 3
+            }
+          },
+          "warm_template_acquisition": {
+            "elapsed_ns": 2444,
+            "admin_sessions": {
+              "before": 4,
+              "after": 4,
+              "delta": 0,
+              "active_after": 3
+            }
+          },
+          "sequential_clone_cleanup": {
+            "operations": 4,
+            "method": {
+              "execution": {
+                "kind": "caller_bounded",
+                "concurrency": 1
+              },
+              "completion": {
+                "kind": "operation_return"
+              }
+            },
+            "elapsed_ns": 153928870,
+            "operations_per_second": 25.98602848185659,
+            "individual_elapsed_ns": [
+              68583927,
+              29842464,
+              28633589,
+              26857994
+            ],
+            "admin_sessions": {
+              "before": 4,
+              "after": 5,
+              "delta": 1,
+              "active_after": 4
+            }
+          },
+          "bounded_concurrent_clone_cleanup": {
+            "operations": 8,
+            "method": {
+              "execution": {
+                "kind": "caller_bounded",
+                "concurrency": 4
+              },
+              "completion": {
+                "kind": "operation_return"
+              }
+            },
+            "elapsed_ns": 109464390,
+            "operations_per_second": 73.08312776419803,
+            "individual_elapsed_ns": [
+              62987121,
+              64530902,
+              64551785,
+              65954619,
+              42905474,
+              44427602,
+              44765022,
+              46404420
+            ],
+            "admin_sessions": {
+              "before": 5,
+              "after": 8,
+              "delta": 3,
+              "active_after": 7
+            }
+          },
+          "downstream_pool_checkout_spike": {
+            "leases": 4,
+            "eager_connections_per_lease": 10,
+            "eager_connections_total": 40,
+            "lease_and_connection_checkout_elapsed_ns": 61271033,
+            "eager_connections_per_second": 652.8370429139003,
+            "observed_application_sessions_at_peak": 40,
+            "cleanup_elapsed_ns": 23679425,
+            "total_elapsed_ns": 87325113,
+            "admin_sessions": {
+              "before": 8,
+              "after": 8,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "prewarmed_database_queue": {
+            "capacity": 4,
+            "initial_fill_elapsed_ns": 88578409,
+            "first_lease_elapsed_ns": 3772,
+            "steady_state_lease_elapsed_ns": [
+              1886,
+              1886,
+              1886
+            ],
+            "steady_state_median_elapsed_ns": 1886,
+            "initial_ready_storage_growth_bytes": 30935100,
+            "refill_elapsed_ns": 41670128,
+            "refill_databases_per_second": 95.99202575043685,
+            "ready_after_refill": 4,
+            "cleanup_elapsed_ns": 12092586,
+            "total_elapsed_ns": 147636967,
+            "admin_sessions": {
+              "before": 8,
+              "after": 8,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "explicit_cleanup_drain": {
+            "operations": 4,
+            "method": {
+              "execution": {
+                "kind": "caller_bounded",
+                "concurrency": 4
+              },
+              "completion": {
+                "kind": "operation_return"
+              }
+            },
+            "elapsed_ns": 9800209,
+            "operations_per_second": 408.1545607853873,
+            "individual_elapsed_ns": [
+              6169325,
+              6186786,
+              6396809,
+              9730643
+            ],
+            "admin_sessions": {
+              "before": 8,
+              "after": 8,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "deferred_cleanup": {
+            "operations": 4,
+            "method": {
+              "execution": {
+                "kind": "implementation_managed"
+              },
+              "completion": {
+                "kind": "awaited_drain_barrier"
+              }
+            },
+            "caller_return_elapsed_ns": 741403,
+            "caller_returns_per_second": 5395.176442501582,
+            "individual_caller_return_elapsed_ns": [
+              50218,
+              50149,
+              32198,
+              600386
+            ],
+            "final_drain_elapsed_ns": 6385634,
+            "total_elapsed_ns": 7131717,
+            "admin_sessions": {
+              "before": 8,
+              "after": 8,
+              "delta": 0,
+              "active_after": 7
+            }
+          }
+        },
+        {
+          "template_name": "pgh_pghp_41bb23242df_template_3073b34153b720b254a3b5ee",
+          "name": "representative",
+          "requested_rows": 50000,
+          "template_size_bytes": 29095615,
+          "cold_template_acquisition": {
+            "elapsed_ns": 439693151,
+            "admin_sessions": {
+              "before": 8,
+              "after": 9,
+              "delta": 1,
+              "active_after": 7
+            }
+          },
+          "warm_template_acquisition": {
+            "elapsed_ns": 2864,
+            "admin_sessions": {
+              "before": 9,
+              "after": 9,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "sequential_clone_cleanup": {
+            "operations": 4,
+            "method": {
+              "execution": {
+                "kind": "caller_bounded",
+                "concurrency": 1
+              },
+              "completion": {
+                "kind": "operation_return"
+              }
+            },
+            "elapsed_ns": 205633815,
+            "operations_per_second": 19.452053642052988,
+            "individual_elapsed_ns": [
+              87697945,
+              43770921,
+              36818566,
+              37337583
+            ],
+            "admin_sessions": {
+              "before": 9,
+              "after": 9,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "bounded_concurrent_clone_cleanup": {
+            "operations": 8,
+            "method": {
+              "execution": {
+                "kind": "caller_bounded",
+                "concurrency": 4
+              },
+              "completion": {
+                "kind": "operation_return"
+              }
+            },
+            "elapsed_ns": 277501358,
+            "operations_per_second": 28.82868775006139,
+            "individual_elapsed_ns": [
+              154606854,
+              158263370,
+              158445526,
+              159090822,
+              113259897,
+              118182911,
+              118010674,
+              121923591
+            ],
+            "admin_sessions": {
+              "before": 9,
+              "after": 9,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "downstream_pool_checkout_spike": {
+            "leases": 4,
+            "eager_connections_per_lease": 10,
+            "eager_connections_total": 40,
+            "lease_and_connection_checkout_elapsed_ns": 150514785,
+            "eager_connections_per_second": 265.75462337470697,
+            "observed_application_sessions_at_peak": 40,
+            "cleanup_elapsed_ns": 67552459,
+            "total_elapsed_ns": 220059987,
+            "admin_sessions": {
+              "before": 9,
+              "after": 9,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "prewarmed_database_queue": {
+            "capacity": 4,
+            "initial_fill_elapsed_ns": 159951380,
+            "first_lease_elapsed_ns": 4749,
+            "steady_state_lease_elapsed_ns": [
+              1885,
+              1886,
+              1886
+            ],
+            "steady_state_median_elapsed_ns": 1886,
+            "initial_ready_storage_growth_bytes": 115738684,
+            "refill_elapsed_ns": 117243847,
+            "refill_databases_per_second": 34.1169289677095,
+            "ready_after_refill": 4,
+            "cleanup_elapsed_ns": 11407966,
+            "total_elapsed_ns": 292385013,
+            "admin_sessions": {
+              "before": 9,
+              "after": 9,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "explicit_cleanup_drain": {
+            "operations": 4,
+            "method": {
+              "execution": {
+                "kind": "caller_bounded",
+                "concurrency": 4
+              },
+              "completion": {
+                "kind": "operation_return"
+              }
+            },
+            "elapsed_ns": 14251978,
+            "operations_per_second": 280.6627964202583,
+            "individual_elapsed_ns": [
+              9475150,
+              12561454,
+              13085710,
+              14169702
+            ],
+            "admin_sessions": {
+              "before": 9,
+              "after": 9,
+              "delta": 0,
+              "active_after": 7
+            }
+          },
+          "deferred_cleanup": {
+            "operations": 4,
+            "method": {
+              "execution": {
+                "kind": "implementation_managed"
+              },
+              "completion": {
+                "kind": "awaited_drain_barrier"
+              }
+            },
+            "caller_return_elapsed_ns": 257029,
+            "caller_returns_per_second": 15562.446260927756,
+            "individual_caller_return_elapsed_ns": [
+              55387,
+              89960,
+              55387,
+              46377
+            ],
+            "final_drain_elapsed_ns": 11649770,
+            "total_elapsed_ns": 11911827,
+            "admin_sessions": {
+              "before": 9,
+              "after": 9,
+              "delta": 0,
+              "active_after": 7
+            }
+          }
+        }
+      ],
+      "scenario_reuse": {
+        "branch_count": 2,
+        "tests_per_branch": 4,
+        "shared_rows": 50000,
+        "test_lifecycles_per_strategy": 8,
+        "strategies": [
+          {
+            "strategy": "derived",
+            "construction_ns": 419027740,
+            "root_acquisition_ns": 73162047,
+            "warm_acquisition_ns": 7124,
+            "lease_acquisition_ns": 187028968,
+            "repeated_test_setup_ns": 0,
+            "test_lifecycles_ns": 492788706,
+            "cleanup_ns": 102632445,
+            "drain_ns": 39323,
+            "total_ns": 911860938,
+            "initializer_counts": {
+              "root_migrations": 1,
+              "shared_fixtures": 1,
+              "branch_steps": [
+                1,
+                1
+              ]
+            },
+            "templates": [
+              {
+                "database_name": "pgh_pghp_41bb23242df_template_ebfc544009ae07a936e7cdc6",
+                "role": "root",
+                "size_bytes": 7886527
+              },
+              {
+                "database_name": "pgh_pghp_41bb23242df_template_2f5bb8e9ddfe299b084b721c",
+                "role": "shared",
+                "size_bytes": 16742079
+              },
+              {
+                "database_name": "pgh_pghp_41bb23242df_template_3edf02a012bcebbdd0b88272",
+                "role": "active",
+                "size_bytes": 16742079
+              },
+              {
+                "database_name": "pgh_pghp_41bb23242df_template_98338188d594eda80c88b045",
+                "role": "cancelled",
+                "size_bytes": 16742079
+              }
+            ],
+            "template_storage_bytes": 58112764
+          },
+          {
+            "strategy": "per_test",
+            "construction_ns": 51998433,
+            "root_acquisition_ns": 51994103,
+            "warm_acquisition_ns": 4749,
+            "lease_acquisition_ns": 127994364,
+            "repeated_test_setup_ns": 1269646141,
+            "test_lifecycles_ns": 1673907425,
+            "cleanup_ns": 80050424,
+            "drain_ns": 44980,
+            "total_ns": 1725955029,
+            "initializer_counts": {
+              "root_migrations": 1,
+              "shared_fixtures": 8,
+              "branch_steps": [
+                4,
+                4
+              ]
+            },
+            "templates": [
+              {
+                "database_name": "pgh_pghp_41bb23242df_template_c9b98868452708451e8f01d8",
+                "role": "root",
+                "size_bytes": 7886527
+              }
+            ],
+            "template_storage_bytes": 7886527
+          },
+          {
+            "strategy": "flat_cached",
+            "construction_ns": 430447930,
+            "root_acquisition_ns": null,
+            "warm_acquisition_ns": 4750,
+            "lease_acquisition_ns": 183240024,
+            "repeated_test_setup_ns": 0,
+            "test_lifecycles_ns": 449919622,
+            "cleanup_ns": 77672417,
+            "drain_ns": 43932,
+            "total_ns": 880415885,
+            "initializer_counts": {
+              "root_migrations": 2,
+              "shared_fixtures": 2,
+              "branch_steps": [
+                1,
+                1
+              ]
+            },
+            "templates": [
+              {
+                "database_name": "pgh_pghp_41bb23242df_template_d92e8954a3ab409007911d83",
+                "role": "active",
+                "size_bytes": 16742079
+              },
+              {
+                "database_name": "pgh_pghp_41bb23242df_template_254d96c7bb568509324dec17",
+                "role": "cancelled",
+                "size_bytes": 16742079
+              }
+            ],
+            "template_storage_bytes": 33484158
+          }
+        ]
+      },
+      "external_stale_cleanup": null
+    }
+  ],
+  "summary": [
+    {
+      "metric": "bounded_concurrent_clone_cleanup",
+      "fixture": "representative",
+      "observations": 3,
+      "min_ns": 231990253,
+      "median_ns": 233410129,
+      "mean_ns": 247633913,
+      "max_ns": 277501358
+    },
+    {
+      "metric": "bounded_concurrent_clone_cleanup",
+      "fixture": "small",
+      "observations": 3,
+      "min_ns": 77981480,
+      "median_ns": 78198139,
+      "mean_ns": 88548003,
+      "max_ns": 109464390
+    },
+    {
+      "metric": "cold_template_acquisition",
+      "fixture": "representative",
+      "observations": 3,
+      "min_ns": 427008770,
+      "median_ns": 435164342,
+      "mean_ns": 433955421,
+      "max_ns": 439693151
+    },
+    {
+      "metric": "cold_template_acquisition",
+      "fixture": "small",
+      "observations": 3,
+      "min_ns": 59264880,
+      "median_ns": 67333356,
+      "mean_ns": 79543932,
+      "max_ns": 112033562
+    },
+    {
+      "metric": "deferred_cleanup_caller_return",
+      "fixture": "representative",
+      "observations": 3,
+      "min_ns": 170352,
+      "median_ns": 173146,
+      "mean_ns": 200175,
+      "max_ns": 257029
+    },
+    {
+      "metric": "deferred_cleanup_caller_return",
+      "fixture": "small",
+      "observations": 3,
+      "min_ns": 135779,
+      "median_ns": 181667,
+      "mean_ns": 352949,
+      "max_ns": 741403
+    },
+    {
+      "metric": "deferred_cleanup_final_drain",
+      "fixture": "representative",
+      "observations": 3,
+      "min_ns": 11198363,
+      "median_ns": 11341753,
+      "mean_ns": 11396628,
+      "max_ns": 11649770
+    },
+    {
+      "metric": "deferred_cleanup_final_drain",
+      "fixture": "small",
+      "observations": 3,
+      "min_ns": 5551408,
+      "median_ns": 5591569,
+      "mean_ns": 5842870,
+      "max_ns": 6385634
+    },
+    {
+      "metric": "deferred_cleanup_total",
+      "fixture": "representative",
+      "observations": 3,
+      "min_ns": 11376677,
+      "median_ns": 11517692,
+      "mean_ns": 11602065,
+      "max_ns": 11911827
+    },
+    {
+      "metric": "deferred_cleanup_total",
+      "fixture": "small",
+      "observations": 3,
+      "min_ns": 5731676,
+      "median_ns": 5737334,
+      "mean_ns": 6200242,
+      "max_ns": 7131717
+    },
+    {
+      "metric": "downstream_pool_checkout_spike",
+      "fixture": "representative",
+      "observations": 3,
+      "min_ns": 115641258,
+      "median_ns": 116977808,
+      "mean_ns": 127711283,
+      "max_ns": 150514785
+    },
+    {
+      "metric": "downstream_pool_checkout_spike",
+      "fixture": "small",
+      "observations": 3,
+      "min_ns": 46920155,
+      "median_ns": 54630815,
+      "mean_ns": 54274001,
+      "max_ns": 61271033
+    },
+    {
+      "metric": "downstream_pool_checkout_spike_total",
+      "fixture": "representative",
+      "observations": 3,
+      "min_ns": 132881128,
+      "median_ns": 134099013,
+      "mean_ns": 162346709,
+      "max_ns": 220059987
+    },
+    {
+      "metric": "downstream_pool_checkout_spike_total",
+      "fixture": "small",
+      "observations": 3,
+      "min_ns": 73815934,
+      "median_ns": 87325113,
+      "mean_ns": 85320030,
+      "max_ns": 94819045
+    },
+    {
+      "metric": "explicit_cleanup_drain",
+      "fixture": "representative",
+      "observations": 3,
+      "min_ns": 11935924,
+      "median_ns": 12681099,
+      "mean_ns": 12956333,
+      "max_ns": 14251978
+    },
+    {
+      "metric": "explicit_cleanup_drain",
+      "fixture": "small",
+      "observations": 3,
+      "min_ns": 5880656,
+      "median_ns": 5986121,
+      "mean_ns": 7222328,
+      "max_ns": 9800209
+    },
+    {
+      "metric": "prewarmed_database_queue_first_lease",
+      "fixture": "representative",
+      "observations": 3,
+      "min_ns": 3772,
+      "median_ns": 4190,
+      "mean_ns": 4237,
+      "max_ns": 4749
+    },
+    {
+      "metric": "prewarmed_database_queue_first_lease",
+      "fixture": "small",
+      "observations": 3,
+      "min_ns": 3772,
+      "median_ns": 3842,
+      "mean_ns": 4424,
+      "max_ns": 5658
+    },
+    {
+      "metric": "prewarmed_database_queue_initial_fill",
+      "fixture": "representative",
+      "observations": 3,
+      "min_ns": 146691199,
+      "median_ns": 147476115,
+      "mean_ns": 151372898,
+      "max_ns": 159951380
+    },
+    {
+      "metric": "prewarmed_database_queue_initial_fill",
+      "fixture": "small",
+      "observations": 3,
+      "min_ns": 69863624,
+      "median_ns": 75334151,
+      "mean_ns": 77925394,
+      "max_ns": 88578409
+    },
+    {
+      "metric": "prewarmed_database_queue_refill",
+      "fixture": "representative",
+      "observations": 3,
+      "min_ns": 98685656,
+      "median_ns": 103552933,
+      "mean_ns": 106494145,
+      "max_ns": 117243847
+    },
+    {
+      "metric": "prewarmed_database_queue_refill",
+      "fixture": "small",
+      "observations": 3,
+      "min_ns": 33166729,
+      "median_ns": 34507610,
+      "mean_ns": 36448155,
+      "max_ns": 41670128
+    },
+    {
+      "metric": "prewarmed_database_queue_steady_lease",
+      "fixture": "representative",
+      "observations": 3,
+      "min_ns": 1467,
+      "median_ns": 1885,
+      "mean_ns": 1746,
+      "max_ns": 1886
+    },
+    {
+      "metric": "prewarmed_database_queue_steady_lease",
+      "fixture": "small",
+      "observations": 3,
+      "min_ns": 1396,
+      "median_ns": 1466,
+      "mean_ns": 1582,
+      "max_ns": 1886
+    },
+    {
+      "metric": "prewarmed_database_queue_total",
+      "fixture": "representative",
+      "observations": 3,
+      "min_ns": 261511499,
+      "median_ns": 263273406,
+      "mean_ns": 272389972,
+      "max_ns": 292385013
+    },
+    {
+      "metric": "prewarmed_database_queue_total",
+      "fixture": "small",
+      "observations": 3,
+      "min_ns": 112951882,
+      "median_ns": 122885983,
+      "mean_ns": 127824944,
+      "max_ns": 147636967
+    },
+    {
+      "metric": "scenario_derived_cleanup",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 93280921,
+      "median_ns": 97294067,
+      "mean_ns": 97735811,
+      "max_ns": 102632445
+    },
+    {
+      "metric": "scenario_derived_construction",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 352671374,
+      "median_ns": 371234735,
+      "mean_ns": 380977949,
+      "max_ns": 419027740
+    },
+    {
+      "metric": "scenario_derived_drain",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 39323,
+      "median_ns": 39742,
+      "mean_ns": 41022,
+      "max_ns": 44002
+    },
+    {
+      "metric": "scenario_derived_lease_acquisition",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 173128589,
+      "median_ns": 176755000,
+      "mean_ns": 178970852,
+      "max_ns": 187028968
+    },
+    {
+      "metric": "scenario_derived_repeated_test_setup",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 0,
+      "median_ns": 0,
+      "mean_ns": 0,
+      "max_ns": 0
+    },
+    {
+      "metric": "scenario_derived_root_acquisition",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 44902617,
+      "median_ns": 46735625,
+      "mean_ns": 54933429,
+      "max_ns": 73162047
+    },
+    {
+      "metric": "scenario_derived_test_lifecycles",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 443949006,
+      "median_ns": 463890126,
+      "mean_ns": 466875946,
+      "max_ns": 492788706
+    },
+    {
+      "metric": "scenario_derived_total",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 796670110,
+      "median_ns": 835169352,
+      "mean_ns": 847900133,
+      "max_ns": 911860938
+    },
+    {
+      "metric": "scenario_derived_warm_acquisition",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 5658,
+      "median_ns": 6146,
+      "mean_ns": 6309,
+      "max_ns": 7124
+    },
+    {
+      "metric": "scenario_flat_cached_cleanup",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 70903404,
+      "median_ns": 74843562,
+      "mean_ns": 74473127,
+      "max_ns": 77672417
+    },
+    {
+      "metric": "scenario_flat_cached_construction",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 421033334,
+      "median_ns": 428265348,
+      "mean_ns": 426582204,
+      "max_ns": 430447930
+    },
+    {
+      "metric": "scenario_flat_cached_drain",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 29754,
+      "median_ns": 40230,
+      "mean_ns": 37972,
+      "max_ns": 43932
+    },
+    {
+      "metric": "scenario_flat_cached_lease_acquisition",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 173142137,
+      "median_ns": 180292151,
+      "mean_ns": 178891437,
+      "max_ns": 183240024
+    },
+    {
+      "metric": "scenario_flat_cached_repeated_test_setup",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 0,
+      "median_ns": 0,
+      "mean_ns": 0,
+      "max_ns": 0
+    },
+    {
+      "metric": "scenario_flat_cached_test_lifecycles",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 434631915,
+      "median_ns": 441741840,
+      "mean_ns": 442097792,
+      "max_ns": 449919622
+    },
+    {
+      "metric": "scenario_flat_cached_total",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 862810236,
+      "median_ns": 862941824,
+      "mean_ns": 868722648,
+      "max_ns": 880415885
+    },
+    {
+      "metric": "scenario_flat_cached_warm_acquisition",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 2374,
+      "median_ns": 2864,
+      "mean_ns": 3329,
+      "max_ns": 4750
+    },
+    {
+      "metric": "scenario_per_test_cleanup",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 66791081,
+      "median_ns": 68554172,
+      "mean_ns": 71798559,
+      "max_ns": 80050424
+    },
+    {
+      "metric": "scenario_per_test_construction",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 47687540,
+      "median_ns": 51998433,
+      "mean_ns": 51924886,
+      "max_ns": 56088687
+    },
+    {
+      "metric": "scenario_per_test_drain",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 36878,
+      "median_ns": 39812,
+      "mean_ns": 40556,
+      "max_ns": 44980
+    },
+    {
+      "metric": "scenario_per_test_lease_acquisition",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 121076583,
+      "median_ns": 126561497,
+      "mean_ns": 125210814,
+      "max_ns": 127994364
+    },
+    {
+      "metric": "scenario_per_test_repeated_test_setup",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 1203806347,
+      "median_ns": 1255001007,
+      "mean_ns": 1242817831,
+      "max_ns": 1269646141
+    },
+    {
+      "metric": "scenario_per_test_root_acquisition",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 47684746,
+      "median_ns": 51994103,
+      "mean_ns": 51921394,
+      "max_ns": 56085334
+    },
+    {
+      "metric": "scenario_per_test_test_lifecycles",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 1561122543,
+      "median_ns": 1624635246,
+      "mean_ns": 1619888404,
+      "max_ns": 1673907425
+    },
+    {
+      "metric": "scenario_per_test_total",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 1608854643,
+      "median_ns": 1680764652,
+      "mean_ns": 1671858108,
+      "max_ns": 1725955029
+    },
+    {
+      "metric": "scenario_per_test_warm_acquisition",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 3212,
+      "median_ns": 3353,
+      "mean_ns": 3771,
+      "max_ns": 4749
+    },
+    {
+      "metric": "sequential_clone_cleanup",
+      "fixture": "representative",
+      "observations": 3,
+      "min_ns": 181758614,
+      "median_ns": 186734221,
+      "mean_ns": 191375550,
+      "max_ns": 205633815
+    },
+    {
+      "metric": "sequential_clone_cleanup",
+      "fixture": "small",
+      "observations": 3,
+      "min_ns": 107161116,
+      "median_ns": 111960155,
+      "mean_ns": 124350047,
+      "max_ns": 153928870
+    },
+    {
+      "metric": "server_startup",
+      "fixture": null,
+      "observations": 3,
+      "min_ns": 1248568506,
+      "median_ns": 1283912717,
+      "mean_ns": 1286010297,
+      "max_ns": 1325549669
+    },
+    {
+      "metric": "warm_template_acquisition",
+      "fixture": "representative",
+      "observations": 3,
+      "min_ns": 1886,
+      "median_ns": 2864,
+      "mean_ns": 2654,
+      "max_ns": 3213
+    },
+    {
+      "metric": "warm_template_acquisition",
+      "fixture": "small",
+      "observations": 3,
+      "min_ns": 1467,
+      "median_ns": 2444,
+      "mean_ns": 2235,
+      "max_ns": 2794
+    }
+  ],
+  "notes": [
+    "Durations are observations, never pass/fail thresholds.",
+    "Owned startup requires a cached image and excludes image-pull time.",
+    "Owned profile settings record initdb synchronization and the effective harness storage mount; image-default storage adds no harness tmpfs mount.",
+    "The owned profile does not disable data checksums or lower wal_level; reports record both server settings.",
+    "Deferred cleanup records caller-return latency separately from the awaited final drain barrier.",
+    "The drain barrier reports worker failures; one post-barrier catalog query verifies that every exact lease name is absent.",
+    "The downstream pool spike eagerly opens its configured maximum on every measured lease and verifies the exact peak in pg_stat_activity; ordinary application pools may establish fewer physical connections lazily.",
+    "The prewarm phase reports synchronous initial fill, first and steady-state ready-queue lease latency, exact initial clone storage, background dirty-drop/refill throughput, and final idle-pool cleanup; dirty databases are never reused.",
+    "Scenario strategies validate identical rows; totals include complete cold construction, all test lifecycles and final drain. Warm acquisition and exact template storage queries are excluded diagnostics.",
+    "Connection permits reserve downstream application capacity only; owner, template-lock, lifecycle-pool, observer, and ambient external-server sessions are separate PostgreSQL connections.",
+    "Run both modes under comparable load and compare the versioned JSON output; URLs and credentials are never recorded."
+  ]
+}

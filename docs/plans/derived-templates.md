@@ -1,6 +1,6 @@
 # Composable cached database scenarios
 
-Status: implementation in progress; delivery beads record completion and validation.
+Status: complete; all six delivery tasks implemented, verified, and committed as separate slices.
 Date: 2026-09-06.
 Source baseline: `8a460ca`.
 Owner: Beads epic `postgres-test-harness-j82`.
@@ -1643,4 +1643,46 @@ Before claiming an implementation bead, verify it using `br show ID --json`.
 Use `br update ID --status=in_progress --json` for the selected delivery task.
 Close it only after its stated outcome is implemented and verified.
 Run `br sync --flush-only` after issue mutations.
-No implementation bead is claimed during this planning session.
+No implementation bead was claimed during the planning session. The subsequent
+implementation is recorded below.
+
+
+## 14. Completed delivery (2026-09-06)
+
+- DT1 (`a5ee9bb`): stable versioned composition with an independently calculated
+  golden vector and ancestor/step invalidation coverage; root identity unchanged.
+- DT2 (`3eb732c`): public `derive`, shared acquisition/recovery, owned parent
+  preparation, exact branching/isolation tests, and non-Send borrowed callbacks.
+- DT3 (`d9c371d`): observable PostgreSQL coordination, registered waiter recovery,
+  cancellation at preparation/finalization, combined errors, sealing, and
+  completed-child independence from stale ancestor cleanup.
+- DT4 (`6b3206e`): owned sources in detached lease and initial prewarm workers;
+  source-release, pristine refill, live-server admission, shutdown, and external
+  lifecycle coverage. CI executes the external tests.
+- DT5 (`c0b1bff`): runnable active/cancelled/overdue scenario example with exact
+  data checks and error-preserving cleanup; README and operational/adapter
+  guidance. Both server modes ran successfully, and CI runs the external example.
+- DT6 (this delivery commit): schema-v9 equivalent-state characterization,
+  exact template inventories, actual setup counters, rotated strategy order,
+  complete timing boundaries, and recorded raw release measurements. CI also
+  executes the benchmark validator's negative-data regression.
+
+Final verification passed: formatting; Clippy with warnings denied; all-target
+unit/API/example tests and README doctests in both feature modes; Rust 1.88
+all-target checks in both modes; all 55 Docker PostgreSQL lifecycle tests;
+both external-only lifecycle tests; the external benchmark-validator test;
+and the scenario example in owned and external modes.
+
+The release characterization completed three samples per mode with 50,000
+shared rows and an additional three owned samples with one row. Successful
+external cleanup removed all nine expected templates per sample. Independent
+report checks verified exact inventories, invocation counts, storage sums,
+timing accounting, summary statistics, and absence of admin URLs. The existing
+workflow renderer processed the new summary rows successfully.
+
+The [recorded baseline](../performance-baseline.md#derived-scenarios-schema-v9-2026-09-06)
+and its three raw JSON artifacts preserve results and provenance. Derived
+scenarios reduced repeated setup cost for the large fixture, had only a small
+and noisy advantage over flat caching, and were slower for the one-row fixture.
+All derived intermediate database storage is included. No performance threshold
+or universal speed claim was added.

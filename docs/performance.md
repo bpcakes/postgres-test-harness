@@ -147,7 +147,7 @@ The JSON records these boundaries for every sample and fixture:
   apples-to-apples comparison with the concurrent explicit drain.
 
 One persistent observer connection reads `pg_stat_database.sessions` before
-and after every phase. The report includes the cumulative values, delta, and
+and after each of the fixture phases above. The report includes the cumulative values, delta, and
 active admin-database sessions. That delta characterizes harness connection
 churn without adding instrumentation to the production path. It is exact on
 the single-purpose owned server. On a shared external server it is intentionally
@@ -196,12 +196,78 @@ owned initdb/storage profile, fixture rows, execution and completion methods,
 concurrency where caller-controlled, sample counts, resolved connection budget,
 per-database permits, effective maximum leases, downstream pool size, prewarm
 capacity, timeouts, the cleanup barrier guard, and external cleanup retry
-policy. Schema version 8 adds prewarm fill, ready-lease, exact storage, refill,
+policy. Schema version 9 adds the equivalent-state scenario comparison,
+exact template inventory, and strategy summaries described below. Schema
+version 8 added prewarm fill, ready-lease, exact storage, refill,
 and shutdown measurements. Schema version 7 added the downstream pool-spike
 measurement, resolved lease capacity, and both reserved-connection settings.
 Schema version 6 replaced catalog-polled deferred completion with explicit
 caller-return and awaited-drain timings. Consumers should branch on
 `schema_version`.
+
+## Scenario reuse comparison (schema version 9)
+
+Each sample also contains `scenario_reuse`, with two fixed branches (`active`
+and `cancelled`), `shared_rows` from `PTH_PERF_REPRESENTATIVE_ROWS`, and
+`tests_per_branch` from `PTH_PERF_SEQUENTIAL_OPERATIONS`. Each strategy performs
+`2 * tests_per_branch` sequential test lifecycles without prewarming. The shared
+fixture contains IDs 1 through the requested count, deterministic text payloads,
+and a base state. Each branch changes row 1 to its own state. Every test checks
+the exact count, complete ID range, and every row's payload and state.
+
+The strategies use identical migration, fixture, and branch SQL:
+
+| Strategy | Constructed templates | Migration / shared / each branch invocations |
+| --- | --- | --- |
+| `per_test` | Migrated root | 1 / twice tests per branch / tests per branch |
+| `flat_cached` | Two complete branch templates from `template0` | 2 / 2 / 1 |
+| `derived` | Root, shared fixture parent, two branch leaves | 1 / 1 / 1 |
+
+The per-test strategy applies shared setup and its branch delta in each test
+lease. The flat strategy repeats migrations and shared setup in both template
+initializers; it does not construct an unused common root. The derived strategy
+copies the root to prepare the shared fixture and copies that parent for each
+branch. Initializer counters increment at the actual SQL execution sites, and
+the sample fails if they disagree with these frequencies.
+
+Each strategy records the following nanosecond observations:
+
+| Field | Boundary |
+| --- | --- |
+| `construction_ns` | All template acquisition and setup before the first lease |
+| `root_acquisition_ns` | Root construction within that cost; `null` for flat scenarios, whose repeated migrations are included in construction |
+| `lease_acquisition_ns` | Sum of test lease acquisition durations |
+| `repeated_test_setup_ns` | Shared and branch SQL in test leases, excluding connect/close; zero for cached strategies |
+| `test_lifecycles_ns` | All leases, application connections, applicable setup, validation queries, connection closure, and awaited cleanup |
+| `cleanup_ns` | Sum of awaited lease cleanup durations, within test lifecycles |
+| `drain_ns` | Final explicit disposable cleanup drain |
+| `total_ns` | Wall time from beginning construction through the final drain |
+| `warm_acquisition_ns` | Reacquire every retained handle, including intermediates, after the primary total |
+
+The nested timings are diagnostics, not independent values to add to the
+primary total. Warm acquisition deliberately occurs outside `total_ns` and its
+callbacks must be skipped. Post-drain absence verification and storage queries
+also run outside that timer. Each strategy's `templates` lists exact names,
+construction roles, and `pg_database_size` values. `template_storage_bytes`
+sums the whole inventory, including derived intermediate nodes. Full copies
+consume storage even when only a small step changes their rows.
+
+Invocation, sample, and strategy domains prevent unintended cache sharing in
+this benchmark. Within a strategy they remain stable for warm measurements.
+Execution order rotates across samples; the array order records the actual
+order. All handles are released before external sample cleanup. The completed
+cleanup count comes from the distinct exact-name inventory across the existing
+fixture reports (`template_name`) and every scenario node, rather than the old
+fixture count. Failed samples keep the existing error-preserving cleanup path.
+
+Summary metrics use `scenario_<strategy>_<timing>`, for example
+`scenario_derived_total`. The existing CI table renderer displays these rows
+without a separate report format. Schema versions through 8 have no
+`scenario_reuse`; consumers must inspect `schema_version` before reading it.
+Raw samples retain workload, counters, inventories, and the standard source and
+environment provenance. A speedup is not a correctness requirement: repeated
+setup can dominate a large fixture, while extra copies can make derivation
+slower than flat caching for a small or cheap shared fixture.
 
 ## Configuration
 
@@ -219,11 +285,11 @@ exactly as it does for downstream callers.
 | Variable | Default | Meaning |
 | --- | ---: | --- |
 | `PTH_PERF_SAMPLES` | 3 | Independent server/harness samples |
-| `PTH_PERF_SEQUENTIAL_OPERATIONS` | 4 | Sequential clone-cleanup lifecycles per fixture |
+| `PTH_PERF_SEQUENTIAL_OPERATIONS` | 4 | Sequential clone-cleanup lifecycles per fixture; tests per scenario branch |
 | `PTH_PERF_CONCURRENCY` | 4 | Maximum concurrent clone-cleanup lifecycles |
 | `PTH_PERF_CONCURRENT_OPERATIONS` | 8 | Total bounded-concurrent lifecycles per fixture |
 | `PTH_PERF_DRAIN_DATABASES` | 4 | Pre-created leases in each cleanup-drain measurement |
-| `PTH_PERF_REPRESENTATIVE_ROWS` | 50000 | Rows migrated into the representative fixture |
+| `PTH_PERF_REPRESENTATIVE_ROWS` | 50000 | Rows in the representative fixture and shared scenario fixture |
 | `PTH_PERF_CONNECTION_BUDGET` | 120 | Total downstream-connection permits (`B`) |
 | `PTH_PERF_CONNECTIONS_PER_DATABASE` | 11 | Permits reserved by each live lease (`P`) |
 | `PTH_PERF_DOWNSTREAM_POOL_SIZE` | 10 | Connections eagerly opened on every lease in the pool spike; must be at most `P` |

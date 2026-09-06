@@ -144,6 +144,10 @@ jobs:
                   + ", image_default_storage"
               end
             ) + "`  ",
+            "Scenario comparison: `branches=" + (.samples[0].scenario_reuse.branch_count | tostring)
+              + ", shared_rows=" + (.samples[0].scenario_reuse.shared_rows | tostring)
+              + ", tests_per_branch=" + (.samples[0].scenario_reuse.tests_per_branch | tostring)
+              + "`; strategy totals include cold construction and final drain. Warm acquisition is excluded.  ",
             "Deferred completion observation: awaited bounded cleanup drain (guarded by `"
               + (.configuration.deferred_drain_timeout_ms | tostring) + " ms`)  ",
             "",

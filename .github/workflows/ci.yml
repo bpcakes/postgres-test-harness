@@ -74,3 +74,4 @@ jobs:
       - run: cargo run --locked --no-default-features --example downstream_adapter
       - run: cargo run --locked --no-default-features --example derived_scenarios
       - run: cargo test --locked --no-default-features --test external_only -- --ignored --test-threads=1
+      - run: cargo test --locked --no-default-features --example performance scenario_oracle -- --ignored

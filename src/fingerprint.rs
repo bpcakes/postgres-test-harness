@@ -99,6 +99,10 @@ impl FingerprintBuilder {
 }
 
 /// Inputs required to locate or create one immutable database template.
+///
+/// For [`crate::PostgresHarness::template`], this is the complete root identity.
+/// For [`crate::DatabaseTemplate::derive`], this identifies only the local setup
+/// step; the harness composes it with the parent's identity automatically.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TemplateSpec {
     fingerprint: TemplateFingerprint,

@@ -20,6 +20,9 @@ use postgres_test_harness::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+#[path = "postgres/derived.rs"]
+mod derived;
+
 struct OwnedHarnessFixture {
     harness: PostgresHarness,
     admin_url: String,

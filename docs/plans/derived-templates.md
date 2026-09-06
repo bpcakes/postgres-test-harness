@@ -1,6 +1,6 @@
 # Composable cached database scenarios
 
-Status: reviewed and ready for implementation; implementation has not started.
+Status: implementation in progress; delivery beads record completion and validation.
 Date: 2026-09-06.
 Source baseline: `8a460ca`.
 Owner: Beads epic `postgres-test-harness-j82`.
@@ -664,7 +664,7 @@ It is a tracking parent, not an implementation prerequisite.
 | DT5 | `postgres-test-harness-j82.5` | Runnable example and guidance | `postgres-test-harness-j82.2` |
 | DT6 | `postgres-test-harness-j82.6` | Scenario performance characterization | `postgres-test-harness-j82.2` |
 
-All six deliveries are open and unclaimed.
+At planning handoff all six deliveries were open and unclaimed.
 Each has a parent-child relationship to the epic and only the blocking
 prerequisites shown above.
 The epic's completion checklist is not a reverse blocking edge.

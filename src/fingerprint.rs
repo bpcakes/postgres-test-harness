@@ -49,6 +49,28 @@ impl fmt::Debug for TemplateFingerprint {
     }
 }
 
+/// Composes a persistent child identity without changing root fingerprints.
+///
+/// SHA-256 hashes three frames in order: the ASCII derived-v1 domain, the
+/// parent's full 32 raw bytes, and the local step's full 32 raw bytes. Each
+/// frame starts with its byte length as an unsigned 64-bit big-endian integer.
+/// Changing this recipe requires a new domain version for cache compatibility.
+pub(crate) fn derived_fingerprint(
+    parent: TemplateFingerprint,
+    step: TemplateFingerprint,
+) -> TemplateFingerprint {
+    let mut digest = Sha256::new();
+    for frame in [
+        b"postgres-test-harness-derived-template-v1".as_slice(),
+        parent.0.as_slice(),
+        step.0.as_slice(),
+    ] {
+        digest.update((frame.len() as u64).to_be_bytes());
+        digest.update(frame);
+    }
+    TemplateFingerprint(digest.finalize().into())
+}
+
 /// Length-framed fingerprint builder that avoids concatenation ambiguity.
 pub struct FingerprintBuilder(Sha256);
 
@@ -94,7 +116,60 @@ impl TemplateSpec {
 
 #[cfg(test)]
 mod tests {
-    use super::{FingerprintBuilder, TemplateFingerprint};
+    use super::{FingerprintBuilder, TemplateFingerprint, derived_fingerprint};
+
+    #[test]
+    fn derived_fingerprint_matches_independent_framed_vector() {
+        let parent = TemplateFingerprint::from_hex(
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        )
+        .unwrap();
+        let step = TemplateFingerprint::from_hex(
+            "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+        )
+        .unwrap();
+        // Independently calculated with Python hashlib.sha256 over frames
+        // prefixed by struct.pack('>Q', len(frame)): lengths 41, 32, 32;
+        // 129 bytes total. This deliberately does not use FingerprintBuilder.
+        assert_eq!(
+            derived_fingerprint(parent, step).to_hex(),
+            "678f8b338e81a48db8625fd8ab6c949a2852e6aec6261d710976de68381b7cd5"
+        );
+    }
+
+    #[test]
+    fn derived_fingerprint_tracks_ordered_parent_and_step_inputs() {
+        let parent = FingerprintBuilder::new("schema")
+            .add("migration", "v1")
+            .finish();
+        let changed_parent = FingerprintBuilder::new("schema")
+            .add("migration", "v2")
+            .finish();
+        let step = FingerprintBuilder::new("fixture")
+            .add("rows", "v1")
+            .finish();
+        let changed_step = FingerprintBuilder::new("fixture")
+            .add("rows", "v2")
+            .finish();
+        let child = derived_fingerprint(parent, step);
+
+        assert_eq!(child, derived_fingerprint(parent, step));
+        assert_ne!(child, parent);
+        assert_ne!(child, step);
+        assert_ne!(child, derived_fingerprint(changed_parent, step));
+        assert_ne!(child, derived_fingerprint(parent, changed_step));
+        assert_ne!(child, derived_fingerprint(step, parent));
+
+        let descendant_step = FingerprintBuilder::new("descendant").finish();
+        assert_ne!(
+            derived_fingerprint(child, descendant_step),
+            derived_fingerprint(derived_fingerprint(changed_parent, step), descendant_step)
+        );
+        assert_ne!(
+            derived_fingerprint(child, descendant_step),
+            derived_fingerprint(derived_fingerprint(parent, changed_step), descendant_step)
+        );
+    }
 
     #[test]
     fn fingerprint_frames_labels_and_content() {

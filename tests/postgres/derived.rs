@@ -1,7 +1,7 @@
 use std::future::Future;
 
 use super::*;
-use postgres_test_harness::DatabaseTemplate;
+use postgres_test_harness::{DatabaseTemplate, RootSpec, StepSpec};
 
 #[path = "derived/lifetime.rs"]
 mod lifetime;
@@ -15,17 +15,21 @@ const CHILD_SQL: &str = "UPDATE scenario SET value = 'cancelled' WHERE id = 2; \
 const SIBLING_SQL: &str = "INSERT INTO scenario VALUES (4, 'sibling')";
 const GRANDCHILD_SQL: &str = "INSERT INTO scenario VALUES (5, 'grandchild')";
 
-fn sql_spec(domain: &str, sql: &str) -> TemplateSpec {
-    TemplateSpec::new(
-        FingerprintBuilder::new(domain)
-            .add("setup.sql", sql)
-            .finish(),
-    )
+fn sql_root(domain: &str, sql: &str) -> RootSpec {
+    FingerprintBuilder::new(domain)
+        .add("setup.sql", sql)
+        .finish_root()
+}
+
+fn sql_step(domain: &str, sql: &str) -> StepSpec {
+    FingerprintBuilder::new(domain)
+        .add("setup.sql", sql)
+        .finish_step()
 }
 
 async fn scenario_root(harness: &PostgresHarness, domain: &str) -> DatabaseTemplate {
     harness
-        .template(sql_spec(domain, PARENT_SQL), |url| execute(url, PARENT_SQL))
+        .template(sql_root(domain, PARENT_SQL), |url| execute(url, PARENT_SQL))
         .await
         .expect("initialize populated scenario root")
 }
@@ -56,7 +60,7 @@ async fn derived_branches_inherit_data_and_isolate_updates_deletes_and_test_writ
     let fixture = OwnedHarnessFixture::start().await;
     let root = scenario_root(&fixture.harness, "derived-isolation").await;
     let child = root
-        .derive(sql_spec("child", CHILD_SQL), |url| async move {
+        .derive(sql_step("child", CHILD_SQL), |url| async move {
             assert_eq!(
                 scenario_rows(&url).await?,
                 ["organization", "active", "invoice"]
@@ -66,15 +70,16 @@ async fn derived_branches_inherit_data_and_isolate_updates_deletes_and_test_writ
         .await
         .expect("derive child with inherited data");
     let sibling = root
-        .derive(sql_spec("sibling", SIBLING_SQL), |url| {
+        .derive(sql_step("sibling", SIBLING_SQL), |url| {
             execute(url, SIBLING_SQL)
         })
         .await
         .expect("derive independent sibling");
     assert_ne!(child.fingerprint(), root.fingerprint());
+    // The step's own inputs, claimed as a root, never name the child.
     assert_ne!(
         child.fingerprint(),
-        sql_spec("child", CHILD_SQL).fingerprint()
+        sql_root("child", CHILD_SQL).fingerprint()
     );
     assert_ne!(child.fingerprint(), sibling.fingerprint());
     let dirty = child.database().await.expect("clone child for mutation");
@@ -101,7 +106,7 @@ async fn derived_grandchildren_track_changed_ancestor_inputs() {
         format!("{PARENT_SQL}; UPDATE scenario SET value = 'organization-v2' WHERE id = 1");
     let changed_root = fixture
         .harness
-        .template(sql_spec("derived-ancestry", &updated_sql), |url| {
+        .template(sql_root("derived-ancestry", &updated_sql), |url| {
             execute(url, updated_sql)
         })
         .await
@@ -109,11 +114,11 @@ async fn derived_grandchildren_track_changed_ancestor_inputs() {
     let mut descendants = Vec::new();
     for parent in [&root, &changed_root] {
         let child = parent
-            .derive(sql_spec("child", CHILD_SQL), |url| execute(url, CHILD_SQL))
+            .derive(sql_step("child", CHILD_SQL), |url| execute(url, CHILD_SQL))
             .await
             .expect("derive child under ancestor");
         let grandchild = child
-            .derive(sql_spec("grandchild", GRANDCHILD_SQL), |url| {
+            .derive(sql_step("grandchild", GRANDCHILD_SQL), |url| {
                 execute(url, GRANDCHILD_SQL)
             })
             .await
@@ -150,7 +155,7 @@ async fn derived_grandchildren_track_changed_ancestor_inputs() {
 async fn derived_warm_acquisition_skips_database_work_and_initializer() {
     let fixture = OwnedHarnessFixture::start().await;
     let root = scenario_root(&fixture.harness, "derived-warm").await;
-    let spec = sql_spec("child", CHILD_SQL);
+    let spec = sql_step("child", CHILD_SQL);
     let child = root
         .derive(spec, |url| execute(url, CHILD_SQL))
         .await

@@ -1,7 +1,7 @@
 //! Equivalent-state scenario comparison; all construction is inside the total.
 
 use super::*;
-use postgres_test_harness::DatabaseTemplate;
+use postgres_test_harness::{DatabaseTemplate, RootSpec, StepSpec};
 
 const MIGRATION: &str = "CREATE TABLE scenario_rows (
     id bigint PRIMARY KEY, payload text NOT NULL, state text NOT NULL
@@ -157,12 +157,12 @@ impl Workload {
         }
     }
 
-    fn spec(&self, strategy: Strategy, steps: &[Step]) -> TemplateSpec {
+    fn fingerprint(&self, strategy: Strategy, steps: &[Step]) -> FingerprintBuilder {
         let mut builder = FingerprintBuilder::new(&self.domain).add("strategy", strategy.name());
         for step in steps {
             builder = builder.add("setup.sql", self.sql(*step));
         }
-        TemplateSpec::new(builder.finish())
+        builder
     }
 
     async fn setup(
@@ -226,10 +226,16 @@ impl Workload {
     }
 }
 
+/// Root nodes start from `template0`; derived nodes copy an earlier node.
+#[derive(Clone, Copy)]
+enum NodeSpec {
+    Root(RootSpec),
+    Derived { parent: usize, step: StepSpec },
+}
+
 struct Node {
     template: DatabaseTemplate,
-    spec: TemplateSpec,
-    source: Option<usize>,
+    spec: NodeSpec,
     role: &'static str,
 }
 
@@ -254,16 +260,22 @@ impl Constructed {
             Step::Shared => "shared",
             Step::Branch(branch) => BRANCHES[*branch],
         };
-        let spec = workload.spec(strategy, steps);
+        let fingerprint = workload.fingerprint(strategy, steps);
         let setup = |url: String| async move { workload.initialize(&url, steps, counts).await };
-        let template = match source {
-            Some(parent) => self.nodes[parent].template.derive(spec, setup).await?,
-            None => harness.template(spec, setup).await?,
+        let (template, spec) = match source {
+            Some(parent) => {
+                let step = fingerprint.finish_step();
+                let template = self.nodes[parent].template.derive(step, setup).await?;
+                (template, NodeSpec::Derived { parent, step })
+            }
+            None => {
+                let root = fingerprint.finish_root();
+                (harness.template(root, setup).await?, NodeSpec::Root(root))
+            }
         };
         self.nodes.push(Node {
             template,
             spec,
-            source,
             role,
         });
         Ok(())
@@ -276,14 +288,11 @@ impl Constructed {
             let skipped = |_| async {
                 Err(io::Error::other("scenario warm initializer unexpectedly ran").into())
             };
-            let cached = match node.source {
-                Some(parent) => {
-                    self.nodes[parent]
-                        .template
-                        .derive(node.spec, skipped)
-                        .await?
+            let cached = match node.spec {
+                NodeSpec::Derived { parent, step } => {
+                    self.nodes[parent].template.derive(step, skipped).await?
                 }
-                None => harness.template(node.spec, skipped).await?,
+                NodeSpec::Root(root) => harness.template(root, skipped).await?,
             };
             if cached.database_name() != node.template.database_name() {
                 return Err(io::Error::other("warm scenario changed its database identity").into());

@@ -24,8 +24,7 @@ use std::{
 
 use postgres_test_harness::{
     BoxError, CleanupReport, FingerprintBuilder, HarnessConfig, OwnedContainerProfile,
-    POSTGRES_TEST_ADMIN_URL_ENV, POSTGRES_TEST_IMAGE_ENV, PostgresHarness, TemplateSpec,
-    cleanup_stale_databases,
+    POSTGRES_TEST_ADMIN_URL_ENV, POSTGRES_TEST_IMAGE_ENV, PostgresHarness, cleanup_stale_databases,
 };
 use serde::Serialize;
 use tokio::{sync::Semaphore, task::JoinSet};
@@ -1188,13 +1187,12 @@ async fn run_fixture(
     invocation: &str,
     sample: usize,
 ) -> AnyResult<FixtureReport> {
-    let fingerprint = FingerprintBuilder::new("performance-v1")
+    let spec = FingerprintBuilder::new("performance-v1")
         .add("fixture", fixture.name)
         .add("migration", fixture.migration_sql.as_bytes())
         .add("invocation", invocation)
         .add("sample", sample.to_string())
-        .finish();
-    let spec = TemplateSpec::new(fingerprint);
+        .finish_root();
     let initialized = Arc::new(AtomicBool::new(false));
     let initialized_by_cold_path = initialized.clone();
     let migration_sql = fixture.migration_sql.clone();

@@ -7,7 +7,7 @@ use std::{error::Error as StdError, fmt, io};
 
 use postgres_test_harness::{
     BoxError, DatabaseLease, DatabaseTemplate, FingerprintBuilder, HarnessConfig, PostgresHarness,
-    Result, TemplateFingerprint, TemplateSpec,
+    Result, RootSpec,
 };
 use tokio::sync::OnceCell;
 use tokio_postgres::NoTls;
@@ -63,13 +63,13 @@ async fn harness() -> Result<&'static PostgresHarness> {
         .await
 }
 
-fn schema_fingerprint() -> TemplateFingerprint {
+fn schema_spec() -> RootSpec {
     // Include every ordered input that shapes the migrated schema, including
     // migration bundles supplied by dependent crates in a real adapter.
     FingerprintBuilder::new("adapter-example-schema-v1")
         .add("0001_create_widgets.sql", CREATE_WIDGETS)
         .add("0002_index_widgets.sql", INDEX_WIDGETS)
-        .finish()
+        .finish_root()
 }
 
 async fn template() -> Result<&'static DatabaseTemplate> {
@@ -77,7 +77,7 @@ async fn template() -> Result<&'static DatabaseTemplate> {
         .get_or_try_init(|| async {
             harness()
                 .await?
-                .template(TemplateSpec::new(schema_fingerprint()), apply_migrations)
+                .template(schema_spec(), apply_migrations)
                 .await
         })
         .await
@@ -191,14 +191,13 @@ async fn main() -> std::result::Result<(), BoxError> {
 mod tests {
     use super::{
         CONNECTION_BUDGET, CONNECTIONS_PER_DATABASE, MAX_PARALLEL_DATABASES,
-        combine_operation_and_cleanup, ensure_widget_table_is_empty, harness_config,
-        schema_fingerprint,
+        combine_operation_and_cleanup, ensure_widget_table_is_empty, harness_config, schema_spec,
     };
 
     #[test]
     fn schema_fingerprint_is_stable_and_complete() {
         assert_eq!(
-            schema_fingerprint().to_hex(),
+            schema_spec().fingerprint().to_hex(),
             "7232f27f45ea0667740c7342c70bbcabc79c48e9738024e46b8c4f60fe1df1b0"
         );
     }

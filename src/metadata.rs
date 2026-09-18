@@ -1,6 +1,6 @@
 use std::{collections::HashMap, time::SystemTime};
 
-use crate::{ProjectName, TemplateFingerprint};
+use crate::{ProjectName, TemplateFingerprint, fingerprint::TemplateIdentity};
 
 const PREFIX: &str = "postgres-test-harness:v1";
 
@@ -21,6 +21,8 @@ pub(crate) enum ResourceMetadata {
         project: ProjectName,
         lock_key: i64,
         fingerprint: TemplateFingerprint,
+        // Absent for roots, so their encoding predates derived templates.
+        parent: Option<TemplateFingerprint>,
         state: TemplateState,
         created_at: u64,
     },
@@ -38,13 +40,14 @@ impl ResourceMetadata {
     pub(crate) fn template(
         project: ProjectName,
         lock_key: i64,
-        fingerprint: TemplateFingerprint,
+        identity: TemplateIdentity,
         state: TemplateState,
     ) -> Self {
         Self::Template {
             project,
             lock_key,
-            fingerprint,
+            fingerprint: identity.fingerprint(),
+            parent: identity.parent(),
             state,
             created_at: unix_now(),
         }
@@ -64,15 +67,19 @@ impl ResourceMetadata {
                 project,
                 lock_key,
                 fingerprint,
+                parent,
                 state,
                 created_at,
             } => {
+                let parent = parent
+                    .map(|parent| format!(";parent={}", parent.to_hex()))
+                    .unwrap_or_default();
                 let state = match state {
                     TemplateState::Initializing => "initializing",
                     TemplateState::Ready => "ready",
                 };
                 format!(
-                    "{PREFIX};kind=template;project={};lock={lock_key};fingerprint={};state={state};created={created_at}",
+                    "{PREFIX};kind=template;project={};lock={lock_key};fingerprint={}{parent};state={state};created={created_at}",
                     project.as_str(),
                     fingerprint.to_hex()
                 )
@@ -101,10 +108,14 @@ impl ResourceMetadata {
                 owner_key: values.remove("owner")?.parse().ok()?,
                 created_at,
             },
-            "template" if values.len() == 3 => Self::Template {
+            "template" => Self::Template {
                 project,
                 lock_key: values.remove("lock")?.parse().ok()?,
-                fingerprint: TemplateFingerprint::from_hex(values.remove("fingerprint")?).ok()?,
+                fingerprint: TemplateFingerprint::from_hex(values.remove("fingerprint")?)?,
+                parent: match values.remove("parent") {
+                    Some(parent) => Some(TemplateFingerprint::from_hex(parent)?),
+                    None => None,
+                },
                 state: match values.remove("state")? {
                     "initializing" => TemplateState::Initializing,
                     "ready" => TemplateState::Ready,
@@ -146,7 +157,7 @@ fn unix_now() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use crate::{FingerprintBuilder, ProjectName};
+    use crate::{FingerprintBuilder, ProjectName, fingerprint::TemplateIdentity};
 
     use super::{ResourceMetadata, TemplateState};
 
@@ -157,14 +168,70 @@ mod tests {
     }
 
     #[test]
-    fn template_metadata_round_trips() {
-        let metadata = ResourceMetadata::template(
+    fn root_template_metadata_keeps_its_original_encoding() {
+        let encoded = "postgres-test-harness:v1;kind=template;project=creditkit;lock=42;\
+            fingerprint=fc8eb7daf3f83a0c92ccf0b5f4122bc72e6a84dba4eb38896c2c9d0ef95afe7f;\
+            state=ready;created=7";
+        let root = FingerprintBuilder::new("schema")
+            .add("migration", "select 1")
+            .finish_root();
+        let metadata = ResourceMetadata::parse(encoded).unwrap();
+
+        assert_eq!(
+            metadata,
+            ResourceMetadata::Template {
+                project: ProjectName::new("creditkit").unwrap(),
+                lock_key: 42,
+                fingerprint: root.fingerprint(),
+                parent: None,
+                state: TemplateState::Ready,
+                created_at: 7,
+            }
+        );
+        assert_eq!(metadata.encode(), encoded);
+    }
+
+    #[test]
+    fn derived_template_metadata_records_its_parent() {
+        let encoded = "postgres-test-harness:v1;kind=template;project=creditkit;lock=42;\
+            fingerprint=46d3709876f0cd53ee201cbda27d8c0322ccd48fe4fdfd95de2f14ae669b2123;\
+            parent=4c618086f44e0de75968300e7a2db86f507fc5688a461831f3f679a80d0c60ed;\
+            state=ready;created=7";
+        let parent = FingerprintBuilder::new("schema")
+            .finish_root()
+            .fingerprint();
+        let identity =
+            TemplateIdentity::derived(parent, FingerprintBuilder::new("fixture").finish_step());
+        let written = ResourceMetadata::template(
             ProjectName::new("creditkit").unwrap(),
             42,
-            FingerprintBuilder::new("schema").finish(),
+            identity,
             TemplateState::Ready,
         );
-        assert_eq!(ResourceMetadata::parse(&metadata.encode()), Some(metadata));
+        assert!(matches!(
+            written,
+            ResourceMetadata::Template {
+                fingerprint,
+                parent: Some(recorded_parent),
+                ..
+            } if fingerprint == identity.fingerprint() && recorded_parent == parent
+        ));
+        let metadata = ResourceMetadata::Template {
+            project: ProjectName::new("creditkit").unwrap(),
+            lock_key: 42,
+            fingerprint: identity.fingerprint(),
+            parent: identity.parent(),
+            state: TemplateState::Ready,
+            created_at: 7,
+        };
+
+        assert_eq!(metadata.encode(), encoded);
+        assert!(encoded.contains(&format!(";parent={};", parent.to_hex())));
+        assert_eq!(ResourceMetadata::parse(encoded), Some(metadata));
+        assert!(
+            ResourceMetadata::parse(&encoded.replace(&parent.to_hex(), "not-a-fingerprint"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -176,5 +243,14 @@ mod tests {
             )
             .is_none()
         );
+        let template = ResourceMetadata::template(
+            ProjectName::new("x").unwrap(),
+            1,
+            TemplateIdentity::root(FingerprintBuilder::new("schema").finish_root()),
+            TemplateState::Ready,
+        )
+        .encode();
+        assert!(ResourceMetadata::parse(&template).is_some());
+        assert!(ResourceMetadata::parse(&format!("{template};extra=1")).is_none());
     }
 }

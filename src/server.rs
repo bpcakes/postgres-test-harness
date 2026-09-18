@@ -1183,11 +1183,15 @@ mod template_cache_tests {
         let mut cache = TemplateCache::default();
         for index in 0..3 {
             cache.entries.insert(
-                FingerprintBuilder::new(format!("expired-{index}")).finish(),
+                FingerprintBuilder::new(format!("expired-{index}"))
+                    .finish_root()
+                    .fingerprint(),
                 TemplateCacheEntry::Ready(Weak::new()),
             );
         }
-        let initializing = FingerprintBuilder::new("initializing").finish();
+        let initializing = FingerprintBuilder::new("initializing")
+            .finish_root()
+            .fingerprint();
         cache.entries.insert(
             initializing,
             TemplateCacheEntry::Initializing(Arc::new(TemplateFlight::new())),

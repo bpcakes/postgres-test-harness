@@ -49,7 +49,7 @@ async fn template() -> Result<&'static DatabaseTemplate> {
         .get_or_try_init(|| async {
             harness()
                 .await?
-                .template(TemplateSpec::new(schema_fingerprint()), apply_migrations)
+                .template(schema_spec(), apply_migrations)
                 .await
         })
         .await
@@ -68,9 +68,9 @@ empty database for every ordinary test discards the main reuse boundary.
 
 ## Make the fingerprint complete and stable
 
-`TemplateFingerprint` is the schema identity, not a cache-busting timestamp.
-Build it in a fixed order from every byte sequence that can change the
-initialized database:
+The root spec from `FingerprintBuilder::finish_root` is the schema identity,
+not a cache-busting timestamp. Build it in a fixed order from every byte
+sequence that can change the initialized database:
 
 - all application migrations;
 - embedded migrations from dependent crates;
@@ -93,7 +93,7 @@ from the active branch. Each test leases a fresh clone of its selected leaf.
 The [scenario example](../examples/derived_scenarios.rs) implements this with
 fixed inputs and the public API in both feature modes.
 
-A child's local spec hashes only its actual setup inputs; `derive` composes it
+A child's step spec hashes only its actual setup inputs; `derive` composes it
 with the parent automatically. Keep SQL/data inputs stable and include a setup
 revision when Rust logic changes the output. A changed migration then
 invalidates downstream scenarios naturally. Cache-hit callbacks are skipped,

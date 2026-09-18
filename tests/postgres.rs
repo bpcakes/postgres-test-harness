@@ -15,7 +15,7 @@ use std::{
 use postgres::{Client, NoTls};
 use postgres_test_harness::{
     BoxError, DEFAULT_OWNED_CONTAINER_TMPFS_SIZE_BYTES, Error, FingerprintBuilder, HarnessConfig,
-    OwnedContainerProfile, PostgresHarness, TemplateSpec, cleanup_stale_databases,
+    OwnedContainerProfile, PostgresHarness, cleanup_stale_databases,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -168,7 +168,7 @@ async fn stale_cleanup_preserves_active_and_untagged_databases() {
     let harness = &fixture.harness;
     let admin_url = &fixture.admin_url;
     {
-        let cleanup_spec = TemplateSpec::new(FingerprintBuilder::new("cleanup-schema").finish());
+        let cleanup_spec = FingerprintBuilder::new("cleanup-schema").finish_root();
         let cleanup_template = harness
             .template(cleanup_spec, |_| async { Ok(()) })
             .await
@@ -242,10 +242,13 @@ async fn dropping_template_releases_its_retained_advisory_lock() {
     let harness = &fixture.harness;
     let admin_url = &fixture.admin_url;
     {
-        let fingerprint = FingerprintBuilder::new("drop-lock-regression").finish();
-        let lock_key = advisory_key("template", &format!("harness_it:{}", fingerprint.to_hex()));
+        let spec = FingerprintBuilder::new("drop-lock-regression").finish_root();
+        let lock_key = advisory_key(
+            "template",
+            &format!("harness_it:{}", spec.fingerprint().to_hex()),
+        );
         let template = harness
-            .template(TemplateSpec::new(fingerprint), |_| async { Ok(()) })
+            .template(spec, |_| async { Ok(()) })
             .await
             .expect("initialize template for retained-lock drop regression");
         assert!(
@@ -275,12 +278,12 @@ async fn many_live_templates_retain_separate_lock_sessions() {
             .expect("count shared locks before many-template capacity regression");
         let mut templates = Vec::with_capacity(LIVE_TEMPLATES);
         for index in 0..LIVE_TEMPLATES {
-            let fingerprint = FingerprintBuilder::new("many-live-templates")
+            let spec = FingerprintBuilder::new("many-live-templates")
                 .add("index", index.to_string())
-                .finish();
+                .finish_root();
             templates.push(
                 harness
-                    .template(TemplateSpec::new(fingerprint), |_| async { Ok(()) })
+                    .template(spec, |_| async { Ok(()) })
                     .await
                     .unwrap_or_else(|error| panic!("initialize live template {index}: {error}")),
             );
@@ -364,7 +367,7 @@ async fn prewarm_refill_failure_closes_only_the_pool() {
         .expect("start prewarm refill-failure harness");
         let template = failure_harness
             .template(
-                TemplateSpec::new(FingerprintBuilder::new("prewarm-failure").finish()),
+                FingerprintBuilder::new("prewarm-failure").finish_root(),
                 |_| async { Ok(()) },
             )
             .await
@@ -523,14 +526,12 @@ async fn concurrent_template_cold_start_initializes_once() {
     let harness = &fixture.harness;
     let admin_url = &fixture.admin_url;
     {
-        let concurrent_spec = TemplateSpec::new(
-            FingerprintBuilder::new("concurrent-schema")
-                .add(
-                    "0001-create-concurrent-marker",
-                    "CREATE TABLE concurrent_marker (value text NOT NULL)",
-                )
-                .finish(),
-        );
+        let concurrent_spec = FingerprintBuilder::new("concurrent-schema")
+            .add(
+                "0001-create-concurrent-marker",
+                "CREATE TABLE concurrent_marker (value text NOT NULL)",
+            )
+            .finish_root();
         const CONCURRENT_CALLERS: usize = 8;
         let shared_locks_before = advisory_lock_count(admin_url.clone(), "ShareLock")
             .await
@@ -597,13 +598,13 @@ async fn template_clones_retain_locks_and_stale_cache_entries_reacquire() {
     let harness = &fixture.harness;
     let admin_url = &fixture.admin_url;
     {
-        let clone_fingerprint = FingerprintBuilder::new("template-clone-lock").finish();
+        let clone_spec = FingerprintBuilder::new("template-clone-lock").finish_root();
         let clone_lock_key = advisory_key(
             "template",
-            &format!("harness_it:{}", clone_fingerprint.to_hex()),
+            &format!("harness_it:{}", clone_spec.fingerprint().to_hex()),
         );
         let template = harness
-            .template(TemplateSpec::new(clone_fingerprint), |_| async { Ok(()) })
+            .template(clone_spec, |_| async { Ok(()) })
             .await
             .expect("initialize clone-held-lock template");
         let template_clone = template.clone();
@@ -619,7 +620,7 @@ async fn template_clones_retain_locks_and_stale_cache_entries_reacquire() {
 
         let reacquired = tokio::time::timeout(
             Duration::from_secs(5),
-            harness.template(TemplateSpec::new(clone_fingerprint), |_| async {
+            harness.template(clone_spec, |_| async {
                 Err(std::io::Error::other("ready template initializer must not rerun").into())
             }),
         )
@@ -644,11 +645,10 @@ async fn warm_template_cache_bypasses_queued_exclusive_lock() {
     let harness = &fixture.harness;
     let admin_url = &fixture.admin_url;
     {
-        let queued_fingerprint = FingerprintBuilder::new("queued-exclusive").finish();
-        let queued_spec = TemplateSpec::new(queued_fingerprint);
+        let queued_spec = FingerprintBuilder::new("queued-exclusive").finish_root();
         let queued_lock_key = advisory_key(
             "template",
-            &format!("harness_it:{}", queued_fingerprint.to_hex()),
+            &format!("harness_it:{}", queued_spec.fingerprint().to_hex()),
         );
         let shared_locks_before = advisory_lock_count(admin_url.clone(), "ShareLock")
             .await
@@ -726,8 +726,7 @@ async fn initializer_failure_wakes_waiter_and_allows_recovery() {
     let fixture = OwnedHarnessFixture::start().await;
     let harness = &fixture.harness;
     {
-        let error_fingerprint = FingerprintBuilder::new("initializer-error-recovery").finish();
-        let error_spec = TemplateSpec::new(error_fingerprint);
+        let error_spec = FingerprintBuilder::new("initializer-error-recovery").finish_root();
         let failing_harness = harness.clone();
         let (initializer_started_sender, initializer_started_receiver) =
             tokio::sync::oneshot::channel();
@@ -790,9 +789,8 @@ async fn initializer_cancellation_wakes_waiter_and_allows_recovery() {
     let fixture = OwnedHarnessFixture::start().await;
     let harness = &fixture.harness;
     {
-        let cancellation_fingerprint =
-            FingerprintBuilder::new("initializer-cancellation-recovery").finish();
-        let cancellation_spec = TemplateSpec::new(cancellation_fingerprint);
+        let cancellation_spec =
+            FingerprintBuilder::new("initializer-cancellation-recovery").finish_root();
         let cancellation_harness = harness.clone();
         let (initializer_started_sender, initializer_started_receiver) =
             tokio::sync::oneshot::channel();
@@ -868,7 +866,7 @@ async fn template_wait_timeout_is_separate_from_operation_timeout() {
         )
         .await
         .expect("start distinct short-operation-timeout server cache");
-        let slow_spec = TemplateSpec::new(FingerprintBuilder::new("slow-schema").finish());
+        let slow_spec = FingerprintBuilder::new("slow-schema").finish_root();
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
         let slow_initializations = Arc::new(AtomicUsize::new(0));
         let first_barrier = barrier.clone();
@@ -920,8 +918,7 @@ async fn template_finalization_terminates_lingering_initializer_connections() {
     {
         let held_client = Arc::new(Mutex::new(None));
         let held_client_for_initializer = held_client.clone();
-        let connection_spec =
-            TemplateSpec::new(FingerprintBuilder::new("held-connection").finish());
+        let connection_spec = FingerprintBuilder::new("held-connection").finish_root();
         let connection_template = harness
             .template(connection_spec, move |database_url| async move {
                 let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
@@ -980,17 +977,14 @@ async fn unrecognized_deterministic_template_is_preserved() {
     let harness = &fixture.harness;
     let admin_url = &fixture.admin_url;
     {
-        let unknown_fingerprint = FingerprintBuilder::new("unknown-template").finish();
+        let unknown_spec = FingerprintBuilder::new("unknown-template").finish_root();
         let unknown_name = format!(
             "pgh_harness_it_template_{}",
-            &unknown_fingerprint.to_hex()[..24]
+            &unknown_spec.fingerprint().to_hex()[..24]
         );
         let unknown_database =
             TemporaryDatabase::create(admin_url.clone(), unknown_name.clone()).await;
-        let error = match harness
-            .template(TemplateSpec::new(unknown_fingerprint), |_| async { Ok(()) })
-            .await
-        {
+        let error = match harness.template(unknown_spec, |_| async { Ok(()) }).await {
             Ok(_) => panic!("unrecognized deterministic template must not be replaced"),
             Err(error) => error,
         };
@@ -1239,9 +1233,9 @@ async fn prewarm_validates_capacity_without_reserving_application_permits() {
         )
         .await
         .expect("start prewarm regression harness");
-        let fingerprint = FingerprintBuilder::new("prewarm-main").finish();
+        let spec = FingerprintBuilder::new("prewarm-main").finish_root();
         let template = prewarm_harness
-            .template(TemplateSpec::new(fingerprint), |database_url| async move {
+            .template(spec, |database_url| async move {
                 execute(database_url, "CREATE TABLE base_marker (value integer)").await
             })
             .await
@@ -1314,9 +1308,9 @@ async fn prewarm_exhaustion_backpressures_and_cancelled_waiters_release_cleanly(
         )
         .await
         .expect("start prewarm regression harness");
-        let fingerprint = FingerprintBuilder::new("prewarm-main").finish();
+        let spec = FingerprintBuilder::new("prewarm-main").finish_root();
         let template = prewarm_harness
-            .template(TemplateSpec::new(fingerprint), |database_url| async move {
+            .template(spec, |database_url| async move {
                 execute(database_url, "CREATE TABLE base_marker (value integer)").await
             })
             .await
@@ -1385,9 +1379,9 @@ async fn prewarm_dirty_return_refills_with_a_fresh_database_and_wakes_waiter() {
         )
         .await
         .expect("start prewarm regression harness");
-        let fingerprint = FingerprintBuilder::new("prewarm-main").finish();
+        let spec = FingerprintBuilder::new("prewarm-main").finish_root();
         let template = prewarm_harness
-            .template(TemplateSpec::new(fingerprint), |database_url| async move {
+            .template(spec, |database_url| async move {
                 execute(database_url, "CREATE TABLE base_marker (value integer)").await
             })
             .await
@@ -1490,10 +1484,13 @@ async fn prewarm_pools_are_template_isolated_and_retain_the_source_lock() {
         )
         .await
         .expect("start prewarm regression harness");
-        let fingerprint = FingerprintBuilder::new("prewarm-main").finish();
-        let lock_key = advisory_key("template", &format!("{PROJECT}:{}", fingerprint.to_hex()));
+        let spec = FingerprintBuilder::new("prewarm-main").finish_root();
+        let lock_key = advisory_key(
+            "template",
+            &format!("{PROJECT}:{}", spec.fingerprint().to_hex()),
+        );
         let template = prewarm_harness
-            .template(TemplateSpec::new(fingerprint), |database_url| async move {
+            .template(spec, |database_url| async move {
                 execute(database_url, "CREATE TABLE base_marker (value integer)").await
             })
             .await
@@ -1504,7 +1501,7 @@ async fn prewarm_pools_are_template_isolated_and_retain_the_source_lock() {
             .expect("fill two prewarmed database slots");
         let other_template = prewarm_harness
             .template(
-                TemplateSpec::new(FingerprintBuilder::new("prewarm-other").finish()),
+                FingerprintBuilder::new("prewarm-other").finish_root(),
                 |database_url| async move {
                     execute(database_url, "CREATE TABLE other_marker (value integer)").await
                 },
@@ -1572,14 +1569,12 @@ async fn ready_templates_are_reused_and_support_repeated_disposable_databases() 
     let fixture = OwnedHarnessFixture::start().await;
     let harness = &fixture.harness;
     {
-        let spec = TemplateSpec::new(
-            FingerprintBuilder::new("integration-schema")
-                .add(
-                    "0001-create-marker",
-                    "CREATE TABLE harness_marker (value text NOT NULL)",
-                )
-                .finish(),
-        );
+        let spec = FingerprintBuilder::new("integration-schema")
+            .add(
+                "0001-create-marker",
+                "CREATE TABLE harness_marker (value text NOT NULL)",
+            )
+            .finish_root();
         let template = harness
             .template(spec, |database_url| async move {
                 execute(
@@ -1626,14 +1621,12 @@ async fn template_clones_are_isolated_and_support_explicit_and_deferred_cleanup(
     let harness = &fixture.harness;
     let admin_url = &fixture.admin_url;
     {
-        let spec = TemplateSpec::new(
-            FingerprintBuilder::new("integration-schema")
-                .add(
-                    "0001-create-marker",
-                    "CREATE TABLE harness_marker (value text NOT NULL)",
-                )
-                .finish(),
-        );
+        let spec = FingerprintBuilder::new("integration-schema")
+            .add(
+                "0001-create-marker",
+                "CREATE TABLE harness_marker (value text NOT NULL)",
+            )
+            .finish_root();
         let template = harness
             .template(spec, |database_url| async move {
                 execute(
@@ -1752,9 +1745,7 @@ async fn awaited_cleanup_failure_closes_admission_and_is_reported_once() {
         .expect("remove injected awaited-cleanup residual");
         let template_after_terminal_admission = failure_harness
             .template(
-                TemplateSpec::new(
-                    FingerprintBuilder::new("template-after-terminal-admission").finish(),
-                ),
+                FingerprintBuilder::new("template-after-terminal-admission").finish_root(),
                 |_| async { Ok::<_, BoxError>(()) },
             )
             .await;
@@ -1845,7 +1836,7 @@ async fn owned_shutdown_is_idempotent_and_wakes_all_waiters() {
         .expect("start owned-shutdown harness");
         let shutdown_template = shutdown_harness
             .template(
-                TemplateSpec::new(FingerprintBuilder::new("shutdown-prewarm").finish()),
+                FingerprintBuilder::new("shutdown-prewarm").finish_root(),
                 |_| async { Ok(()) },
             )
             .await
@@ -1921,7 +1912,7 @@ async fn prewarm_shutdown_wakes_checkout_waiting_for_database_capacity() {
     .expect("start prewarm-close regression harness");
     let template = harness
         .template(
-            TemplateSpec::new(FingerprintBuilder::new("prewarm-close").finish()),
+            FingerprintBuilder::new("prewarm-close").finish_root(),
             |_| async { Ok(()) },
         )
         .await

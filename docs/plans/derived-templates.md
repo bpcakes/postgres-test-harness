@@ -1,6 +1,9 @@
 # Composable cached database scenarios
 
 Status: complete; all six delivery tasks implemented, verified, and committed as separate slices.
+Superseded in part: the shared `TemplateSpec` in section 4 was later split into
+`RootSpec` and `StepSpec`, `TemplateFingerprint` became output-only, and
+derived-template metadata now records the parent fingerprint.
 Date: 2026-09-06.
 Source baseline: `8a460ca`.
 Owner: Beads epic `postgres-test-harness-j82`.

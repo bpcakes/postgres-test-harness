@@ -64,9 +64,6 @@ pub enum Error {
     #[error("invalid PostgreSQL admin database URL: {reason}")]
     InvalidAdminDatabaseUrl { reason: &'static str },
 
-    #[error("invalid template fingerprint")]
-    InvalidTemplateFingerprint,
-
     #[error("invalid managed test database name '{name}'")]
     InvalidDatabaseName { name: String },
 

@@ -59,9 +59,7 @@ This test creates one content-addressed template, applies a real migration, and
 leases a fresh clone for the test body:
 
 ```rust,no_run
-use postgres_test_harness::{
-    BoxError, FingerprintBuilder, HarnessConfig, PostgresHarness, TemplateSpec,
-};
+use postgres_test_harness::{BoxError, FingerprintBuilder, HarnessConfig, PostgresHarness};
 use tokio_postgres::NoTls;
 
 const MIGRATION: &str = r#"
@@ -74,12 +72,12 @@ const MIGRATION: &str = r#"
 #[tokio::test]
 async fn widgets_use_a_migrated_isolated_database() -> Result<(), BoxError> {
     let harness = PostgresHarness::start(HarnessConfig::new("readme_example")?).await?;
-    let fingerprint = FingerprintBuilder::new("readme-schema-v1")
+    let schema = FingerprintBuilder::new("readme-schema-v1")
         .add("0001_create_widgets.sql", MIGRATION)
-        .finish();
+        .finish_root();
 
     let template = harness
-        .template(TemplateSpec::new(fingerprint), |database_url| async move {
+        .template(schema, |database_url| async move {
             let (client, connection) =
                 tokio_postgres::connect(&database_url, NoTls).await?;
             let connection = tokio::spawn(connection);
@@ -128,17 +126,17 @@ tests.
 
 ## Cached scenarios
 
-Derive a populated template from another immutable template. The local step
-spec fingerprints the setup SQL; `derive` incorporates the parent's complete
-identity automatically:
+Derive a populated template from another immutable template. `finish_step`
+fingerprints only the local setup SQL; `derive` incorporates the parent's
+complete identity automatically:
 
 ```rust,no_run
-# use postgres_test_harness::{BoxError, DatabaseTemplate, FingerprintBuilder, TemplateSpec};
+# use postgres_test_harness::{BoxError, DatabaseTemplate, FingerprintBuilder};
 # async fn seeded_widgets(root: &DatabaseTemplate) -> Result<DatabaseTemplate, BoxError> {
 const SEED: &str = "INSERT INTO widgets (name) VALUES ('example')";
-let step = TemplateSpec::new(
-    FingerprintBuilder::new("widgets-fixture-v1").add("seed.sql", SEED).finish(),
-);
+let step = FingerprintBuilder::new("widgets-fixture-v1")
+    .add("seed.sql", SEED)
+    .finish_step();
 let seeded = root.derive(step, |url| async move {
     let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls).await?;
     let connection = tokio::spawn(connection);
@@ -168,12 +166,17 @@ not describe; closures are not automatically fingerprinted. Each derived
 template is a full PostgreSQL database copy and each live template holds a lock
 session. Reuse a small set of stable scenarios across tests.
 
+`DatabaseTemplate::fingerprint` is output-only: a derived identity means
+nothing without its parent, so no API accepts it back as a spec. To reopen a
+scenario in another test or process, repeat its `template` and `derive` calls.
+Cache hits return the existing templates without running their setup.
+
 ## How it works
 
 1. `PostgresHarness::start` starts an owned PostgreSQL container, unless an
    external admin URL is configured.
 2. `template` identifies a migrated schema from every ordered input added to
-   its fingerprint. Calls with the same fingerprint are single-flighted within
+   its root spec. Calls with the same spec are single-flighted within
    a harness and coordinated across processes with PostgreSQL advisory locks.
 3. `DatabaseTemplate::database` clones a uniquely named database from the
    immutable template.

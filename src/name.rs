@@ -91,7 +91,12 @@ mod tests {
     fn generated_names_fit_postgres_identifiers() {
         let project = ProjectName::new("sixteen_chars_ok").unwrap();
         let test = DatabaseName::test(&project);
-        let template = DatabaseName::template(&project, FingerprintBuilder::new("schema").finish());
+        let template = DatabaseName::template(
+            &project,
+            FingerprintBuilder::new("schema")
+                .finish_root()
+                .fingerprint(),
+        );
         assert!(test.as_str().len() <= 63);
         assert!(template.as_str().len() <= 63);
         assert_eq!(test.kind(), DatabaseKind::Test);

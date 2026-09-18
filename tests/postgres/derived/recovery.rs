@@ -34,7 +34,7 @@ enum BuildAction {
 
 async fn gated_build(
     parent: DatabaseTemplate,
-    spec: TemplateSpec,
+    spec: StepSpec,
 ) -> (
     Task<postgres_test_harness::Result<DatabaseTemplate>>,
     oneshot::Sender<BuildAction>,
@@ -71,7 +71,7 @@ async fn gated_build(
 async fn assert_interrupted_build_recovers(action: Option<BuildAction>) {
     let fixture = OwnedHarnessFixture::start().await;
     let parent = scenario_root(&fixture.harness, "derived-recovery").await;
-    let spec = sql_spec("interrupted-child", CHILD_SQL);
+    let spec = sql_step("interrupted-child", CHILD_SQL);
     let (winner, release) = gated_build(parent.clone(), spec).await;
     let retry_parent = parent.clone();
     let calls = Arc::new(AtomicUsize::new(0));
@@ -147,7 +147,7 @@ async fn derived_initializer_and_abort_errors_are_preserved_for_retry() {
     .await
     .unwrap();
     let parent = scenario_root(&harness, "derived-abort-errors").await;
-    let spec = sql_spec("abort-errors", CHILD_SQL);
+    let spec = sql_step("abort-errors", CHILD_SQL);
     let (task, release) = gated_build(parent.clone(), spec).await;
     let catalog = CatalogLock::acquire(fixture.admin_url.clone()).await;
     release.send(BuildAction::Error).ok().unwrap();
@@ -197,7 +197,7 @@ async fn derived_concurrent_cold_start_publishes_one_child_lock_and_setup() {
     let locks_before = advisory_lock_count(fixture.admin_url.clone(), "ShareLock")
         .await
         .unwrap();
-    let spec = sql_spec("concurrent-child", CHILD_SQL);
+    let spec = sql_step("concurrent-child", CHILD_SQL);
     let (winner, release) = gated_build(parent.clone(), spec).await;
     let unexpected_calls = Arc::new(AtomicUsize::new(0));
     let mut waiters = Vec::new();
@@ -242,7 +242,7 @@ async fn derived_concurrent_cold_start_publishes_one_child_lock_and_setup() {
 async fn derived_cancelled_waiter_leaves_winning_initializer_running() {
     let fixture = OwnedHarnessFixture::start().await;
     let parent = scenario_root(&fixture.harness, "derived-waiter-cancel").await;
-    let spec = sql_spec("waiter-cancel", CHILD_SQL);
+    let spec = sql_step("waiter-cancel", CHILD_SQL);
     let (winner, release) = gated_build(parent.clone(), spec).await;
     let waiting_parent = parent.clone();
     let (waiter, registered) = registered_waiter(async move {
@@ -279,7 +279,7 @@ async fn child_metadata(admin_url: &str, name: &str) -> Option<(bool, String)> {
 async fn remove_cached_child(
     fixture: &OwnedHarnessFixture,
     parent: &DatabaseTemplate,
-    spec: TemplateSpec,
+    spec: StepSpec,
 ) -> (String, i64) {
     let child = parent
         .derive(spec, |url| execute(url, CHILD_SQL))
@@ -356,7 +356,7 @@ async fn derived_detached_preparation_retains_and_releases_parent() {
         "template",
         &format!("harness_it:{}", parent.fingerprint().to_hex()),
     );
-    let spec = sql_spec("detached-child", CHILD_SQL);
+    let spec = sql_step("detached-child", CHILD_SQL);
     let (name, key) = remove_cached_child(&fixture, &parent, spec).await;
     let gate = AdvisoryGate::hold(fixture.admin_url.clone(), key).await;
     let task = tokio::spawn(async move {
@@ -401,7 +401,7 @@ async fn derived_detached_preparation_retains_and_releases_parent() {
 async fn derived_abandoned_finalization_reuses_catalog_ready_child() {
     let fixture = OwnedHarnessFixture::start().await;
     let parent = scenario_root(&fixture.harness, "derived-finalize").await;
-    let spec = sql_spec("finalize-child", CHILD_SQL);
+    let spec = sql_step("finalize-child", CHILD_SQL);
     let (name, key) = remove_cached_child(&fixture, &parent, spec).await;
     let (task, release) = gated_build(parent.clone(), spec).await;
     let catalog = CatalogLock::acquire(fixture.admin_url.clone()).await;
@@ -443,7 +443,7 @@ async fn derived_independent_harnesses_coordinate_through_postgres() {
     .await
     .unwrap();
     let peer_parent = scenario_root(&peer, "derived-peers").await;
-    let spec = sql_spec("peer-child", CHILD_SQL);
+    let spec = sql_step("peer-child", CHILD_SQL);
     let (winner, release) = gated_build(parent.clone(), spec).await;
     // The winning callback holds an exclusive target advisory lock on its
     // admin session; identify that blocker without relying on a local counter.
@@ -487,7 +487,7 @@ async fn derived_child_survives_parent_stale_cleanup() {
         &format!("harness_it:{}", parent.fingerprint().to_hex()),
     );
     let child = parent
-        .derive(sql_spec("child", CHILD_SQL), |url| execute(url, CHILD_SQL))
+        .derive(sql_step("child", CHILD_SQL), |url| execute(url, CHILD_SQL))
         .await
         .unwrap();
     drop(parent);
@@ -515,7 +515,7 @@ async fn derived_child_survives_parent_stale_cleanup() {
 async fn derived_unrecognized_target_is_preserved() {
     let fixture = OwnedHarnessFixture::start().await;
     let parent = scenario_root(&fixture.harness, "derived-collision").await;
-    let spec = sql_spec("collision-child", CHILD_SQL);
+    let spec = sql_step("collision-child", CHILD_SQL);
     let (name, _) = remove_cached_child(&fixture, &parent, spec).await;
     let lookalike = TemporaryDatabase::create(fixture.admin_url.clone(), name.clone()).await;
     let mut url = url::Url::parse(&fixture.admin_url).unwrap();
@@ -539,13 +539,60 @@ async fn derived_unrecognized_target_is_preserved() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires a local Docker-compatible daemon"]
+async fn derived_ready_target_without_matching_lineage_is_preserved() {
+    let fixture = OwnedHarnessFixture::start().await;
+    let parent = scenario_root(&fixture.harness, "derived-lineage").await;
+    let spec = sql_step("lineage-child", CHILD_SQL);
+    let child = parent
+        .derive(spec, |url| execute(url, CHILD_SQL))
+        .await
+        .unwrap();
+    let name = child.database_name().to_owned();
+    let key = advisory_key(
+        "template",
+        &format!("harness_it:{}", child.fingerprint().to_hex()),
+    );
+    drop(child);
+    wait_until_advisory_lock_is_acquirable(&fixture.admin_url, key).await;
+    // Earlier builds could seal a template0 build under a derived fingerprint;
+    // its metadata matched a real child's except for the missing parent.
+    let (_, metadata) = child_metadata(&fixture.admin_url, &name).await.unwrap();
+    let lineage = format!(";parent={}", parent.fingerprint().to_hex());
+    assert!(metadata.contains(&lineage));
+    execute(
+        fixture.admin_url.clone(),
+        format!(
+            "COMMENT ON DATABASE \"{name}\" IS '{}'",
+            metadata.replace(&lineage, "")
+        ),
+    )
+    .await
+    .unwrap();
+    let result = parent
+        .derive(spec, |_| async {
+            panic!("a target with another lineage must not be initialized")
+        })
+        .await;
+    assert!(
+        matches!(result, Err(Error::InconsistentMetadata { database_name }) if database_name == name)
+    );
+    assert!(
+        database_exists(fixture.admin_url.clone(), name)
+            .await
+            .unwrap()
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires a local Docker-compatible daemon"]
 async fn derived_sealing_terminates_lingering_child_connection() {
     let fixture = OwnedHarnessFixture::start().await;
     let parent = scenario_root(&fixture.harness, "derived-seal").await;
     let held = Arc::new(Mutex::new(None));
     let callback_held = held.clone();
     let child = parent
-        .derive(sql_spec("seal-child", CHILD_SQL), move |url| async move {
+        .derive(sql_step("seal-child", CHILD_SQL), move |url| async move {
             execute(url.clone(), CHILD_SQL).await?;
             let connection = HeldClient::connect(url).await;
             // The held client's backend belongs only to this initializing child.

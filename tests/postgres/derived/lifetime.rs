@@ -12,7 +12,7 @@ async fn assert_cancelled_copy_retains_source(prewarm: bool) {
     let parent = scenario_root(&fixture.harness, "derived-copy-source").await;
     let parent_key = template_key(&parent);
     let child = parent
-        .derive(sql_spec("child", CHILD_SQL), |url| execute(url, CHILD_SQL))
+        .derive(sql_step("child", CHILD_SQL), |url| execute(url, CHILD_SQL))
         .await
         .unwrap();
     let key = template_key(&child);
@@ -63,12 +63,12 @@ async fn derived_prewarm_refills_pristine_child_without_retaining_ancestors() {
     let root = scenario_root(&fixture.harness, "derived-prewarm").await;
     let root_key = template_key(&root);
     let child = root
-        .derive(sql_spec("child", CHILD_SQL), |url| execute(url, CHILD_SQL))
+        .derive(sql_step("child", CHILD_SQL), |url| execute(url, CHILD_SQL))
         .await
         .unwrap();
     let child_key = template_key(&child);
     let leaf = child
-        .derive(sql_spec("grandchild", GRANDCHILD_SQL), |url| {
+        .derive(sql_step("grandchild", GRANDCHILD_SQL), |url| {
             execute(url, GRANDCHILD_SQL)
         })
         .await
@@ -129,10 +129,10 @@ async fn derived_cold_creation_obeys_closed_admission_on_a_live_server() {
     .unwrap();
     let parent = scenario_root(&harness, "derived-admission").await;
     let child = parent
-        .derive(sql_spec("child", CHILD_SQL), |url| execute(url, CHILD_SQL))
+        .derive(sql_step("child", CHILD_SQL), |url| execute(url, CHILD_SQL))
         .await
         .unwrap();
-    let uncached_spec = sql_spec("uncached", SIBLING_SQL);
+    let uncached_spec = sql_step("uncached", SIBLING_SQL);
     let target_name = remove_admission_target(&fixture.admin_url, &parent, uncached_spec).await;
     let disposable = harness.empty_database().await.unwrap();
     let residual_name = disposable.database_name().to_owned();
@@ -175,7 +175,7 @@ async fn derived_cold_creation_obeys_closed_admission_on_a_live_server() {
         Err(Error::ConnectionBudgetClosed)
     ));
     let cached = parent
-        .derive(sql_spec("child", CHILD_SQL), |_| async {
+        .derive(sql_step("child", CHILD_SQL), |_| async {
             panic!("cached handle must skip callback")
         })
         .await
@@ -194,7 +194,7 @@ async fn derived_cold_creation_obeys_closed_admission_on_a_live_server() {
 async fn remove_admission_target(
     admin_url: &str,
     parent: &DatabaseTemplate,
-    spec: TemplateSpec,
+    spec: StepSpec,
 ) -> String {
     let target = parent
         .derive(spec, |url| execute(url, SIBLING_SQL))
@@ -240,7 +240,7 @@ async fn derived_creation_and_leases_fail_after_owned_shutdown() {
     let fixture = OwnedHarnessFixture::start().await;
     let parent = scenario_root(&fixture.harness, "derived-shutdown").await;
     let child = parent
-        .derive(sql_spec("child", CHILD_SQL), |url| execute(url, CHILD_SQL))
+        .derive(sql_step("child", CHILD_SQL), |url| execute(url, CHILD_SQL))
         .await
         .unwrap();
     fixture.shutdown().await;
@@ -251,7 +251,7 @@ async fn derived_creation_and_leases_fail_after_owned_shutdown() {
     let calls = AtomicUsize::new(0);
     assert!(
         parent
-            .derive(sql_spec("new-child", SIBLING_SQL), |_| async {
+            .derive(sql_step("new-child", SIBLING_SQL), |_| async {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             })

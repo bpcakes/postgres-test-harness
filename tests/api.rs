@@ -1,6 +1,6 @@
 use std::{cell::Cell, rc::Rc};
 
-use postgres_test_harness::{BoxError, DatabaseTemplate, FingerprintBuilder, TemplateSpec};
+use postgres_test_harness::{BoxError, DatabaseTemplate, FingerprintBuilder};
 
 #[test]
 fn derived_initializer_accepts_borrowed_non_send_state() {
@@ -8,7 +8,7 @@ fn derived_initializer_accepts_borrowed_non_send_state() {
     let captured = Rc::new(Cell::new(0));
     let check = |template: &DatabaseTemplate| {
         let future = template.derive(
-            TemplateSpec::new(FingerprintBuilder::new("borrowed-step").finish()),
+            FingerprintBuilder::new("borrowed-step").finish_step(),
             |_| async {
                 captured.set(captured.get() + 1);
                 Ok::<(), BoxError>(())

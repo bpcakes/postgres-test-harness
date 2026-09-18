@@ -2,7 +2,7 @@
 
 use postgres_test_harness::{
     BoxError, Error, FingerprintBuilder, HarnessConfig, POSTGRES_TEST_ADMIN_URL_ENV,
-    PostgresHarness, TemplateSpec,
+    PostgresHarness,
 };
 use std::process::Command;
 
@@ -61,7 +61,7 @@ async fn external_only_lifecycle_works_end_to_end() {
 
     let template = harness
         .template(
-            TemplateSpec::new(FingerprintBuilder::new("external-only-lifecycle").finish()),
+            FingerprintBuilder::new("external-only-lifecycle").finish_root(),
             |_| async { Ok::<_, BoxError>(()) },
         )
         .await
@@ -104,19 +104,17 @@ async fn external_only_derived_scenario_survives_no_op_shutdown() {
     let root_sql = "CREATE TABLE scenario (id integer PRIMARY KEY, state text NOT NULL); \
                     INSERT INTO scenario VALUES (1, 'active')";
     let child_sql = "UPDATE scenario SET state = 'cancelled' WHERE id = 1";
-    let spec = |sql| {
-        TemplateSpec::new(
-            FingerprintBuilder::new("external-derived-v1")
-                .add("setup.sql", sql)
-                .finish(),
-        )
-    };
+    let fingerprint = |sql| FingerprintBuilder::new("external-derived-v1").add("setup.sql", sql);
     let root = harness
-        .template(spec(root_sql), |url| external_execute(url, root_sql))
+        .template(fingerprint(root_sql).finish_root(), |url| {
+            external_execute(url, root_sql)
+        })
         .await
         .unwrap();
     let child = root
-        .derive(spec(child_sql), |url| external_execute(url, child_sql))
+        .derive(fingerprint(child_sql).finish_step(), |url| {
+            external_execute(url, child_sql)
+        })
         .await
         .unwrap();
     for after_shutdown in [false, true] {

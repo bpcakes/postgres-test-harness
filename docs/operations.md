@@ -149,11 +149,34 @@ migration suite is still running. Override it with
 
 ### Derived scenario templates
 
-`DatabaseTemplate::derive(step_spec, initializer)` copies the parent's sealed
+`DatabaseTemplate::derive(step, initializer)` copies the parent's sealed
 database, applies the local setup step, then seals and caches the child. The
-step spec describes only the local inputs. The returned `fingerprint()` is the
-complete composed identity, including every ancestor. Changing a parent's
-inputs therefore changes its descendants without callers restating ancestry.
+`StepSpec` from `FingerprintBuilder::finish_step` describes only the local
+inputs. The returned `fingerprint()` is the complete composed identity,
+including every ancestor. Changing a parent's inputs therefore changes its
+descendants without callers restating ancestry.
+
+A derived template's catalog metadata also records its parent's fingerprint.
+A ready database whose recorded lineage differs from the requested one fails
+with `Error::InconsistentMetadata` instead of being reused. Owner-aware stale
+cleanup removes it like any other unused stale template.
+
+On a persistent server, derived templates created before parent lineage was
+recorded have no `parent` field and fail that check after an upgrade. Stop
+older-version processes and release their live template handles before running
+`cleanup_stale_databases` from the new version. Cleanup removes these templates
+once they pass the configured stale-age threshold and no process holds their
+lock; it skips active templates. Recreate the scenario through `derive` after
+cleanup. `HarnessConfig` defaults to a one-hour threshold for its automatic
+startup cleanup; `cleanup_stale_databases` always requires an explicit
+`stale_after`. `skipped_fresh` counts all recognized project resources below
+the chosen threshold; it does not identify a particular template. For earlier
+maintenance, pass a shorter `stale_after` to `cleanup_stale_databases`, choosing
+a threshold appropriate for all tagged resources in the project. Do not run
+old and new versions against the same derived templates: older versions cannot
+read the new `parent` metadata. Acquiring one returns
+`Error::InconsistentMetadata`, and old-version cleanup reports it as
+`skipped_unrecognized` without reclaiming it.
 
 Schema, table data, sequences, and other database-local objects are copied.
 Database-level grants and settings are not inherited as scenario payload;
@@ -192,12 +215,12 @@ For suites whose test bodies are shorter than a template clone, call
 
 ```rust,no_run
 # use postgres_test_harness::{
-#     BoxError, FingerprintBuilder, HarnessConfig, PostgresHarness, TemplateSpec,
+#     BoxError, FingerprintBuilder, HarnessConfig, PostgresHarness,
 # };
 # async fn example() -> Result<(), BoxError> {
 # let harness = PostgresHarness::start(HarnessConfig::new("example")?).await?;
 # let template = harness.template(
-#     TemplateSpec::new(FingerprintBuilder::new("prewarm-example").finish()),
+#     FingerprintBuilder::new("prewarm-example").finish_root(),
 #     |_| async { Ok(()) },
 # ).await?;
 let pool = template.prewarm(4).await?;

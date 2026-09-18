@@ -12,8 +12,8 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::{
-    BoxError, ConnectionLimits, Error, HarnessConfig, ProjectName, Result, TemplateFingerprint,
-    TemplateSpec,
+    BoxError, ConnectionLimits, Error, HarnessConfig, ProjectName, Result, RootSpec, StepSpec,
+    TemplateFingerprint,
     admin::{
         AdminClient, AdminDatabaseUrl, AdminSessionDisposition, DatabaseRecord, PersistentClient,
         acquire_shared_template_advisory_lock, acquire_template_advisory_lock, advisory_key,
@@ -23,7 +23,7 @@ use crate::{
     },
     admission::ManagedDatabaseCreationFailure,
     cleanup::{CleanupOutcome, log_cleanup},
-    fingerprint::derived_fingerprint,
+    fingerprint::TemplateIdentity,
     metadata::{ResourceMetadata, TemplateState},
     name::{DatabaseKind, DatabaseName},
     server::{ServerInner, TemplateCacheAction, TemplateInner, run_blocking},
@@ -114,25 +114,22 @@ impl PostgresHarness {
         create_test_database(self.server.clone(), TemplateSource::Empty).await
     }
 
-    /// Gets or initializes one immutable, content-addressed template database.
+    /// Gets or initializes one immutable, content-addressed template database
+    /// from PostgreSQL's built-in `template0`.
     ///
-    /// Calls with the same fingerprint on clones of this harness single-flight
+    /// Calls with the same spec on clones of this harness single-flight
     /// initialization and share one live template handle. The cache is weak:
     /// dropping the final [`DatabaseTemplate`] releases its retained PostgreSQL
     /// shared-lock session. Separate harness starts continue to coordinate through
     /// PostgreSQL advisory locks.
-    pub async fn template<F, Fut>(
-        &self,
-        spec: TemplateSpec,
-        initializer: F,
-    ) -> Result<DatabaseTemplate>
+    pub async fn template<F, Fut>(&self, spec: RootSpec, initializer: F) -> Result<DatabaseTemplate>
     where
         F: FnOnce(String) -> Fut,
         Fut: Future<Output = std::result::Result<(), BoxError>>,
     {
         get_or_initialize_template(
             self.server.clone(),
-            spec.fingerprint(),
+            TemplateIdentity::root(spec),
             TemplateSource::Empty,
             initializer,
         )
@@ -152,6 +149,10 @@ impl DatabaseTemplate {
     }
 
     /// Complete template identity, including every ancestor for derived templates.
+    ///
+    /// The fingerprint is output-only. To reopen a derived scenario, repeat its
+    /// [`PostgresHarness::template`] and [`Self::derive`] calls; cache hits skip
+    /// each initializer.
     pub fn fingerprint(&self) -> TemplateFingerprint {
         self.inner.fingerprint()
     }
@@ -159,11 +160,11 @@ impl DatabaseTemplate {
     /// Gets or initializes an immutable child by copying this template and
     /// applying one local setup step to the copy.
     ///
-    /// `spec` fingerprints the local step only. The harness combines it with
+    /// `step` fingerprints the local step only. The harness combines it with
     /// this template's complete identity; the returned [`Self::fingerprint`]
-    /// is that composed identity, not `spec.fingerprint()`. Include all SQL,
-    /// fixture data, configuration, seeds, and setup-code revisions that can
-    /// change the step's output. Closures and their captures are not hashed.
+    /// is that composed identity. Include all SQL, fixture data,
+    /// configuration, seeds, and setup-code revisions that can change the
+    /// step's output. Closures and their captures are not hashed.
     ///
     /// The initializer receives a writable child URL with inherited schema
     /// and rows. It is skipped on cache hits, and runs on the caller's task
@@ -183,18 +184,14 @@ impl DatabaseTemplate {
     /// outside the downstream lease-permit budget. Inheritance covers
     /// database-local state: database-level grants/settings, cluster-wide
     /// roles, and external side effects are not copied as scenario state.
-    pub async fn derive<F, Fut>(
-        &self,
-        spec: TemplateSpec,
-        initializer: F,
-    ) -> Result<DatabaseTemplate>
+    pub async fn derive<F, Fut>(&self, step: StepSpec, initializer: F) -> Result<DatabaseTemplate>
     where
         F: FnOnce(String) -> Fut,
         Fut: Future<Output = std::result::Result<(), BoxError>>,
     {
         get_or_initialize_template(
             self.inner.server().clone(),
-            derived_fingerprint(self.fingerprint(), spec.fingerprint()),
+            TemplateIdentity::derived(self.fingerprint(), step),
             TemplateSource::Template(self.inner.clone()),
             initializer,
         )
@@ -979,7 +976,7 @@ impl TemplateSource {
 
 async fn get_or_initialize_template<F, Fut>(
     server: Arc<ServerInner>,
-    fingerprint: TemplateFingerprint,
+    identity: TemplateIdentity,
     source: TemplateSource,
     initializer: F,
 ) -> Result<DatabaseTemplate>
@@ -987,6 +984,7 @@ where
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = std::result::Result<(), BoxError>>,
 {
+    let fingerprint = identity.fingerprint();
     let mut initializer = Some(initializer);
     loop {
         match server.template_cache_action(fingerprint) {
@@ -1001,7 +999,7 @@ where
                 let preparation_server = server.clone();
                 let preparation_source = source.clone();
                 let preparation = run_blocking(move || {
-                    begin_template(preparation_server, name, fingerprint, preparation_source)
+                    begin_template(preparation_server, name, identity, preparation_source)
                 })
                 .await?;
 
@@ -1055,7 +1053,7 @@ enum TemplatePreparation {
 struct TemplateInitialization {
     server: Arc<ServerInner>,
     name: DatabaseName,
-    fingerprint: TemplateFingerprint,
+    identity: TemplateIdentity,
     lock_key: i64,
     coordination_key: i64,
     exclusive_lock: PersistentClient,
@@ -1066,7 +1064,7 @@ impl TemplateInitialization {
         let Self {
             server,
             name,
-            fingerprint,
+            identity,
             lock_key,
             coordination_key,
             mut exclusive_lock,
@@ -1080,18 +1078,13 @@ impl TemplateInitialization {
             &ResourceMetadata::template(
                 server.project.clone(),
                 lock_key,
-                fingerprint,
+                identity,
                 TemplateState::Ready,
             ),
         )?;
         release_advisory_lock(client, lock_key)?;
-        let ready = acquire_and_inspect_shared_template_lock(
-            client,
-            &server,
-            &name,
-            fingerprint,
-            lock_key,
-        )?;
+        let ready =
+            acquire_and_inspect_shared_template_lock(client, &server, &name, identity, lock_key)?;
         release_advisory_lock(client, coordination_key)?;
         if ready {
             Ok(exclusive_lock)
@@ -1121,11 +1114,11 @@ impl TemplateInitialization {
 fn begin_template(
     server: Arc<ServerInner>,
     name: DatabaseName,
-    fingerprint: TemplateFingerprint,
+    identity: TemplateIdentity,
     source: TemplateSource,
 ) -> Result<TemplatePreparation> {
-    let lock_key = template_lock_key(&server.project, fingerprint);
-    let coordination_key = template_coordination_key(&server.project, fingerprint);
+    let lock_key = template_lock_key(&server.project, identity.fingerprint());
+    let coordination_key = template_coordination_key(&server.project, identity.fingerprint());
     let mut persistent_client = PersistentClient::new(connect_admin(
         &server.admin_url,
         server.operation_timeout,
@@ -1133,8 +1126,7 @@ fn begin_template(
     )?);
     loop {
         let client = persistent_client.client_mut();
-        if acquire_and_inspect_shared_template_lock(client, &server, &name, fingerprint, lock_key)?
-        {
+        if acquire_and_inspect_shared_template_lock(client, &server, &name, identity, lock_key)? {
             return Ok(TemplatePreparation::Ready(persistent_client));
         }
 
@@ -1146,8 +1138,7 @@ fn begin_template(
             server.template_wait_timeout,
             server.operation_timeout,
         )?;
-        if acquire_and_inspect_shared_template_lock(client, &server, &name, fingerprint, lock_key)?
-        {
+        if acquire_and_inspect_shared_template_lock(client, &server, &name, identity, lock_key)? {
             release_advisory_lock(client, coordination_key)?;
             return Ok(TemplatePreparation::Ready(persistent_client));
         }
@@ -1158,14 +1149,10 @@ fn begin_template(
             server.template_wait_timeout,
             server.operation_timeout,
         )?;
-        if template_is_ready(client, &server, &name, fingerprint, lock_key)? {
+        if template_is_ready(client, &server, &name, identity, lock_key)? {
             release_advisory_lock(client, lock_key)?;
             let ready = acquire_and_inspect_shared_template_lock(
-                client,
-                &server,
-                &name,
-                fingerprint,
-                lock_key,
+                client, &server, &name, identity, lock_key,
             )?;
             release_advisory_lock(client, coordination_key)?;
             if ready {
@@ -1182,7 +1169,7 @@ fn begin_template(
                     recoverable_template_initialization(
                         &metadata,
                         &server.project,
-                        fingerprint,
+                        identity,
                         lock_key,
                     )
                 });
@@ -1201,7 +1188,7 @@ fn begin_template(
                 &ResourceMetadata::template(
                     server.project.clone(),
                     lock_key,
-                    fingerprint,
+                    identity,
                     TemplateState::Initializing,
                 ),
             )
@@ -1212,7 +1199,7 @@ fn begin_template(
         return Ok(TemplatePreparation::Initialize(TemplateInitialization {
             server,
             name,
-            fingerprint,
+            identity,
             lock_key,
             coordination_key,
             exclusive_lock: persistent_client,
@@ -1238,7 +1225,7 @@ fn acquire_and_inspect_shared_template_lock(
     client: &mut AdminClient,
     server: &ServerInner,
     name: &DatabaseName,
-    fingerprint: TemplateFingerprint,
+    identity: TemplateIdentity,
     lock_key: i64,
 ) -> Result<bool> {
     acquire_shared_template_advisory_lock(
@@ -1247,7 +1234,7 @@ fn acquire_and_inspect_shared_template_lock(
         server.template_wait_timeout,
         server.operation_timeout,
     )?;
-    if template_is_ready(client, server, name, fingerprint, lock_key)? {
+    if template_is_ready(client, server, name, identity, lock_key)? {
         Ok(true)
     } else {
         release_shared_advisory_lock(client, lock_key)?;
@@ -1258,20 +1245,15 @@ fn acquire_and_inspect_shared_template_lock(
 fn recoverable_template_initialization(
     metadata: &ResourceMetadata,
     project: &ProjectName,
-    fingerprint: TemplateFingerprint,
+    identity: TemplateIdentity,
     lock_key: i64,
 ) -> bool {
-    matches!(
+    template_metadata_matches(
         metadata,
-        ResourceMetadata::Template {
-            project: metadata_project,
-            lock_key: metadata_lock_key,
-            fingerprint: metadata_fingerprint,
-            state: TemplateState::Initializing,
-            ..
-        } if metadata_project == project
-            && *metadata_lock_key == lock_key
-            && *metadata_fingerprint == fingerprint
+        project,
+        identity,
+        lock_key,
+        TemplateState::Initializing,
     )
 }
 
@@ -1279,14 +1261,14 @@ fn template_is_ready(
     client: &mut AdminClient,
     server: &ServerInner,
     name: &DatabaseName,
-    fingerprint: TemplateFingerprint,
+    identity: TemplateIdentity,
     lock_key: i64,
 ) -> Result<bool> {
     let record = find_database(client, name)?;
     Ok(template_record_is_ready(
         record.as_ref(),
         &server.project,
-        fingerprint,
+        identity,
         lock_key,
     ))
 }
@@ -1294,23 +1276,40 @@ fn template_is_ready(
 fn template_record_is_ready(
     record: Option<&DatabaseRecord>,
     project: &ProjectName,
-    fingerprint: TemplateFingerprint,
+    identity: TemplateIdentity,
     lock_key: i64,
 ) -> bool {
-    let Some(comment) = record.and_then(|record| record.comment.as_deref()) else {
-        return false;
-    };
+    record
+        .and_then(|record| record.comment.as_deref())
+        .and_then(ResourceMetadata::parse)
+        .is_some_and(|metadata| {
+            template_metadata_matches(&metadata, project, identity, lock_key, TemplateState::Ready)
+        })
+}
+
+/// Requires the recorded parent too: a database built from a different
+/// source lacks the inherited data its fingerprint promises.
+fn template_metadata_matches(
+    metadata: &ResourceMetadata,
+    project: &ProjectName,
+    identity: TemplateIdentity,
+    lock_key: i64,
+    state: TemplateState,
+) -> bool {
     matches!(
-        ResourceMetadata::parse(comment),
-        Some(ResourceMetadata::Template {
+        metadata,
+        ResourceMetadata::Template {
             project: metadata_project,
             lock_key: metadata_lock_key,
-            fingerprint: metadata_fingerprint,
-            state: TemplateState::Ready,
+            fingerprint,
+            parent,
+            state: metadata_state,
             ..
-        }) if metadata_project == *project
-            && metadata_lock_key == lock_key
-            && metadata_fingerprint == fingerprint
+        } if metadata_project == project
+            && *metadata_lock_key == lock_key
+            && *fingerprint == identity.fingerprint()
+            && *parent == identity.parent()
+            && *metadata_state == state
     )
 }
 
@@ -1655,8 +1654,9 @@ mod tests {
         run_blocking, template_coordination_key, template_lock_key, template_record_is_ready,
     };
     use crate::{
-        Error, FingerprintBuilder, ProjectName,
+        Error, FingerprintBuilder, ProjectName, TemplateFingerprint,
         admin::DatabaseRecord,
+        fingerprint::TemplateIdentity,
         metadata::{ResourceMetadata, TemplateState},
         name::{DatabaseKind, DatabaseName},
     };
@@ -1750,7 +1750,8 @@ mod tests {
 
     fn template_record(
         project: &ProjectName,
-        fingerprint: crate::TemplateFingerprint,
+        fingerprint: TemplateFingerprint,
+        parent: Option<TemplateFingerprint>,
         lock_key: i64,
         state: TemplateState,
         created_at: u64,
@@ -1764,12 +1765,17 @@ mod tests {
                     project: project.clone(),
                     lock_key,
                     fingerprint,
+                    parent,
                     state,
                     created_at,
                 }
                 .encode(),
             ),
         }
+    }
+
+    fn root_identity(domain: &str) -> TemplateIdentity {
+        TemplateIdentity::root(FingerprintBuilder::new(domain).finish_root())
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1807,7 +1813,7 @@ mod tests {
 
     #[test]
     fn template_lock_domains_are_distinct_and_namespaced_by_project() {
-        let fingerprint = FingerprintBuilder::new("schema").finish();
+        let fingerprint = root_identity("schema").fingerprint();
         let left = template_lock_key(&ProjectName::new("left").unwrap(), fingerprint);
         let right = template_lock_key(&ProjectName::new("right").unwrap(), fingerprint);
         let coordination =
@@ -1819,36 +1825,29 @@ mod tests {
     #[test]
     fn only_matching_initializing_templates_are_recoverable() {
         let project = ProjectName::new("creditkit").unwrap();
-        let fingerprint = FingerprintBuilder::new("schema").finish();
-        let lock_key = template_lock_key(&project, fingerprint);
+        let identity = root_identity("schema");
+        let lock_key = template_lock_key(&project, identity.fingerprint());
         let initializing = ResourceMetadata::template(
             project.clone(),
             lock_key,
-            fingerprint,
+            identity,
             TemplateState::Initializing,
         );
-        let ready = ResourceMetadata::template(
-            project.clone(),
-            lock_key,
-            fingerprint,
-            TemplateState::Ready,
-        );
+        let ready =
+            ResourceMetadata::template(project.clone(), lock_key, identity, TemplateState::Ready);
         assert!(recoverable_template_initialization(
             &initializing,
             &project,
-            fingerprint,
+            identity,
             lock_key
         ));
         assert!(!recoverable_template_initialization(
-            &ready,
-            &project,
-            fingerprint,
-            lock_key
+            &ready, &project, identity, lock_key
         ));
         assert!(!recoverable_template_initialization(
             &initializing,
             &ProjectName::new("another").unwrap(),
-            fingerprint,
+            identity,
             lock_key
         ));
     }
@@ -1856,9 +1855,9 @@ mod tests {
     #[test]
     fn exact_template_records_preserve_catalog_states() {
         let project = ProjectName::new("creditkit").unwrap();
-        let fingerprint = FingerprintBuilder::new("schema").finish();
-        let lock_key = template_lock_key(&project, fingerprint);
-        let name = DatabaseName::template(&project, fingerprint)
+        let identity = root_identity("schema");
+        let lock_key = template_lock_key(&project, identity.fingerprint());
+        let name = DatabaseName::template(&project, identity.fingerprint())
             .as_str()
             .to_owned();
         let untagged = DatabaseRecord {
@@ -1871,7 +1870,7 @@ mod tests {
                 ResourceMetadata::template(
                     project.clone(),
                     lock_key,
-                    fingerprint,
+                    identity,
                     TemplateState::Initializing,
                 )
                 .encode(),
@@ -1883,7 +1882,7 @@ mod tests {
                 ResourceMetadata::template(
                     project.clone(),
                     lock_key,
-                    fingerprint,
+                    identity,
                     TemplateState::Ready,
                 )
                 .encode(),
@@ -1891,28 +1890,74 @@ mod tests {
         };
 
         assert!(!template_record_is_ready(
-            None,
-            &project,
-            fingerprint,
-            lock_key
+            None, &project, identity, lock_key
         ));
         assert!(!template_record_is_ready(
             Some(&untagged),
             &project,
-            fingerprint,
+            identity,
             lock_key
         ));
         assert!(!template_record_is_ready(
             Some(&initializing),
             &project,
-            fingerprint,
+            identity,
             lock_key
         ));
         assert!(template_record_is_ready(
             Some(&ready),
             &project,
-            fingerprint,
+            identity,
             lock_key
+        ));
+    }
+
+    #[test]
+    fn template_records_must_match_the_requested_lineage() {
+        let project = ProjectName::new("creditkit").unwrap();
+        let root = root_identity("schema");
+        let other_root = root_identity("other-schema");
+        let child = TemplateIdentity::derived(
+            root.fingerprint(),
+            FingerprintBuilder::new("fixture").finish_step(),
+        );
+        let child_key = template_lock_key(&project, child.fingerprint());
+        let accepts_child = |parent, state| {
+            let record =
+                template_record(&project, child.fingerprint(), parent, child_key, state, 10);
+            let metadata = ResourceMetadata::parse(record.comment.as_deref().unwrap()).unwrap();
+            match state {
+                TemplateState::Ready => {
+                    template_record_is_ready(Some(&record), &project, child, child_key)
+                }
+                TemplateState::Initializing => {
+                    recoverable_template_initialization(&metadata, &project, child, child_key)
+                }
+            }
+        };
+
+        for state in [TemplateState::Ready, TemplateState::Initializing] {
+            assert!(accepts_child(Some(root.fingerprint()), state));
+            // A template0 build tagged with the child's fingerprint lacks the
+            // parent's data, as does a copy of an unrelated parent.
+            assert!(!accepts_child(None, state));
+            assert!(!accepts_child(Some(other_root.fingerprint()), state));
+        }
+
+        let root_key = template_lock_key(&project, root.fingerprint());
+        let parented_root = template_record(
+            &project,
+            root.fingerprint(),
+            Some(other_root.fingerprint()),
+            root_key,
+            TemplateState::Ready,
+            10,
+        );
+        assert!(!template_record_is_ready(
+            Some(&parented_root),
+            &project,
+            root,
+            root_key
         ));
     }
 
@@ -2037,10 +2082,16 @@ mod tests {
     #[test]
     fn locked_cleanup_rejects_a_finalized_template_snapshot() {
         let project = ProjectName::new("creditkit").unwrap();
-        let fingerprint = FingerprintBuilder::new("cleanup-race").finish();
-        let initializing =
-            template_record(&project, fingerprint, 42, TemplateState::Initializing, 10);
-        let ready = template_record(&project, fingerprint, 42, TemplateState::Ready, 10);
+        let fingerprint = root_identity("cleanup-race").fingerprint();
+        let initializing = template_record(
+            &project,
+            fingerprint,
+            None,
+            42,
+            TemplateState::Initializing,
+            10,
+        );
+        let ready = template_record(&project, fingerprint, None, 42, TemplateState::Ready, 10);
         let mut report = CleanupReport::default();
 
         assert!(

@@ -1046,7 +1046,9 @@ mod tests {
         assert!(!debug.contains("secret"));
         let database = DatabaseName::template(
             &ProjectName::new("creditkit").unwrap(),
-            FingerprintBuilder::new("schema").finish(),
+            FingerprintBuilder::new("schema")
+                .finish_root()
+                .fingerprint(),
         );
         let rewritten = admin.database_url(&database);
         assert!(rewritten.contains(database.as_str()));

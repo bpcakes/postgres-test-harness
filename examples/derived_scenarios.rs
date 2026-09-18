@@ -6,7 +6,7 @@
 use std::{error::Error as StdError, fmt, io};
 
 use postgres_test_harness::{
-    BoxError, DatabaseTemplate, FingerprintBuilder, HarnessConfig, PostgresHarness, TemplateSpec,
+    BoxError, DatabaseTemplate, FingerprintBuilder, HarnessConfig, PostgresHarness,
 };
 use tokio_postgres::NoTls;
 
@@ -35,14 +35,10 @@ const CANCELLED: &str =
     "INSERT INTO subscriptions VALUES (100, 10, 'cancelled', DATE '2030-01-01');";
 const OVERDUE: &str = "UPDATE subscriptions SET due_on = DATE '2000-01-01' WHERE id = 100;";
 
-fn step(sql: &str) -> TemplateSpec {
+fn setup(sql: &str) -> FingerprintBuilder {
     // These exact SQL bytes fully describe this example's setup. If Rust code
     // starts shaping the fixture too, also hash its inputs and a setup revision.
-    TemplateSpec::new(
-        FingerprintBuilder::new("derived-scenarios-sql-v1")
-            .add("setup.sql", sql)
-            .finish(),
-    )
+    FingerprintBuilder::new("derived-scenarios-sql-v1").add("setup.sql", sql)
 }
 
 async fn execute(url: String, sql: &str) -> Result<()> {
@@ -54,14 +50,16 @@ async fn execute(url: String, sql: &str) -> Result<()> {
 }
 
 async fn scenario(parent: &DatabaseTemplate, sql: &str) -> Result<DatabaseTemplate> {
-    // The spec describes only this step. derive includes the complete parent's
+    // The step describes only this setup. derive includes the complete parent's
     // identity automatically, so changed migrations invalidate all descendants.
-    Ok(parent.derive(step(sql), |url| execute(url, sql)).await?)
+    Ok(parent
+        .derive(setup(sql).finish_step(), |url| execute(url, sql))
+        .await?)
 }
 
 async fn run_scenarios(harness: &PostgresHarness) -> Result<()> {
     let root = harness
-        .template(step(SCHEMA), |url| execute(url, SCHEMA))
+        .template(setup(SCHEMA).finish_root(), |url| execute(url, SCHEMA))
         .await?;
     let organization = scenario(&root, ORGANIZATION).await?;
     let active = scenario(&organization, ACTIVE).await?;
